@@ -89,6 +89,14 @@ impl Engine {
     /// `identity` — the engine's actual notion of who exists — correctly drops
     /// it. Trusting the store's list would resurrect a merged-away entity on
     /// every reload, and the merge would quietly undo itself across a restart.
+    ///
+    /// One counter of the same kind is *not* checked, and deliberately named
+    /// here rather than left to be discovered: `MemoryStore`'s own `next_id`.
+    /// Rewound below a live `StableId`, a later `create_entity` would overwrite
+    /// an existing entity exactly as a rewound `next_assertion` would overwrite
+    /// an assertion. `rm_store` exposes no accessor for it, so this crate
+    /// cannot inspect it without reaching around the type; closing it belongs
+    /// in `rm_store`, next to the counter itself.
     pub fn open(snapshot: &str, ruleset: Ruleset, policy: Policy) -> Result<Engine, EngineError> {
         let p: Persisted = serde_json::from_str(snapshot)
             .map_err(|e| EngineError::CorruptSnapshot(e.to_string()))?;
@@ -99,6 +107,35 @@ impl Engine {
         // itself rather than flattened into a string that loses which invariant
         // broke.
         let index = VectorIndex::open(&p.index)?;
+
+        // The counters name the *next* id to hand out, so anything at or below
+        // an id already in use is a snapshot that lies on its first write
+        // rather than on load. Nothing downstream can catch it: `remember`
+        // would call `assertions.insert`, which overwrites the existing
+        // `AssertionRef`, and `VectorIndex::insert`, which overwrites an
+        // existing id's vector in place rather than erroring. One stored fact
+        // would be destroyed, `index_len()` would not move, and the call would
+        // return `Ok`. That is the same "parses but lies on first use" shape
+        // the rest of this block exists to reject, so it is rejected here.
+        if let Some(&highest) = p.assertions.keys().next_back() {
+            if p.next_assertion <= highest {
+                return Err(EngineError::CorruptSnapshot(format!(
+                    "next_assertion is {}, but assertion {highest} already exists, so the next                      write would overwrite a stored fact",
+                    p.next_assertion
+                )));
+            }
+        }
+        // The same shape one queue over. A reused review id overwrites an open
+        // question, which is a question someone was going to be asked and now
+        // never will be.
+        if let Some(&highest) = p.review.keys().next_back() {
+            if p.next_review <= highest {
+                return Err(EngineError::CorruptSnapshot(format!(
+                    "next_review is {}, but review {highest} is already open, so the next                      question would overwrite it",
+                    p.next_review
+                )));
+            }
+        }
 
         for (id, entry) in &p.assertions {
             if p.store.entity(entry.entity).is_none() {

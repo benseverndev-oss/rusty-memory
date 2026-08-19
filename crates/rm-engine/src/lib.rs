@@ -1787,6 +1787,70 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshot_whose_assertion_counter_was_rewound_is_rejected_not_restored() {
+        // Every other check passes: the store holds the entity, identity knows
+        // it, the version indices are in range, every assertion has its vector.
+        // Only the counter lies, and it lies about the *next* write rather than
+        // about anything already stored -- so the damage lands after `open`
+        // returns Ok, on a `remember` that itself returns Ok. `assertions`
+        // takes the overwrite, `VectorIndex::insert` overwrites the vector of
+        // an id it already holds in place, `index_len()` does not move, and a
+        // fact is gone with nothing anywhere reporting it.
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        e.remember(observation("Ben Severn", "city", "Bristol", 2))
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&e.snapshot()).unwrap();
+        assert_eq!(
+            doc["next_assertion"], 2,
+            "setup: two assertions were written"
+        );
+        // Rewound to the id of a live assertion, not below it: the boundary is
+        // where the counter names an id already in use, so `<=` is the test.
+        doc["next_assertion"] = serde_json::json!(1);
+
+        let Err(err) = Engine::open(
+            &doc.to_string(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        ) else {
+            panic!("a counter that would reissue a live assertion id must not open");
+        };
+        assert!(
+            matches!(err, EngineError::CorruptSnapshot(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_whose_review_counter_was_rewound_is_rejected_not_restored() {
+        // The same shape one queue over. A reissued review id overwrites an
+        // open question -- one someone was going to be asked and now never
+        // will be -- and `file_review` cannot notice, because inserting over a
+        // `BTreeMap` key is not an error anywhere.
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        e.remember(ambiguous()).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&e.snapshot()).unwrap();
+        assert_eq!(doc["next_review"], 1, "setup: one question was filed");
+        doc["next_review"] = serde_json::json!(0);
+
+        let Err(err) = Engine::open(
+            &doc.to_string(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        ) else {
+            panic!("a counter that would reissue an open review id must not open");
+        };
+        assert!(
+            matches!(err, EngineError::CorruptSnapshot(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn a_malformed_snapshot_is_reported_not_panicked_on() {
         assert!(Engine::open(
             "{ not json",
