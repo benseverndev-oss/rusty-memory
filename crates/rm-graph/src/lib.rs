@@ -340,4 +340,192 @@ mod tests {
         assert_eq!(n.reached.len(), 1, "the seed alone filled it");
         assert!(n.truncated);
     }
+
+    #[test]
+    fn direction_decides_which_question_is_being_asked() {
+        // Alice employed_by Acme. Outward from Alice finds Acme; outward from
+        // Acme finds nobody; inward from Acme finds Alice.
+        let mut store = MemoryStore::new();
+        let alice = store.create_entity("person", 1);
+        let acme = store.create_entity("org", 1);
+        store
+            .relate(alice, "employed_by", acme, Interval::since(1), said(1))
+            .unwrap();
+
+        let out = neighborhood(&store, &Walk::new(vec![alice], 1, 10, 5, 5));
+        assert_eq!(out.reached.len(), 2);
+
+        let from_acme = neighborhood(&store, &Walk::new(vec![acme], 1, 10, 5, 5));
+        assert_eq!(from_acme.reached.len(), 1, "nothing leaves Acme");
+
+        let into_acme = neighborhood(
+            &store,
+            &Walk::new(vec![acme], 1, 10, 5, 5).direction(Direction::In),
+        );
+        assert_eq!(into_acme.reached.len(), 2, "who works at Acme");
+
+        let both = neighborhood(
+            &store,
+            &Walk::new(vec![acme], 1, 10, 5, 5).direction(Direction::Both),
+        );
+        assert_eq!(both.reached.len(), 2);
+    }
+
+    #[test]
+    fn a_predicate_filter_keeps_a_walk_off_unrelated_edges() {
+        let mut store = MemoryStore::new();
+        let alice = store.create_entity("person", 1);
+        let acme = store.create_entity("org", 1);
+        let bob = store.create_entity("person", 1);
+        store
+            .relate(alice, "employed_by", acme, Interval::since(1), said(1))
+            .unwrap();
+        store
+            .relate(alice, "knows", bob, Interval::since(1), said(1))
+            .unwrap();
+
+        let employment = neighborhood(
+            &store,
+            &Walk::new(vec![alice], 2, 10, 5, 5).via(vec!["employed_by".to_string()]),
+        );
+        assert_eq!(employment.reached.len(), 2);
+        assert!(employment.reached.iter().all(|r| r.entity != bob));
+
+        let all = neighborhood(&store, &Walk::new(vec![alice], 2, 10, 5, 5));
+        assert_eq!(all.reached.len(), 3);
+    }
+
+    #[test]
+    fn a_walk_as_of_a_past_tx_time_does_not_cross_edges_learned_later() {
+        // Told in September that Alice joined Acme in July. A walk as we stood
+        // in August must not reach Acme, even asking about August.
+        let mut store = MemoryStore::new();
+        let alice = store.create_entity("person", 1);
+        let acme = store.create_entity("org", 1);
+        store
+            .relate(alice, "employed_by", acme, Interval::since(7), said(9))
+            .unwrap();
+
+        let in_august = neighborhood(&store, &Walk::new(vec![alice], 2, 10, 8, 8));
+        assert_eq!(in_august.reached.len(), 1, "we did not know yet");
+
+        let in_october = neighborhood(&store, &Walk::new(vec![alice], 2, 10, 8, 10));
+        assert_eq!(in_october.reached.len(), 2, "learned since, true then");
+    }
+
+    #[test]
+    fn a_walk_does_not_cross_an_edge_that_has_been_unrelated() {
+        let mut store = MemoryStore::new();
+        let alice = store.create_entity("person", 1);
+        let acme = store.create_entity("org", 1);
+        store
+            .relate(alice, "employed_by", acme, Interval::since(1), said(1))
+            .unwrap();
+        store
+            .unrelate(alice, "employed_by", acme, 5, said(5))
+            .unwrap();
+
+        assert_eq!(
+            neighborhood(&store, &Walk::new(vec![alice], 2, 10, 3, 9))
+                .reached
+                .len(),
+            2
+        );
+        assert_eq!(
+            neighborhood(&store, &Walk::new(vec![alice], 2, 10, 7, 9))
+                .reached
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_two_hop_walk_reaches_what_one_hop_cannot() {
+        // The reason this crate exists: "what do I know about Alice's
+        // employer's city" is not a question recall() can answer.
+        let mut store = MemoryStore::new();
+        let alice = store.create_entity("person", 1);
+        let acme = store.create_entity("org", 1);
+        let bristol = store.create_entity("place", 1);
+        store
+            .relate(alice, "employed_by", acme, Interval::since(1), said(1))
+            .unwrap();
+        store
+            .relate(acme, "based_in", bristol, Interval::since(1), said(1))
+            .unwrap();
+
+        let one = neighborhood(&store, &Walk::new(vec![alice], 1, 10, 5, 5));
+        assert!(one.reached.iter().all(|r| r.entity != bristol));
+
+        let two = neighborhood(&store, &Walk::new(vec![alice], 2, 10, 5, 5));
+        let hit = two.reached.iter().find(|r| r.entity == bristol).unwrap();
+        assert_eq!(hit.distance, 2);
+    }
+
+    #[test]
+    fn a_level_with_siblings_out_of_discovery_order_is_returned_by_ascending_id() {
+        // Every other fixture in this file has one entity per level, so a walk
+        // that visited a level in discovery order rather than sorted id order
+        // would still pass every other test here.
+        //
+        // `relate` call order alone cannot produce that disagreement: the store
+        // keys objects of one predicate in a `BTreeMap<StableId, _>`
+        // (`rm_store`'s `edges: BTreeMap<StableId, BTreeMap<String,
+        // BTreeMap<StableId, _>>>`), so `edges_from` already yields a single
+        // predicate's objects in ascending id order no matter what order they
+        // were related in -- the first version of this test related three
+        // same-predicate edges out of id order and it made no difference. What
+        // *can* disagree is predicate order: predicates are also a `BTreeMap`,
+        // walked alphabetically, so three different predicates whose alphabetical
+        // order is the reverse of their objects' ids gives a hub whose raw,
+        // pre-sort discovery order is high, mid, low -- the opposite of what the
+        // result must be.
+        //
+        // Verified as a real pin, not a tautology: swapping the `BTreeSet` that
+        // orders a level (both `neighbours`'s `out` and `neighborhood`'s
+        // `frontier`/`next`) for `Vec`s built by push, no sort, made this test
+        // fail -- it returned `[high, mid, low]`. Reverting restored the pass.
+        // See the task report for the exact diff used.
+        let mut store = MemoryStore::new();
+        let hub = store.create_entity("person", 1); // id 0
+        let low = store.create_entity("person", 1); // id 1
+        let mid = store.create_entity("person", 1); // id 2
+        let high = store.create_entity("person", 1); // id 3
+
+        // Predicate names sort "a" < "m" < "z", pointed at ids in the opposite
+        // order, so raw discovery order (by predicate, then by object within a
+        // predicate) is high, mid, low -- fully reversed from id order.
+        store
+            .relate(hub, "a_knows", high, Interval::since(1), said(1))
+            .unwrap();
+        store
+            .relate(hub, "m_knows", mid, Interval::since(1), said(1))
+            .unwrap();
+        store
+            .relate(hub, "z_knows", low, Interval::since(1), said(1))
+            .unwrap();
+
+        let n = neighborhood(&store, &walk(vec![hub], 1, 10));
+        let level_one: Vec<StableId> = n
+            .reached
+            .iter()
+            .filter(|r| r.distance == 1)
+            .map(|r| r.entity)
+            .collect();
+        assert_eq!(
+            level_one,
+            vec![low, mid, high],
+            "a level is ordered by ascending entity id, not discovery order"
+        );
+    }
+
+    #[test]
+    fn a_zero_budget_returns_nothing_and_reports_truncated() {
+        // An entity existed at the seed and was not returned: that is exactly
+        // what `truncated` exists to distinguish from a genuinely empty result.
+        let (store, ids) = chain(1);
+        let n = neighborhood(&store, &walk(vec![ids[0]], 1, 0));
+        assert_eq!(n.reached.len(), 0);
+        assert!(n.truncated);
+    }
 }
