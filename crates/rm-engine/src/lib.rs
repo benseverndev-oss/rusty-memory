@@ -1761,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_nested_index_is_rejected_by_the_indexs_own_door() {
+    fn a_corrupt_nested_index_is_rejected_by_its_own_door() {
         // One id at three dimensions needs three floats. `rm_index` already
         // rejects this and already has tests for it; restoring through
         // `VectorIndex::open` rather than a derived `Deserialize` is what makes
