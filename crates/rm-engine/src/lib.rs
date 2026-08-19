@@ -346,6 +346,11 @@ impl Engine {
     /// then erased, which is the one call in `rm_store` that destroys history.
     /// Copy first, erase second: the copy is the half that can fail, and
     /// failing after the erase would lose the facts outright.
+    ///
+    /// Appending to the survivor's logs moves every absorbed assertion's
+    /// position in them, so the lengths those logs had before the copy are read
+    /// first and the assertions are renumbered against them afterwards — see
+    /// [`Engine::adopt_assertions`].
     pub fn confirm(&mut self, review: ReviewId) -> Result<StableId, EngineError> {
         let pair = self
             .review
@@ -356,37 +361,34 @@ impl Engine {
             return Ok(kept);
         }
 
-        // Which assertions are about to change hands. Recorded now because
-        // re-pointing them destroys the only evidence of where they came from,
-        // and `reindex_versions` needs exactly that to renumber them.
-        let moved: BTreeSet<AssertionId> = self
-            .assertions
-            .iter()
-            .filter(|(_, entry)| entry.entity == absorbed)
-            .map(|(&id, _)| id)
-            .collect();
-
-        // Move every assertion's ownership across.
-        for entry in self.assertions.values_mut() {
-            if entry.entity == absorbed {
-                entry.entity = kept;
-            }
-        }
-
-        // Move the store's versions across, preserving append order.
+        // How long each of the survivor's own logs is *before* anything is
+        // appended to it. This is the whole of the renumbering argument, and it
+        // is read from the store rather than counted off the assertion map on
+        // purpose — see [`Engine::adopt_assertions`].
         let attributes: Vec<String> = self
             .store
             .entity(absorbed)
             .map(|e| e.attributes.keys().cloned().collect())
             .unwrap_or_default();
-        for attribute in attributes {
-            let versions: Vec<_> = self.store.history(absorbed, &attribute).to_vec();
+        let offsets: BTreeMap<String, usize> = attributes
+            .iter()
+            .map(|a| (a.clone(), self.store.history(kept, a).len()))
+            .collect();
+
+        // Move the store's versions across, preserving append order.
+        for attribute in &attributes {
+            let versions: Vec<_> = self.store.history(absorbed, attribute).to_vec();
             for v in versions {
                 self.store
                     .assert(kept, attribute.clone(), v.value, v.valid, v.provenance)?;
             }
-            self.store.erase(absorbed, &attribute)?;
+            self.store.erase(absorbed, attribute)?;
         }
+
+        // Ownership and position move together, after the copy: the offsets
+        // were read before it, so the assertion map is only touched once the
+        // log it points into is in its final shape.
+        self.adopt_assertions(absorbed, kept, &offsets);
 
         // Fold identity and re-point the blocking map.
         if let Some(record) = self.identity.remove(&absorbed) {
@@ -434,55 +436,55 @@ impl Engine {
             })
             .collect();
 
-        self.reindex_versions(kept, &moved);
         Ok(kept)
     }
 
-    /// Renumber `AssertionRef::version` for one entity after a merge appended
-    /// versions to its logs.
+    /// Re-point the absorbed entity's assertions at the survivor, renumbering
+    /// each one's position in the version log it now reads from.
     ///
     /// `version` is a position in an attribute's version log, so re-appending
     /// the absorbed entity's versions under the survivor invalidates every
-    /// index the absorbed entity's assertions held. Left stale, a search hit
+    /// position the absorbed entity's assertions held. Left stale, a search hit
     /// resolves to a real, well-formed, *wrong* fact: nothing errors and
     /// nothing downstream can tell.
     ///
-    /// `moved` names the assertions that changed hands, and has to be passed in
-    /// rather than inferred. Once ownership is re-pointed, an absorbed
-    /// assertion and one of the survivor's own can both claim version 0, and
-    /// nothing in the pair says which the store now holds first. Sorting on the
-    /// assertion id alone is wrong whenever the two entities' observations
-    /// interleaved — create A, create B, then a second fact about A — which is
-    /// the ordinary case rather than a corner one: A's second assertion has the
-    /// higher id and the lower position in the merged log.
-    fn reindex_versions(&mut self, entity: StableId, moved: &BTreeSet<AssertionId>) {
-        let mut by_attribute: BTreeMap<String, Vec<AssertionId>> = BTreeMap::new();
-        for (&id, entry) in &self.assertions {
-            if entry.entity == entity {
-                by_attribute
-                    .entry(entry.attribute.clone())
-                    .or_default()
-                    .push(id);
+    /// `offsets` is how long each of the survivor's own logs was when the copy
+    /// started, read from the store before a single version moved. `rm_store`
+    /// only ever appends, so the survivor's own positions do not move at all,
+    /// and an absorbed version lands at exactly its old position plus that
+    /// offset. Nothing else about either entity's history is consulted, which
+    /// is the point.
+    ///
+    /// The rejected alternative was to renumber by sorting the survivor's
+    /// assertions and handing out consecutive positions from zero — in effect
+    /// deriving the log from the assertion map. It assumes a bijection between
+    /// the two, and [`Engine::forget`] breaks that in both directions at once:
+    /// it appends a tombstone with no assertion behind it, and it drops an
+    /// attribute's assertions while their versions stay in the log. A survivor
+    /// that had been forgotten then handed an absorbed assertion the position
+    /// of its own *first* value, returned under the absorbed entity's
+    /// provenance. Reading the log directly needs no such correspondence to
+    /// hold, so there is no invariant left to break — which is why it is the
+    /// version that shipped, rather than teaching `forget` to file an assertion
+    /// for its tombstone. That would have restored the count while breaking a
+    /// different rule: `Engine::open` requires every assertion to have a
+    /// vector, and dropping the vector is the entire point of `forget`.
+    fn adopt_assertions(
+        &mut self,
+        absorbed: StableId,
+        kept: StableId,
+        offsets: &BTreeMap<String, usize>,
+    ) {
+        for entry in self.assertions.values_mut() {
+            if entry.entity != absorbed {
+                continue;
             }
-        }
-
-        for (attribute, mut ids) in by_attribute {
-            // The survivor's own versions kept their order and their place; the
-            // absorbed ones all follow, in their own original order.
-            ids.sort_by_key(|id| {
-                let entry = &self.assertions[id];
-                (moved.contains(id), entry.version, *id)
-            });
-            debug_assert_eq!(
-                ids.len(),
-                self.store.history(entity, &attribute).len(),
-                "every version is written through `write`, so each has one assertion"
-            );
-            for (version, id) in ids.into_iter().enumerate() {
-                if let Some(entry) = self.assertions.get_mut(&id) {
-                    entry.version = version;
-                }
-            }
+            entry.entity = kept;
+            // An attribute with no absorbed versions had nothing appended for
+            // it, so it shifts by nothing — and cannot be named by an absorbed
+            // assertion in the first place, since that assertion would already
+            // be pointing past the end of a log that does not exist.
+            entry.version += offsets.get(&entry.attribute).copied().unwrap_or(0);
         }
     }
 
@@ -937,10 +939,11 @@ mod tests {
     fn a_second_merge_still_leaves_every_assertion_on_its_own_value() {
         // One merge is not enough to protect the renumbering. It leaves the
         // survivor holding assertions whose ids no longer run in version
-        // order — here assertion 1 ends up at version 2 — and it is only the
-        // *next* merge that has to sort them back into log order. Without a
-        // chained merge, dropping the version from the sort key changes
-        // nothing and the regression ships unnoticed.
+        // order — here assertion 1 ends up at version 2 — so the *next* merge
+        // has to shift an already-shifted assertion by the survivor's new log
+        // length rather than its original one. A renumbering that reset
+        // positions from zero, or that read a stale offset, only goes wrong on
+        // the second merge.
         let mut e = engine();
         let first = e
             .remember(observation("Ben Severn", "employer", "Acme", 1))
@@ -992,6 +995,127 @@ mod tests {
         );
         assert_eq!(value_of(&e, initech).as_deref(), Some("Initech"));
         assert_eq!(value_of(&e, umbrella).as_deref(), Some("Umbrella"));
+    }
+
+    #[test]
+    fn a_merge_renumbers_each_attribute_against_its_own_log() {
+        // Two attributes whose logs are different lengths on the survivor. One
+        // offset per entity rather than one per attribute would land the
+        // absorbed nickname at the employer log's position — still a real
+        // version, still a plausible string, and about something else.
+        let mut e = engine();
+        let Remembered::Created {
+            entity: kept,
+            assertion: acme,
+        } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Merged {
+            assertion: initech, ..
+        } = e
+            .remember(observation("Ben Severn", "employer", "Initech", 2))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Merged {
+            assertion: benny, ..
+        } = e
+            .remember(observation("Ben Severn", "nickname", "Benny", 3))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+
+        let out = e.remember(ambiguous()).unwrap();
+        let Remembered::CreatedPendingReview {
+            assertion: globex,
+            review,
+            ..
+        } = out
+        else {
+            panic!("setup: expected a review, got {out:?}")
+        };
+        let mut nickname = ambiguous();
+        nickname.attribute = "nickname".to_string();
+        nickname.value = Some("Bez".to_string());
+        let out = e.remember(nickname).unwrap();
+        let Remembered::Merged { assertion: bez, .. } = out else {
+            panic!("setup: the repeated near-miss must land on its own entity, got {out:?}")
+        };
+
+        assert_eq!(e.confirm(review[0]).unwrap(), kept);
+
+        assert_eq!(value_of(&e, acme).as_deref(), Some("Acme"));
+        assert_eq!(value_of(&e, initech).as_deref(), Some("Initech"));
+        assert_eq!(value_of(&e, benny).as_deref(), Some("Benny"));
+        assert_eq!(
+            value_of(&e, globex).as_deref(),
+            Some("Globex"),
+            "the absorbed employer shifts by the survivor's two employer versions"
+        );
+        assert_eq!(
+            value_of(&e, bez).as_deref(),
+            Some("Bez"),
+            "and the absorbed nickname by its one nickname version, not by two"
+        );
+    }
+
+    #[test]
+    fn a_merge_after_a_forget_still_leaves_every_assertion_on_its_own_value() {
+        // `forget` breaks any correspondence between the assertion map and the
+        // version log in both directions at once: it appends a tombstone the
+        // index never sees, and it drops the attribute's existing assertions
+        // while their versions stay in the log. The survivor here ends up with
+        // two versions and no assertions at all, so a renumbering that counts
+        // assertions rather than reading the log hands the absorbed entity's
+        // assertion version 0 — the survivor's *first* value, returned under
+        // the absorbed entity's provenance. Well-formed, confidently wrong,
+        // and nothing errors.
+        let mut e = engine();
+        let Remembered::Created { entity: kept, .. } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        e.forget(
+            kept,
+            "employer",
+            2,
+            Provenance::new(Source::UserAssertion, 2, "s2"),
+        )
+        .unwrap();
+        assert_eq!(
+            e.store_history(kept, "employer").len(),
+            2,
+            "setup: two versions, and forget left neither of them an assertion"
+        );
+
+        let out = e.remember(ambiguous()).unwrap();
+        let Remembered::CreatedPendingReview {
+            entity: absorbed,
+            assertion: globex,
+            review,
+        } = out
+        else {
+            panic!("setup: expected a review, got {out:?}")
+        };
+        assert_eq!(e.confirm(review[0]).unwrap(), kept.min(absorbed));
+
+        assert_eq!(
+            value_of(&e, globex).as_deref(),
+            Some("Globex"),
+            "an absorbed assertion must name its own fact even where the \
+             survivor's log holds versions no assertion points at"
+        );
+        // And through the door a caller actually uses.
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 5)).unwrap();
+        assert_eq!(hits.len(), 1, "forget took the survivor's vector with it");
+        assert_eq!(hits[0].value.as_deref(), Some("Globex"));
     }
 
     #[test]
