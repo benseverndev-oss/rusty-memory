@@ -140,6 +140,64 @@ mod tests {
         }
     }
 
+    /// Find the JSON example embedded in the prompt's instructions.
+    ///
+    /// Panics rather than returning an empty string when the marker or a
+    /// balanced brace is missing, because a locator that fails quietly would
+    /// make the round-trip test below vacuous -- it would "pass" by parsing
+    /// nothing.
+    fn example_json(prompt: &str) -> &str {
+        let after_marker = prompt
+            .find("nothing else:")
+            .map(|i| &prompt[i..])
+            .expect("the prompt should tell the model to reply with only JSON");
+        let start = after_marker
+            .find('{')
+            .expect("the prompt should show a JSON example after that instruction");
+        let body = &after_marker[start..];
+        let mut depth = 0usize;
+        for (i, ch) in body.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &body[..=i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("the prompt's JSON example never closes its opening brace");
+    }
+
+    #[test]
+    fn the_prompt_s_example_round_trips_through_the_wire_schema() {
+        // The substring test above catches a field added to the types and
+        // never described, but a textual check cannot catch a field dropped
+        // from the example while its prose sentence lingers, or one renamed to
+        // a word already present elsewhere. Parsing the example itself as the
+        // schema the parser actually reads catches both: a removed or renamed
+        // field fails to parse, or parses into the wrong shape.
+        let p = prompt(&turn("anything", None));
+        let json = example_json(&p);
+        let wire: crate::WireExtraction = serde_json::from_str(json)
+            .expect("the prompt's own example must parse as the wire schema it teaches");
+
+        assert_eq!(wire.mentions.len(), 1);
+        assert_eq!(wire.mentions[0].name, "Alex Chen");
+        assert_eq!(wire.facts.len(), 1);
+        assert_eq!(wire.facts[0].attribute, "employer");
+        assert_eq!(wire.facts[0].value.as_deref(), Some("Globex"));
+        assert_eq!(wire.relations.len(), 1);
+        assert_eq!(wire.relations[0].predicate, "employed_by");
+        assert_eq!(wire.closures.len(), 1);
+        assert_eq!(
+            wire.closures[0].because,
+            "starting a new job ends the previous one"
+        );
+    }
+
     #[test]
     fn the_prompt_tells_the_model_when_to_close_a_relationship() {
         // The whole closure mechanism depends on the model volunteering one.
