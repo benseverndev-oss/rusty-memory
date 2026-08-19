@@ -66,9 +66,35 @@ pub enum EngineError {
     Store(StoreError),
     /// Survivorship declined to guess. Carries its explanation.
     Refused(Refused),
+    /// A write named an entity that does not exist.
+    ///
+    /// The write-path error, and only the write path: naming a nonexistent
+    /// entity in [`Engine::forget`], [`Engine::erase`] or [`Engine::confirm`]
+    /// is a bug in the caller and is reported as one. Asking *about* one is
+    /// not — [`Engine::about`] answers [`Believed::Unknown`], because "I have
+    /// nothing on this" is a true and useful answer to a question where it
+    /// would be a silent no-op if accepted as an instruction. `rm_store` draws
+    /// the line in the same place, and this variant is where its
+    /// [`StoreError::UnknownEntity`] surfaces, relabelled rather than wrapped
+    /// so the caller does not have to reach through `Store(..)` for the one
+    /// thing the wrapper exists to tell them.
     UnknownEntity(StableId),
     UnknownReview(ReviewId),
     CorruptSnapshot(String),
+}
+
+/// Relabel the store's "no such entity" as the engine's own on a write.
+///
+/// Every other `StoreError` keeps its wrapper: each is an explanation the store
+/// wrote, and flattening them would lose which invariant broke. This one is
+/// different because the engine's own error type already names it, and a
+/// variant nothing constructs is a design stated in a comment rather than in
+/// the type.
+fn on_write(e: StoreError) -> EngineError {
+    match e {
+        StoreError::UnknownEntity(id) => EngineError::UnknownEntity(id),
+        other => EngineError::Store(other),
+    }
 }
 
 impl std::fmt::Display for EngineError {
@@ -394,9 +420,10 @@ impl Engine {
             let versions: Vec<_> = self.store.history(absorbed, attribute).to_vec();
             for v in versions {
                 self.store
-                    .assert(kept, attribute.clone(), v.value, v.valid, v.provenance)?;
+                    .assert(kept, attribute.clone(), v.value, v.valid, v.provenance)
+                    .map_err(on_write)?;
             }
-            self.store.erase(absorbed, attribute)?;
+            self.store.erase(absorbed, attribute).map_err(on_write)?;
         }
 
         // Ownership and position move together, after the copy: the offsets
@@ -614,13 +641,15 @@ impl Engine {
         at: Timestamp,
         prov: Provenance,
     ) -> Result<(), EngineError> {
-        self.store.assert(
-            entity,
-            attribute.to_string(),
-            None,
-            Interval::since(at),
-            prov,
-        )?;
+        self.store
+            .assert(
+                entity,
+                attribute.to_string(),
+                None,
+                Interval::since(at),
+                prov,
+            )
+            .map_err(on_write)?;
         self.drop_vectors(entity, attribute);
         Ok(())
     }
@@ -642,7 +671,7 @@ impl Engine {
     /// Validating with the store first, exactly as `remember` validates the
     /// embedding before writing, keeps a rejected call free of side effects.
     pub fn erase(&mut self, entity: StableId, attribute: &str) -> Result<usize, EngineError> {
-        let removed = self.store.erase(entity, attribute)?;
+        let removed = self.store.erase(entity, attribute).map_err(on_write)?;
         self.drop_vectors(entity, attribute);
         Ok(removed)
     }
@@ -1676,10 +1705,11 @@ mod tests {
     fn forgetting_on_an_unknown_entity_is_an_error() {
         let mut e = engine();
         let p = Provenance::new(Source::UserAssertion, 1, "s");
-        assert!(matches!(
+        assert_eq!(
             e.forget(9999, "employer", 1, p),
-            Err(EngineError::Store(_)) | Err(EngineError::UnknownEntity(_))
-        ));
+            Err(EngineError::UnknownEntity(9999)),
+            "the write path names the missing entity itself, not through a wrapper"
+        );
     }
 
     #[test]
@@ -1706,10 +1736,10 @@ mod tests {
             panic!("setup")
         };
 
-        assert!(matches!(
+        assert_eq!(
             e.erase(9999, "employer"),
-            Err(EngineError::Store(_)) | Err(EngineError::UnknownEntity(_))
-        ));
+            Err(EngineError::UnknownEntity(9999))
+        );
 
         // The unrelated entity's vector and history are untouched by the
         // failed call.
@@ -1750,10 +1780,10 @@ mod tests {
         );
         e.index.insert(0, &[1.0, 0.0, 0.0]).unwrap();
 
-        assert!(matches!(
+        assert_eq!(
             e.erase(9999, "employer"),
-            Err(EngineError::Store(_)) | Err(EngineError::UnknownEntity(_))
-        ));
+            Err(EngineError::UnknownEntity(9999))
+        );
 
         assert!(
             e.assertions.contains_key(&0),
