@@ -48,9 +48,15 @@ fn person(name: &str, at: i64) -> Observation {
     }
 }
 
-/// An observation of `attribute: value` for `name`, with a caller-chosen
-/// embedding so distinct entities (a person, a company, a city) don't
-/// resolve into one another under blocking.
+/// An observation of `attribute: value` for `name`, modelling one of the
+/// distinct things a two-hop question runs through — a person, a company, a
+/// city — each with its own kind, attribute, value and embedding.
+///
+/// The embedding is a parameter because the entities are different things and
+/// giving them all the same vector would say otherwise; it is *not* what keeps
+/// them apart under resolution. Blocking here is name-prefix only and the
+/// comparator scores `name`, so embeddings play no part in matching at all —
+/// the distinct names are what stop these three colliding.
 fn seen(name: &str, attribute: &str, value: &str, at: i64, v: [f32; 3]) -> Observation {
     Observation {
         kind: "thing".to_string(),
