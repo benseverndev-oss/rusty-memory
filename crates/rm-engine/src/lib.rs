@@ -1478,10 +1478,15 @@ mod tests {
     }
 
     #[test]
-    fn erasing_an_unknown_entity_is_an_error_and_touches_nothing() {
-        // The ordering that matters: `store.erase` runs before `drop_vectors`,
-        // so a rejected call (unknown entity) costs nothing — same discipline
-        // `remember` uses for a rejected embedding.
+    fn erasing_an_unknown_entity_is_an_error_and_leaves_an_unrelated_entity_alone() {
+        // Note what this does *not* prove: an id the store does not hold is,
+        // by construction, an id `self.assertions` has no entries for either
+        // (every entry is written by `write`, which requires the store to
+        // already know the entity). So `drop_vectors` is a structural no-op
+        // on this path regardless of which statement in `erase` runs first.
+        // This test only proves the call errors without disturbing an
+        // unrelated, valid entity. The ordering itself is exercised by
+        // `a_failing_erase_runs_store_first_so_drop_vectors_never_executes`.
         let mut e = engine();
         let Remembered::Created { entity, .. } = e
             .remember(embedded(
@@ -1508,5 +1513,47 @@ mod tests {
             e.about(entity, "employer", 15, 30).unwrap(),
             Believed::Value("Acme".into())
         );
+    }
+
+    #[test]
+    fn a_failing_erase_runs_store_first_so_drop_vectors_never_executes() {
+        // `store.erase`'s only failure is `UnknownEntity`, and reaching that
+        // id through `remember`/`erase` alone can never leave it holding
+        // assertions — so the ordering guarantee is unobservable through the
+        // public API in the ordinary case (see the test above). To actually
+        // discriminate the two statements' order, manufacture the one state
+        // the public API cannot produce on its own: an assertion, and its
+        // indexed vector, recorded against an id the store does not hold.
+        // Reaching into `assertions`/`index` directly is legitimate here
+        // precisely because it is the only way to make the two orderings
+        // diverge — everything else about this scenario is unreachable
+        // through `remember`.
+        //
+        // If `drop_vectors` ran before `store.erase`, this entry would
+        // already be gone by the time the call returns its error. With the
+        // implemented ordering — `store.erase` first — it survives, because
+        // the `?` on the unknown-entity error returns before `drop_vectors`
+        // is ever called.
+        let mut e = engine();
+        e.assertions.insert(
+            0,
+            AssertionRef {
+                entity: 9999,
+                attribute: "employer".to_string(),
+                version: 0,
+            },
+        );
+        e.index.insert(0, &[1.0, 0.0, 0.0]).unwrap();
+
+        assert!(matches!(
+            e.erase(9999, "employer"),
+            Err(EngineError::Store(_)) | Err(EngineError::UnknownEntity(_))
+        ));
+
+        assert!(
+            e.assertions.contains_key(&0),
+            "drop_vectors must not run before store.erase has a chance to fail"
+        );
+        assert_eq!(e.index_len(), 1);
     }
 }
