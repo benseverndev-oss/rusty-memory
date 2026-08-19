@@ -680,7 +680,7 @@ impl MemoryStore {
             for (predicate, by_object) in by_predicate {
                 for object in by_object.into_keys() {
                     removed += 1;
-                    self.unhook_reverse(object, entity, &predicate);
+                    self.unhook_reverse(entity, &predicate, object);
                 }
             }
         }
@@ -758,7 +758,7 @@ impl MemoryStore {
         if let Some(by_predicate) = self.edges.remove(&from) {
             for (predicate, by_object) in by_predicate {
                 for (object, versions) in by_object {
-                    self.unhook_reverse(object, from, &predicate);
+                    self.unhook_reverse(from, &predicate, object);
                     moved += 1;
                     if object == to {
                         continue; // `to` -> `to`; see the self-edge note above
@@ -840,7 +840,7 @@ impl MemoryStore {
     /// derived `PartialEq`, and [`MemoryStore::open`] rebuilds it from the
     /// forward map with no empty entries at all, so leaving one makes a store
     /// unequal to its own round trip over a difference no query can see.
-    fn unhook_reverse(&mut self, object: StableId, subject: StableId, predicate: &str) {
+    fn unhook_reverse(&mut self, subject: StableId, predicate: &str, object: StableId) {
         if let Some(sources) = self.into.get_mut(&object) {
             // The set owns its predicate, so removing means building the whole
             // key. Borrowing one from the forward map instead would tie the
@@ -1586,6 +1586,25 @@ mod tests {
         );
     }
 
+    /// Assert a restore was refused for the reason the test is about.
+    ///
+    /// The variant alone is not enough: `open` runs its checks in a fixed
+    /// order, so a reordering could let a snapshot trip a *different* check and
+    /// still satisfy `matches!(err, CorruptSnapshot(_))` -- the test would keep
+    /// passing while no longer testing what its name says.
+    #[track_caller]
+    fn refused_because(err: &StoreError, expected: &str) {
+        let StoreError::CorruptSnapshot(why) = err else {
+            panic!("expected a CorruptSnapshot, got {err:?}");
+        };
+        assert!(
+            why.contains(expected),
+            "refused for the wrong reason
+  expected to contain: {expected}
+  actual: {why}"
+        );
+    }
+
     #[test]
     fn a_snapshot_whose_edge_names_an_unknown_entity_is_rejected() {
         // Built by mutating the parsed JSON, not by a string replace on the
@@ -1620,7 +1639,7 @@ mod tests {
         assert!(clash.is_none(), "setup: 4242 must not already be a key");
 
         let err = MemoryStore::open(&doc.to_string()).unwrap_err();
-        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+        refused_because(&err, "points at entity");
     }
 
     #[test]
@@ -1657,7 +1676,7 @@ mod tests {
         assert!(clash.is_none(), "setup: 4242 must not already be a key");
 
         let err = MemoryStore::open(&doc.to_string()).unwrap_err();
-        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+        refused_because(&err, "starts at entity");
     }
 
     #[test]
@@ -1689,7 +1708,7 @@ mod tests {
         by_object.insert(user.to_string(), versions);
 
         let err = MemoryStore::open(&doc.to_string()).unwrap_err();
-        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+        refused_because(&err, "to itself");
     }
 
     #[test]
@@ -1719,7 +1738,7 @@ mod tests {
         *log = serde_json::json!([]);
 
         let err = MemoryStore::open(&doc.to_string()).unwrap_err();
-        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+        refused_because(&err, "carries no versions");
     }
 
     #[test]
@@ -1743,14 +1762,24 @@ mod tests {
         let snapshot = store.snapshot();
 
         let mut predicate_level: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-        predicate_level["edges"][user.to_string()]["employed_by"] = serde_json::json!({});
+        let level = &mut predicate_level["edges"][user.to_string()]["employed_by"];
+        assert!(
+            level.as_object().is_some_and(|m| !m.is_empty()),
+            "setup: the predicate starts with an object under it, or emptying it proves nothing"
+        );
+        *level = serde_json::json!({});
         let err = MemoryStore::open(&predicate_level.to_string()).unwrap_err();
-        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+        refused_because(&err, "names no object");
 
         let mut subject_level: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-        subject_level["edges"][user.to_string()] = serde_json::json!({});
+        let level = &mut subject_level["edges"][user.to_string()];
+        assert!(
+            level.as_object().is_some_and(|m| !m.is_empty()),
+            "setup: the subject starts with a predicate under it, or emptying it proves nothing"
+        );
+        *level = serde_json::json!({});
         let err = MemoryStore::open(&subject_level.to_string()).unwrap_err();
-        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+        refused_because(&err, "no predicates in it");
     }
 
     // ---- wholesale edge surgery ---------------------------------------------
