@@ -287,7 +287,21 @@ impl Engine {
         // derived from a field the mention did not carry, and re-keying the
         // whole record is idempotent where keying the delta alone is not.
         let folded = self.identity[&entity].clone();
-        for key in self.keys_for(&folded) {
+        self.key_entity(entity, &folded);
+    }
+
+    /// Register one entity under every blocking key its record derives.
+    ///
+    /// The only writer that adds to `blocks`, so the dedup rule is stated once
+    /// instead of three times. It used to be three: `create_entity` and
+    /// `rebuild_blocks` pushed blind while `remember_identity` checked first,
+    /// and the three only agreed because each happened to be called at a moment
+    /// where a duplicate could not arise. That is a property of the callers, not
+    /// of the map, and a duplicate id in a block is silent — it makes
+    /// `candidates` score the same pair twice and, in `confirm`, makes a single
+    /// `retain` insufficient to remove an id.
+    pub(crate) fn key_entity(&mut self, entity: StableId, record: &Record) {
+        for key in self.keys_for(record) {
             let ids = self.blocks.entry(key).or_default();
             if !ids.contains(&entity) {
                 ids.push(entity);
@@ -390,17 +404,33 @@ impl Engine {
         // log it points into is in its final shape.
         self.adopt_assertions(absorbed, kept, &offsets);
 
-        // Fold identity and re-point the blocking map.
+        // Fold identity, and let the folded record say what the survivor is
+        // keyed under.
+        //
+        // The absorbed id is struck from every key it stood under, and nothing
+        // is pointed at the survivor that its own record cannot derive.
+        // Re-pointing the absorbed record's keys instead — which is what this
+        // did — re-broke the invariant `remember_identity` documents at length:
+        // `blocks` is derived from `identity`, and `remember_identity` keeps
+        // the first spelling of a field it already holds, so when both entities
+        // carry a blocking field with different values nothing folds and the
+        // survivor cannot derive the absorbed entity's key. The live map became
+        // a strict superset of what `rebuild_blocks` produces, and the same
+        // mention then resolved differently either side of a snapshot: no
+        // error, no difference in the stored facts, only a merge that happens
+        // or does not depending on when the process last restarted.
         if let Some(record) = self.identity.remove(&absorbed) {
-            self.remember_identity(kept, &record);
-            for key in self.keys_for(&record) {
-                if let Some(ids) = self.blocks.get_mut(&key) {
-                    ids.retain(|&id| id != absorbed);
-                    if !ids.contains(&kept) {
-                        ids.push(kept);
-                    }
-                }
+            for ids in self.blocks.values_mut() {
+                ids.retain(|&id| id != absorbed);
             }
+            // A key nobody stands under any more goes, because `rebuild_blocks`
+            // never creates an empty one and the two maps have to be equal, not
+            // merely equivalent.
+            self.blocks.retain(|_, ids| !ids.is_empty());
+            // Re-keys the survivor from the folded record whenever the fold
+            // learned a field; where it learned nothing the survivor's own keys
+            // are already in place, because every writer keys the whole record.
+            self.remember_identity(kept, &record);
         }
 
         // Any other open question naming the absorbed entity now names the
@@ -517,9 +547,7 @@ impl Engine {
         let id = self
             .store
             .create_entity(&obs.kind, obs.provenance.observed_at);
-        for key in self.keys_for(&obs.mention) {
-            self.blocks.entry(key).or_default().push(id);
-        }
+        self.key_entity(id, &obs.mention);
         self.identity.insert(id, obs.mention.clone());
         id
     }
@@ -1240,6 +1268,59 @@ mod tests {
         assert!(
             e.candidates(&by_email).contains(&entity),
             "a blocking key learned on a later observation must still reach the entity"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_merge_leaves_the_blocking_map_a_reload_would_rebuild() {
+        // `blocks` is derived from `identity`, and `remember_identity` keeps
+        // the first spelling of a field it already holds — so when both
+        // entities carry a blocking field with different values, nothing folds
+        // and the survivor's record cannot derive the absorbed entity's key.
+        // Re-pointing the absorbed record's keys at the survivor therefore
+        // leaves the live map holding a key `rebuild_blocks` would never
+        // produce, and the same mention resolves differently either side of a
+        // snapshot. `test_ruleset`'s single `Prefix("name", 3)` cannot show
+        // this: both spellings derive the same key, so nothing diverges.
+        let mut e = Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            email_blocking_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        );
+        let mut first = observation("Ben Severn", "employer", "Acme", 1);
+        first.mention = Record::new()
+            .with("name", "Ben Severn")
+            .with("email", "ben@example.com");
+        e.remember(first).unwrap();
+
+        let mut second = observation("Ben Severn", "employer", "Globex", 2);
+        second.mention = Record::new()
+            .with("name", "Ben Severn")
+            .with("email", "b.severn@example.com");
+        let out = e.remember(second).unwrap();
+        let Remembered::CreatedPendingReview { review, .. } = out else {
+            panic!("setup: two emails on one name is a question, got {out:?}")
+        };
+        e.confirm(review[0]).unwrap();
+
+        let restored = Engine::open(
+            &e.snapshot(),
+            email_blocking_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        )
+        .unwrap();
+        assert_eq!(
+            e.blocks, restored.blocks,
+            "a live blocking map that outruns the one a reload rebuilds is a \
+             merge that happens or does not depending on when the process last \
+             restarted"
+        );
+
+        // The same statement as something a caller can observe.
+        let absorbed_email = Record::new().with("email", "b.severn@example.com");
+        assert_eq!(
+            e.candidates(&absorbed_email),
+            restored.candidates(&absorbed_email)
         );
     }
 

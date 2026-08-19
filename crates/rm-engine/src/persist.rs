@@ -219,6 +219,11 @@ impl Engine {
     /// The ruleset is the live one supplied to `open`, not whichever one the
     /// snapshot was written under, which is the point: change the blocking
     /// rules and the map reflects them on the next load.
+    ///
+    /// This is the definition every live mutation of `blocks` has to agree
+    /// with, so it keys through [`Engine::key_entity`] rather than pushing
+    /// directly — two spellings of the same rule are how a live map and a
+    /// rebuilt one come to disagree.
     fn rebuild_blocks(&mut self) {
         self.blocks.clear();
         let entries: Vec<(StableId, Record)> = self
@@ -227,9 +232,7 @@ impl Engine {
             .map(|(&id, r)| (id, r.clone()))
             .collect();
         for (id, record) in entries {
-            for key in self.keys_for(&record) {
-                self.blocks.entry(key).or_default().push(id);
-            }
+            self.key_entity(id, &record);
         }
     }
 }
