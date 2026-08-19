@@ -77,6 +77,8 @@ pub enum StoreError {
     /// draw that line with a variant of this name; drawing it differently here
     /// would make the three doors read as three unrelated designs.
     CorruptSnapshot(String),
+    /// An edge from an entity to itself.
+    SelfEdge(StableId),
 }
 
 impl std::fmt::Display for StoreError {
@@ -91,6 +93,7 @@ impl std::fmt::Display for StoreError {
                     "snapshot parsed but describes an impossible store: {why}"
                 )
             }
+            StoreError::SelfEdge(id) => write!(f, "entity {id} cannot relate to itself; a self-edge carries nothing a traversal can use, and a merge drops the ones it creates"),
         }
     }
 }
@@ -158,6 +161,41 @@ impl Version {
     }
 }
 
+/// One assertion about a relationship, positioned on both time axes.
+///
+/// The edge counterpart of [`Version`], and deliberately the same shape:
+/// `present: false` is a tombstone asserting the relationship did *not* hold
+/// over `valid`, exactly as a `Version` with `value: None` asserts an attribute
+/// had none. Keeping the two models identical is what lets edges inherit
+/// bi-temporality, provenance and the restore path without a second
+/// implementation to keep honest against the first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeVersion {
+    pub present: bool,
+    pub valid: Interval,
+    pub provenance: Provenance,
+}
+
+impl EdgeVersion {
+    /// Transaction time: when this assertion entered the store.
+    pub fn ingested_at(&self) -> Timestamp {
+        self.provenance.observed_at
+    }
+}
+
+/// A relationship in force at the queried point on both axes.
+///
+/// Borrowed rather than owned, and carrying its endpoints, so a caller reading
+/// a neighbourhood never has to reassemble the key it asked about.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Edge<'a> {
+    pub subject: StableId,
+    pub predicate: &'a str,
+    pub object: StableId,
+    pub valid: Interval,
+    pub provenance: &'a Provenance,
+}
+
 /// An entity and everything ever asserted about it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entity {
@@ -179,6 +217,14 @@ pub struct Entity {
 pub struct MemoryStore {
     entities: BTreeMap<StableId, Entity>,
     next_id: StableId,
+    /// subject -> predicate -> object -> version log.
+    ///
+    /// Nested rather than keyed on a `(subject, predicate, object)` tuple
+    /// because `serde_json` cannot use a tuple as a JSON object key — only
+    /// scalars stringify. Nesting keeps every level a `BTreeMap`, so snapshots
+    /// stay byte-stable, and makes `edges_from` one lookup rather than a scan.
+    #[serde(default)]
+    edges: BTreeMap<StableId, BTreeMap<String, BTreeMap<StableId, Vec<EdgeVersion>>>>,
 }
 
 impl MemoryStore {
@@ -398,6 +444,135 @@ impl MemoryStore {
             .map_or(0, |versions| versions.len()))
     }
 
+    /// Record that a relationship held over `valid`.
+    ///
+    /// Appends; it does not overwrite. Asserting the same triple again is a
+    /// correction, and both versions survive so the earlier belief stays
+    /// reconstructible — the same rule [`MemoryStore::assert`] follows.
+    ///
+    /// Both endpoints must exist. A dangling edge is a lie a traversal would
+    /// follow without complaint, and since ids are never reused, one that names
+    /// nothing today will never name anything.
+    pub fn relate(
+        &mut self,
+        subject: StableId,
+        predicate: impl Into<String>,
+        object: StableId,
+        valid: Interval,
+        provenance: Provenance,
+    ) -> Result<(), StoreError> {
+        self.push_edge(
+            subject,
+            predicate.into(),
+            object,
+            EdgeVersion {
+                present: true,
+                valid,
+                provenance,
+            },
+        )
+    }
+
+    /// Record that a relationship stopped holding at `at`.
+    ///
+    /// Appends a tombstone rather than editing the earlier assertion, so
+    /// [`MemoryStore::edge_history`] still shows that it held and who said so.
+    /// Ending a relationship is a fact with provenance, not an untraceable edit
+    /// — the same distinction `forget` draws for attributes.
+    pub fn unrelate(
+        &mut self,
+        subject: StableId,
+        predicate: &str,
+        object: StableId,
+        at: Timestamp,
+        provenance: Provenance,
+    ) -> Result<(), StoreError> {
+        self.push_edge(
+            subject,
+            predicate.to_string(),
+            object,
+            EdgeVersion {
+                present: false,
+                valid: Interval::since(at),
+                provenance,
+            },
+        )
+    }
+
+    /// Validate the endpoints and append one edge version.
+    fn push_edge(
+        &mut self,
+        subject: StableId,
+        predicate: String,
+        object: StableId,
+        version: EdgeVersion,
+    ) -> Result<(), StoreError> {
+        for id in [subject, object] {
+            if !self.entities.contains_key(&id) {
+                return Err(StoreError::UnknownEntity(id));
+            }
+        }
+        if subject == object {
+            return Err(StoreError::SelfEdge(subject));
+        }
+        self.edges
+            .entry(subject)
+            .or_default()
+            .entry(predicate)
+            .or_default()
+            .entry(object)
+            .or_default()
+            .push(version);
+        Ok(())
+    }
+
+    /// Edges out of `subject` in force at `valid_t`, as known by `tx_t`.
+    ///
+    /// Per triple, the latest-ingested version we had by `tx_t` whose validity
+    /// covers `valid_t` — the same resolution [`MemoryStore::as_of`] performs
+    /// for an attribute. Ordered by `(predicate, object)` so two runs agree.
+    pub fn edges_from(
+        &self,
+        subject: StableId,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+    ) -> Vec<Edge<'_>> {
+        let Some(by_predicate) = self.edges.get(&subject) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (predicate, by_object) in by_predicate {
+            for (&object, versions) in by_object {
+                if let Some(v) = in_force(versions, valid_t, tx_t) {
+                    out.push(Edge {
+                        subject,
+                        predicate,
+                        object,
+                        valid: v.valid,
+                        provenance: &v.provenance,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Every version ever asserted for one triple, in append order.
+    ///
+    /// Empty for a triple never discussed — asking is not an error.
+    pub fn edge_history(
+        &self,
+        subject: StableId,
+        predicate: &str,
+        object: StableId,
+    ) -> &[EdgeVersion] {
+        self.edges
+            .get(&subject)
+            .and_then(|m| m.get(predicate))
+            .and_then(|m| m.get(&object))
+            .map_or(&[], |v| v.as_slice())
+    }
+
     /// Serialise to canonical JSON.
     ///
     /// `BTreeMap` ordering makes this byte-stable for a given state, so two
@@ -448,6 +623,22 @@ fn held_to_value(held: Held) -> Option<String> {
         Held::Value(v) => Some(v),
         Held::Absent => None,
     }
+}
+
+/// The version in force at a point on both axes, if the relationship held.
+///
+/// Latest ingested wins among versions covering `valid_t`, breaking ingestion
+/// ties toward the later append — the same rule, and the same tie-break, as
+/// `as_of` uses for attributes. A winning tombstone yields `None`: the
+/// relationship was considered and found not to hold, which is the answer.
+fn in_force(versions: &[EdgeVersion], valid_t: Timestamp, tx_t: Timestamp) -> Option<&EdgeVersion> {
+    versions
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.ingested_at() <= tx_t && v.valid.contains(valid_t))
+        .max_by_key(|(i, v)| (v.ingested_at(), *i))
+        .map(|(_, v)| v)
+        .filter(|v| v.present)
 }
 
 #[cfg(test)]
@@ -740,6 +931,176 @@ mod tests {
         assert_eq!(
             store.erase(9999, "employer"),
             Err(StoreError::UnknownEntity(9999))
+        );
+    }
+
+    // ---- edges --------------------------------------------------------------
+
+    #[test]
+    fn an_edge_is_bitemporal_like_an_attribute() {
+        // Told in September that they joined in July: the edge is valid from
+        // July, but we did not know it in August.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JUL),
+                user_said(SEP),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.edges_from(user, AUG, AUG).len(),
+            0,
+            "not known in August"
+        );
+        assert_eq!(
+            store.edges_from(user, AUG, OCT).len(),
+            1,
+            "known by October, true in August"
+        );
+        assert_eq!(
+            store.edges_from(user, MAR, OCT).len(),
+            0,
+            "not true in March"
+        );
+    }
+
+    #[test]
+    fn unrelate_stops_the_edge_without_erasing_that_it_held() {
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .unrelate(user, "employed_by", acme, JUL, user_said(JUL))
+            .unwrap();
+
+        assert_eq!(
+            store.edges_from(user, MAR, OCT).len(),
+            1,
+            "it held in March"
+        );
+        assert_eq!(
+            store.edges_from(user, AUG, OCT).len(),
+            0,
+            "and not in August"
+        );
+        assert_eq!(
+            store.edge_history(user, "employed_by", acme).len(),
+            2,
+            "ending a relationship is a fact, not an erasure"
+        );
+    }
+
+    #[test]
+    fn two_employers_at_once_both_stand() {
+        // Arrival does not entail departure. Closing the first edge is an
+        // inference, and the store records what was said rather than inferring.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        let globex = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .relate(
+                user,
+                "employed_by",
+                globex,
+                Interval::since(JUL),
+                user_said(JUL),
+            )
+            .unwrap();
+
+        assert_eq!(store.edges_from(user, AUG, OCT).len(), 2);
+    }
+
+    #[test]
+    fn an_edge_naming_an_unknown_entity_is_rejected() {
+        let (mut store, user) = store_with_user();
+        assert_eq!(
+            store.relate(
+                user,
+                "employed_by",
+                9999,
+                Interval::since(JAN),
+                user_said(JAN)
+            ),
+            Err(StoreError::UnknownEntity(9999))
+        );
+        assert_eq!(
+            store.relate(
+                9999,
+                "employed_by",
+                user,
+                Interval::since(JAN),
+                user_said(JAN)
+            ),
+            Err(StoreError::UnknownEntity(9999))
+        );
+    }
+
+    #[test]
+    fn an_edge_from_an_entity_to_itself_is_rejected() {
+        // It carries nothing a walk can use, and a merge drops the self-edges it
+        // creates -- accepting one at the front door while dropping it at the
+        // back would be two answers to the same question.
+        let (mut store, user) = store_with_user();
+        assert!(store
+            .relate(user, "knows", user, Interval::since(JAN), user_said(JAN))
+            .is_err());
+    }
+
+    #[test]
+    fn a_later_assertion_about_the_same_edge_supersedes_the_earlier_one() {
+        // Same key, and both versions cover August, so the latest ingested wins
+        // -- exactly as for an attribute (see
+        // `a_tombstone_can_itself_be_superseded`). A merely *narrower* `relate`
+        // would not do this: presence is not read as an implicit end (see
+        // `two_employers_at_once_both_stand`), so for the later version to
+        // actually govern August it has to say something about August -- here,
+        // that the relationship did not hold.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .unrelate(user, "employed_by", acme, JAN, user_said(JUL))
+            .unwrap();
+
+        assert_eq!(
+            store.edges_from(user, AUG, OCT).len(),
+            0,
+            "the correction superseded it"
+        );
+        assert_eq!(
+            store.edges_from(user, AUG, MAR).len(),
+            1,
+            "but we believed otherwise in March"
         );
     }
 
