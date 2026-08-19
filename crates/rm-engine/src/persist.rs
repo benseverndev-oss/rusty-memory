@@ -149,6 +149,23 @@ impl Engine {
             }
         }
 
+        // The mirror of the assertion check below. `identity` is the engine's
+        // entity set, and an entry in it that the store has never heard of is
+        // not inert: it is keyed into the blocking map by `rebuild_blocks`, so
+        // it stands in front of every future mention as a candidate, and a
+        // `Match` against it sends `remember` into `store.assert` with an id
+        // the store rejects — an `UnknownEntity` naming an entity the caller
+        // was just told exists. One check at the door instead of a misleading
+        // error on the first write that happens to resolve this way.
+        for id in p.identity.keys() {
+            if store.entity(*id).is_none() {
+                return Err(EngineError::CorruptSnapshot(format!(
+                    "identity {id} is not an entity the store holds, so resolving \
+                     against it would produce a match nothing can be written to"
+                )));
+            }
+        }
+
         for (id, entry) in &p.assertions {
             if store.entity(entry.entity).is_none() {
                 return Err(EngineError::CorruptSnapshot(format!(
@@ -178,6 +195,28 @@ impl Engine {
                     "assertion {id} has no vector, so it could never be recalled"
                 )));
             }
+        }
+        // And the reverse direction, which the loop above cannot see. Every
+        // assertion now has a vector, so the index holds at least as many as
+        // there are assertions; anything beyond that is a vector no assertion
+        // claims. It is not harmless: `search_filtered` scans it, `recall`
+        // silently drops the hit it cannot resolve, and `index_len` reports a
+        // store larger than anything a query can reach — the same "counts
+        // right, answers wrong" shape the id-to-row map already taught this
+        // crate to distrust.
+        //
+        // Compared by length rather than by iterating the index's ids, because
+        // `VectorIndex` deliberately exposes no id iterator. Given the check
+        // above, equal lengths are exactly the bijection the spec asks for, so
+        // widening `rm_index`'s API to restate it here would buy nothing.
+        if index.len() != p.assertions.len() {
+            return Err(EngineError::CorruptSnapshot(format!(
+                "the index holds {} vectors but only {} assertions claim one, so \
+                 {} could be found and never resolved",
+                index.len(),
+                p.assertions.len(),
+                index.len() - p.assertions.len()
+            )));
         }
         for pending in p.review.values() {
             for id in [pending.a, pending.b] {

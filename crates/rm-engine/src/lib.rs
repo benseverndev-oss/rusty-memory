@@ -1968,6 +1968,74 @@ mod tests {
     }
 
     #[test]
+    fn a_vector_no_assertion_claims_is_rejected_not_restored() {
+        // The mirror of `an_assertion_belonging_to_no_known_identity...`: every
+        // assertion here has its vector, and the index has one more besides.
+        // Nothing about it is malformed, so `VectorIndex::open` waves it
+        // through, and nothing downstream reports it either — the scan visits
+        // it, `recall` drops the hit it cannot resolve, and `index_len` keeps
+        // counting it as searchable.
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&e.snapshot()).unwrap();
+        let mut index: serde_json::Value =
+            serde_json::from_str(doc["index"].as_str().unwrap()).unwrap();
+        index["ids"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(1));
+        index["vectors"]
+            .as_array_mut()
+            .unwrap()
+            .extend([serde_json::json!(0.0), serde_json::json!(1.0)]);
+        index["vectors"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!(0.0));
+        doc["index"] = serde_json::json!(index.to_string());
+
+        let Err(err) = Engine::open(
+            &doc.to_string(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        ) else {
+            panic!("an orphan vector must not open");
+        };
+        assert!(
+            matches!(err, EngineError::CorruptSnapshot(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_identity_the_store_never_heard_of_is_rejected_not_restored() {
+        // The symmetric case to an assertion naming a missing entity, and the
+        // one that used to get through. It is not inert: `rebuild_blocks` keys
+        // it, so it stands in front of every future mention, and the `Match` it
+        // eventually wins sends `remember` into `store.assert` with an id the
+        // store rejects. The caller sees `UnknownEntity` naming an entity the
+        // engine had just resolved against.
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&e.snapshot()).unwrap();
+        doc["identity"]["99"] = serde_json::json!({"fields": {"name": "Ben Severn"}});
+
+        let Err(err) = Engine::open(
+            &doc.to_string(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        ) else {
+            panic!("an identity the store does not hold must not open");
+        };
+        assert!(
+            matches!(err, EngineError::CorruptSnapshot(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
     fn a_corrupt_nested_index_is_rejected_by_its_own_door() {
         // One id at three dimensions needs three floats. `rm_index` already
         // rejects this and already has tests for it; restoring through
