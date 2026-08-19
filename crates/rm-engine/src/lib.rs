@@ -1347,6 +1347,12 @@ mod tests {
         let hits = e.recall(&q).unwrap();
         assert_eq!(hits.len(), 1, "September's news is not August's knowledge");
         assert_eq!(hits[0].value.as_deref(), Some("Acme"));
+        assert!(
+            !hits[0].superseded,
+            "Globex was learned after the horizon, so it must not count as \
+             superseding Acme — only later knowledge the horizon has already \
+             seen can do that"
+        );
     }
 
     #[test]
