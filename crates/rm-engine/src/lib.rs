@@ -24,6 +24,7 @@
 //! agent that fuses two people because they scored in the middle has corrupted
 //! its memory permanently and silently.
 
+mod ingest;
 mod persist;
 mod policy;
 mod read;
@@ -36,6 +37,7 @@ use rm_resolve::Decision;
 use rm_store::MemoryStore;
 use serde::{Deserialize, Serialize};
 
+pub use ingest::{Closed, Embedder, EmbedderError, Ingested};
 pub use policy::Policy;
 pub use read::{Believed, Query, Recalled};
 pub use review::{PendingReview, ReviewId, Settled};
@@ -56,7 +58,19 @@ pub use review::{PendingReview, ReviewId, Settled};
 //
 // Only the surface those signatures reach is re-exported. `MemoryStore`,
 // `Outcome` and the rest stay behind the engine, which owns them.
+//
+// `extract` and `prompt` are re-exported alongside the types they build and
+// consume, for the same reason: a caller who has to reach into `rm-extract`
+// for the function while naming its types through `rm-engine` has the worst
+// of both, and `tests/extract.rs` calls `rm_engine::extract` to prove it does
+// not have to. A caller ingesting a turn needs to name every type in
+// `extract`'s signature and in `ingest`'s, which is why the full list below
+// goes past what `Extraction` alone would require.
 pub use rm_core::{Interval, Provenance, Source, Timestamp};
+pub use rm_extract::{
+    extract, prompt, Closure, Completer, CompleterError, ExtractError, Extraction, Fact, Mention,
+    Relation, Turn,
+};
 pub use rm_graph::{Direction, Neighborhood, Reached, Walk};
 pub use rm_index::{IndexError, Metric, VectorIndex};
 pub use rm_resolve::{BlockingKey, Comparator, FieldRule, Record, Ruleset};
@@ -100,6 +114,8 @@ pub enum EngineError {
     UnknownEntity(StableId),
     UnknownReview(ReviewId),
     CorruptSnapshot(String),
+    /// The host's embedder failed. Carries its explanation.
+    Embed(EmbedderError),
 }
 
 /// Relabel the store's "no such entity" as the engine's own on a write.
@@ -130,6 +146,7 @@ impl std::fmt::Display for EngineError {
                     "snapshot parsed but describes an impossible engine: {why}"
                 )
             }
+            EngineError::Embed(e) => write!(f, "{e}"),
         }
     }
 }
@@ -151,6 +168,12 @@ impl From<StoreError> for EngineError {
 impl From<Refused> for EngineError {
     fn from(e: Refused) -> Self {
         EngineError::Refused(e)
+    }
+}
+
+impl From<EmbedderError> for EngineError {
+    fn from(e: EmbedderError) -> Self {
+        EngineError::Embed(e)
     }
 }
 
@@ -2832,5 +2855,134 @@ mod tests {
             Policy::new(Strategy::MostRecent)
         )
         .is_err());
+    }
+
+    /// An embedder that maps text to a vector by hashing its bytes into three
+    /// buckets. Deterministic, offline, and different texts get different
+    /// vectors -- which is all any test here needs.
+    struct Buckets;
+
+    impl Embedder for Buckets {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+            let mut v = [0.0f32; 3];
+            for (i, b) in text.bytes().enumerate() {
+                v[i % 3] += f32::from(b);
+            }
+            // A zero vector is refused under cosine, and an empty string would
+            // produce one.
+            if v.iter().all(|x| *x == 0.0) {
+                v[0] = 1.0;
+            }
+            Ok(v.to_vec())
+        }
+    }
+
+    struct NoEmbedder;
+
+    impl Embedder for NoEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedderError> {
+            Err(EmbedderError("the embedding service is down".to_string()))
+        }
+    }
+
+    fn mention(kind: &str, name: &str) -> rm_extract::Mention {
+        rm_extract::Mention {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            text: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn every_mention_becomes_an_entity_even_with_no_facts_about_it() {
+        // A place named only as the object of an edge still has to exist, or
+        // the edge could not name it.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn"), mention("place", "Bristol")],
+            ..Default::default()
+        };
+
+        let out = e.ingest(&extraction, &Buckets).unwrap();
+        assert_eq!(out.entities.len(), 2);
+        assert_eq!(e.entity_count(), 2);
+        assert_ne!(out.entities[0], out.entities[1]);
+    }
+
+    #[test]
+    fn a_mention_is_recorded_with_its_kind_so_it_can_be_recalled_at_all() {
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("place", "Bristol")],
+            ..Default::default()
+        };
+        let out = e.ingest(&extraction, &Buckets).unwrap();
+        assert_eq!(
+            e.about(out.entities[0], "kind", 100, 100).unwrap(),
+            Believed::Value("place".into())
+        );
+    }
+
+    #[test]
+    fn a_failing_embedder_leaves_the_store_and_the_index_untouched() {
+        // The same guarantee `remember` makes: a write that cannot complete
+        // must cost nothing, because a fact with no vector to find it is
+        // undetectable from outside.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            ..Default::default()
+        };
+
+        let err = e.ingest(&extraction, &NoEmbedder).unwrap_err();
+        assert!(matches!(err, EngineError::Embed(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("embedding service is down"),
+            "the host's own explanation must survive: {err}"
+        );
+        assert_eq!(e.entity_count(), 0);
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn an_ambiguous_mention_comes_back_as_a_review_rather_than_a_merge() {
+        // Resolution's middle band survives ingestion. A turn naming someone
+        // who might be someone already known must not quietly merge them, and
+        // the question has to reach the caller -- a review nobody can see is
+        // the same as no review.
+        let mut e = engine();
+        let first = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            ..Default::default()
+        };
+        e.ingest(&first, &Buckets).unwrap();
+
+        let second = rm_extract::Extraction {
+            mentions: vec![rm_extract::Mention {
+                kind: "person".to_string(),
+                name: "Ben Severne".to_string(),
+                text: "Ben Severne".to_string(),
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&second, &Buckets).unwrap();
+
+        assert_eq!(out.reviews.len(), 1, "the near-miss has to be asked about");
+        assert_eq!(
+            e.entity_count(),
+            2,
+            "and they stay apart until someone answers"
+        );
+        assert_eq!(e.pending_review().len(), 1);
+    }
+
+    #[test]
+    fn ingesting_nothing_writes_nothing_and_is_not_an_error() {
+        let mut e = engine();
+        let out = e
+            .ingest(&rm_extract::Extraction::default(), &Buckets)
+            .unwrap();
+        assert!(out.entities.is_empty());
+        assert_eq!(e.entity_count(), 0);
     }
 }
