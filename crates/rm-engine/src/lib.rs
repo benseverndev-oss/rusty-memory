@@ -47,7 +47,9 @@ pub use review::{PendingReview, ReviewId, Settled};
 // every one of these types appears in this crate's own signatures: `Ruleset`
 // and `VectorIndex` in `new`, `Record`/`Interval`/`Provenance` in
 // `Observation`, `StableId` in nearly everything, `Version` in the return type
-// of `store_history`. A caller could not name the last of those at all without
+// of `store_history`, `Edge` in `edges_from` and `edges_into`, and
+// `EdgeVersion` in `edge_history`. A caller could not name the last of those
+// at all without
 // adding `rm-store` to their manifest, which makes an internal decomposition —
 // five crates instead of one — into something the caller has to know about and
 // track. `tests/readme.rs` exists to prove the public API is sufficient, and it
@@ -739,8 +741,11 @@ impl Engine {
     /// # Errors
     ///
     /// [`EngineError::UnknownEntity`] if `entity` names no entity the store
-    /// holds — see [`rm_store::MemoryStore::erase_edges`] for why that, and
-    /// not a bare `Ok(0)`, is what an unknown id gets.
+    /// holds — see `rm_store::MemoryStore::erase_edges` for why that, and not
+    /// a bare `Ok(0)`, is what an unknown id gets. Named rather than linked,
+    /// as [`Engine::erase`] names `erase`: `MemoryStore` is deliberately not
+    /// re-exported, so a link would take a reader to a type they cannot write
+    /// down without adding `rm-store` to their manifest.
     pub fn erase_edges(&mut self, entity: StableId) -> Result<usize, EngineError> {
         self.store.erase_edges(entity).map_err(on_write)
     }
@@ -767,7 +772,9 @@ impl Engine {
     /// Record that a relationship stopped holding at `at`.
     ///
     /// The edge counterpart of [`Engine::forget`]: a walk stops crossing it,
-    /// and `edge_history` still shows that it held and who said so.
+    /// and [`Engine::edge_history`] still shows that it held and who said so.
+    /// Appending a tombstone rather than deleting is only defensible because
+    /// that call exists — a record no caller can read is not a record.
     pub fn unrelate(
         &mut self,
         subject: StableId,
@@ -793,6 +800,50 @@ impl Engine {
         rm_graph::neighborhood(&self.store, walk)
     }
 
+    /// Relationships out of `subject` in force at `valid_t`, as known by
+    /// `tx_t`.
+    ///
+    /// [`Engine::neighborhood`] answers which entities a walk reaches and how
+    /// far away they are; it deliberately hands back ids and distances and
+    /// nothing else, because a walk of any depth cannot say which edge carried
+    /// it without inventing a path when several did. This is the other
+    /// question — one hop, fully described: the predicate, the interval it
+    /// held over, and who said so. A caller rendering "where does Alice work,
+    /// and on whose word" needs that and cannot reconstruct it from a
+    /// [`Reached`].
+    ///
+    /// Both axes are required and neither is defaulted, for the same reason
+    /// [`Walk`] requires them: an edge read without a `tx_t` is a claim about
+    /// now that quietly stops being reproducible.
+    pub fn edges_from(
+        &self,
+        subject: StableId,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+    ) -> Vec<Edge<'_>> {
+        self.store.edges_from(subject, valid_t, tx_t)
+    }
+
+    /// Relationships into `object` in force at `valid_t`, as known by `tx_t`.
+    ///
+    /// The mirror of [`Engine::edges_from`], answering "who works at Acme"
+    /// rather than "where does Alice work". Both directions are exposed
+    /// because the store keeps both and [`Direction`] already lets a walk go
+    /// either way: offering only the forward half would make the reverse
+    /// question answerable by traversal but not by inspection.
+    ///
+    /// An id the store does not hold has no edges rather than being an error,
+    /// exactly as [`Engine::about`] answers [`Believed::Unknown`]. Asking is
+    /// not an instruction.
+    pub fn edges_into(
+        &self,
+        object: StableId,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+    ) -> Vec<Edge<'_>> {
+        self.store.edges_into(object, valid_t, tx_t)
+    }
+
     /// Remove every indexed vector for one attribute of one entity.
     fn drop_vectors(&mut self, entity: StableId, attribute: &str) {
         let doomed: Vec<AssertionId> = self
@@ -811,6 +862,34 @@ impl Engine {
     /// an answer.
     pub fn store_history(&self, entity: StableId, attribute: &str) -> &[rm_store::Version] {
         self.store.history(entity, attribute)
+    }
+
+    /// The raw version log for one relationship, in append order.
+    ///
+    /// The edge counterpart of [`Engine::store_history`], and the call that
+    /// makes [`Engine::unrelate`] honest. `unrelate` appends a tombstone
+    /// instead of deleting, and justifies that by saying the record still
+    /// shows the relationship held and who said so — a promise worth nothing
+    /// if the only type that can read it is one the engine keeps to itself.
+    /// This is where an audit, a "why do you think that" answer, or a
+    /// correction that has to see what it is correcting reaches it.
+    ///
+    /// No time arguments, deliberately: this is the log, not a query over it.
+    /// [`Engine::edges_from`] resolves a point on both axes; asking for the
+    /// history and then filtering it is a different job, and one whose rules
+    /// the caller should be able to see rather than inherit.
+    ///
+    /// Empty for a triple never discussed. Asking about a relationship nobody
+    /// ever asserted is a question, not a mistake, and it answers the same as
+    /// a triple whose versions were erased — [`Engine::erase_edges`] destroys
+    /// the trail, which is exactly what it is documented to do.
+    pub fn edge_history(
+        &self,
+        subject: StableId,
+        predicate: &str,
+        object: StableId,
+    ) -> &[EdgeVersion] {
+        self.store.edge_history(subject, predicate, object)
     }
 }
 

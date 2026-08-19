@@ -5,16 +5,17 @@
 //! alone cannot reach.
 //!
 //! One `use`, from one crate. A caller composing a [`Walk`] and reading back a
-//! [`Neighborhood`] of [`Reached`] entities, choosing a [`Direction`], and
-//! matching on [`EngineError::UnknownEntity`] must be able to do all of that
-//! by naming only `rm_engine` types — never `rm-graph` or `rm-store` in this
-//! crate's own manifest. If this file needed a second dependency to compile,
-//! task 6's re-export list would be incomplete.
+//! [`Neighborhood`] of [`Reached`] entities, choosing a [`Direction`], reading
+//! an [`Edge`] or the [`EdgeVersion`]s behind it, and matching on
+//! [`EngineError::UnknownEntity`] must be able to do all of that by naming
+//! only `rm_engine` types — never `rm-graph` or `rm-store` in this crate's own
+//! manifest. If this file needed a second dependency to compile, task 6's
+//! re-export list would be incomplete.
 
 use rm_engine::{
-    BlockingKey, Comparator, Direction, Engine, EngineError, FieldRule, Interval, Metric,
-    Neighborhood, Observation, Policy, Provenance, Reached, Record, Remembered, Ruleset, Source,
-    Strategy, VectorIndex, Walk,
+    BlockingKey, Comparator, Direction, Edge, EdgeVersion, Engine, EngineError, FieldRule,
+    Interval, Metric, Neighborhood, Observation, Policy, Provenance, Reached, Record, Remembered,
+    Ruleset, Source, Strategy, VectorIndex, Walk,
 };
 
 fn ruleset() -> Ruleset {
@@ -119,6 +120,72 @@ fn a_caller_can_compose_a_walk_from_rm_engine_alone() {
         e.erase_edges(9999),
         Err(EngineError::UnknownEntity(9999)),
         "the error variant is nameable without a second crate too"
+    );
+}
+
+#[test]
+fn an_unrelated_edge_still_shows_that_it_held_and_who_said_so() {
+    // `unrelate` appends a tombstone rather than deleting, and justifies that
+    // by saying the record still shows the relationship held. That is a promise
+    // about what a caller can read, so it has to be provable from the engine's
+    // own surface -- and it is the reason `Edge` and `EdgeVersion` are
+    // re-exported rather than left behind the engine with `MemoryStore`.
+    let mut e = engine();
+    let Remembered::Created { entity: alice, .. } = e.remember(person("Alice", 1)).unwrap() else {
+        panic!("setup")
+    };
+    let Remembered::Created { entity: bob, .. } = e.remember(person("Bob", 1)).unwrap() else {
+        panic!("setup")
+    };
+
+    e.relate(
+        alice,
+        "knows",
+        bob,
+        Interval::since(1),
+        Provenance::new(Source::UserAssertion, 1, "the-introduction"),
+    )
+    .unwrap();
+
+    let live: Vec<Edge<'_>> = e.edges_from(alice, 2, 2);
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].object, bob);
+    assert_eq!(live[0].predicate, "knows");
+    assert_eq!(
+        live[0].provenance.source_ref, "the-introduction",
+        "an edge carries who said so, which a Reached cannot"
+    );
+    assert_eq!(e.edges_into(bob, 2, 2).len(), 1, "and the reverse question");
+
+    e.unrelate(
+        alice,
+        "knows",
+        bob,
+        5,
+        Provenance::new(Source::UserAssertion, 5, "the-falling-out"),
+    )
+    .unwrap();
+
+    assert!(
+        e.edges_from(alice, 9, 9).is_empty(),
+        "the relationship has stopped holding"
+    );
+    assert_eq!(
+        e.edges_from(alice, 2, 9).len(),
+        1,
+        "but it still held in February, which is the point of a tombstone"
+    );
+
+    let history: &[EdgeVersion] = e.edge_history(alice, "knows", bob);
+    assert_eq!(history.len(), 2, "two assertions, neither one overwritten");
+    assert!(history[0].present);
+    assert_eq!(history[0].provenance.source_ref, "the-introduction");
+    assert!(!history[1].present, "the tombstone");
+    assert_eq!(history[1].provenance.source_ref, "the-falling-out");
+
+    assert!(
+        e.edge_history(bob, "knows", alice).is_empty(),
+        "a triple nobody asserted is empty, not an error"
     );
 }
 
