@@ -134,7 +134,7 @@ job, i.e. ours.
 ```
 rusty-memory/
   crates/
-    rm-core/       # Memory, Provenance, temporal types. No deps.
+    rm-core/       # Provenance + bi-temporal model. serde only.
     rm-store/      # goldengraph-core::store + attribute history
     rm-graph/      # model / resolve / retrieve / community
     rm-resolve/    # score-core + goldenfuzz + goldenphonetic over memories
