@@ -866,6 +866,67 @@ mod tests {
     }
 
     #[test]
+    fn a_second_merge_still_leaves_every_assertion_on_its_own_value() {
+        // One merge is not enough to protect the renumbering. It leaves the
+        // survivor holding assertions whose ids no longer run in version
+        // order — here assertion 1 ends up at version 2 — and it is only the
+        // *next* merge that has to sort them back into log order. Without a
+        // chained merge, dropping the version from the sort key changes
+        // nothing and the regression ships unnoticed.
+        let mut e = engine();
+        let first = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let second = e.remember(ambiguous()).unwrap();
+        let third = e
+            .remember(observation("Ben Severn", "employer", "Initech", 3))
+            .unwrap();
+
+        let (
+            Remembered::Created {
+                assertion: acme, ..
+            },
+            Remembered::CreatedPendingReview {
+                assertion: globex,
+                review: first_review,
+                ..
+            },
+            Remembered::Merged {
+                assertion: initech, ..
+            },
+        ) = (first, second, third)
+        else {
+            panic!("setup")
+        };
+        e.confirm(first_review[0]).unwrap();
+
+        // A third entity, near-missing the survivor the same way the second
+        // did, and merged in turn.
+        let mut later = ambiguous();
+        later.value = Some("Umbrella".to_string());
+        let fourth = e.remember(later).unwrap();
+        let Remembered::CreatedPendingReview {
+            assertion: umbrella,
+            review: second_review,
+            ..
+        } = fourth
+        else {
+            panic!("setup: the third entity must arrive as a question, got {fourth:?}")
+        };
+        e.confirm(second_review[0]).unwrap();
+
+        assert_eq!(e.entity_count(), 1);
+        assert_eq!(value_of(&e, acme).as_deref(), Some("Acme"));
+        assert_eq!(
+            value_of(&e, globex).as_deref(),
+            Some("Globex"),
+            "an assertion absorbed by the first merge must survive the second"
+        );
+        assert_eq!(value_of(&e, initech).as_deref(), Some("Initech"));
+        assert_eq!(value_of(&e, umbrella).as_deref(), Some("Umbrella"));
+    }
+
+    #[test]
     fn rejecting_a_review_stops_it_being_raised_again() {
         let mut e = engine();
         e.remember(observation("Ben Severn", "employer", "Acme", 1))
