@@ -86,6 +86,12 @@ pub enum IndexError {
     /// A zero vector under [`Metric::Cosine`], which has no direction and so
     /// no angle to anything.
     ZeroVectorUnderCosine,
+    /// A snapshot parsed as JSON but described an index that cannot exist.
+    ///
+    /// Separate from a parse failure: the bytes were well-formed, so nothing
+    /// upstream would have flagged them, and the damage only shows up as a
+    /// panic on the first query.
+    CorruptSnapshot(String),
 }
 
 impl std::fmt::Display for IndexError {
@@ -105,6 +111,10 @@ impl std::fmt::Display for IndexError {
                 f,
                 "the zero vector has no direction, so it has no cosine \
                  similarity to anything; use Metric::L2 if magnitude is meaningful"
+            ),
+            IndexError::CorruptSnapshot(why) => write!(
+                f,
+                "snapshot parsed but describes an impossible index: {why}"
             ),
         }
     }
@@ -132,8 +142,15 @@ pub struct VectorIndex {
     /// Flattened `len * dim`, so one allocation is scanned per query rather
     /// than chasing a pointer per entry.
     vectors: Vec<f32>,
-    /// `EntryId` to row. Rebuilt on removal, which is why removal is O(1)
-    /// amortised rather than O(n) — see [`VectorIndex::remove`].
+    /// `EntryId` to row. Patched in place on removal — one entry, not a rebuild
+    /// — which is what keeps removal O(1); see [`VectorIndex::remove`].
+    ///
+    /// Not serialised. It is wholly derived from `ids`, so persisting it would
+    /// (a) let a snapshot describe an index whose map disagrees with its rows,
+    /// and (b) make `snapshot()` non-deterministic, since `HashMap` iterates in
+    /// a per-process-randomised order and `rm_store` promises snapshots that
+    /// diff. [`VectorIndex::open`] rebuilds it and validates as it goes.
+    #[serde(skip)]
     positions: HashMap<EntryId, usize>,
 }
 
@@ -257,14 +274,24 @@ impl VectorIndex {
             .collect();
 
         // Descending by score; equal scores fall back to id so a tie does not
-        // reorder between runs.
-        hits.sort_by(|a, b| {
+        // reorder between runs. Scores are finite by construction — `prepare`
+        // rejects non-finite input at both doors — so the comparison is total.
+        let order = |a: &Hit, b: &Hit| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.id.cmp(&b.id))
-        });
-        hits.truncate(k);
+        };
+
+        // Partition around k before sorting, so the cost is O(n) in the scan
+        // plus O(k log k) on the survivors rather than O(n log n) on all of
+        // them. At N=20,000 and k=10 the full sort was a real share of the
+        // 2.2 ms this crate's design argument rests on.
+        if k < hits.len() {
+            hits.select_nth_unstable_by(k, order);
+            hits.truncate(k);
+        }
+        hits.sort_unstable_by(order);
         Ok(hits)
     }
 
@@ -274,8 +301,45 @@ impl VectorIndex {
     }
 
     /// Restore from a snapshot.
-    pub fn open(snapshot: &str) -> Result<Self, String> {
-        serde_json::from_str(snapshot).map_err(|e| e.to_string())
+    ///
+    /// Rebuilds the id-to-row map rather than trusting a stored one, and checks
+    /// the invariants the rest of the crate indexes on faith. Without this a
+    /// snapshot with the wrong number of floats parses cleanly and then panics
+    /// on the first search, which is the failure mode the whole "reject at the
+    /// door" premise exists to avoid — a restore path is a door.
+    pub fn open(snapshot: &str) -> Result<Self, IndexError> {
+        let mut ix: VectorIndex = serde_json::from_str(snapshot)
+            .map_err(|e| IndexError::CorruptSnapshot(e.to_string()))?;
+
+        if ix.dim == 0 {
+            return Err(IndexError::CorruptSnapshot(
+                "dimension is 0, so no vector could ever be inserted".to_string(),
+            ));
+        }
+        let expected = ix.ids.len() * ix.dim;
+        if ix.vectors.len() != expected {
+            return Err(IndexError::CorruptSnapshot(format!(
+                "{} ids at {} dimensions need {expected} floats, but the snapshot holds {}",
+                ix.ids.len(),
+                ix.dim,
+                ix.vectors.len()
+            )));
+        }
+        if let Some(position) = ix.vectors.iter().position(|x| !x.is_finite()) {
+            return Err(IndexError::CorruptSnapshot(format!(
+                "stored component {position} is not finite"
+            )));
+        }
+
+        ix.positions = HashMap::with_capacity(ix.ids.len());
+        for (row, &id) in ix.ids.iter().enumerate() {
+            if ix.positions.insert(id, row).is_some() {
+                return Err(IndexError::CorruptSnapshot(format!(
+                    "id {id} appears more than once, so one memory would answer a query twice"
+                )));
+            }
+        }
+        Ok(ix)
     }
 
     /// Validate, and normalise if the metric calls for it.
@@ -291,11 +355,24 @@ impl VectorIndex {
         }
         match self.metric {
             Metric::Cosine => {
-                let norm = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+                // Accumulated in f64. In f32 the sum of squares overflows to
+                // infinity for components around 1e19, and `x / inf` is 0.0 for
+                // every one of them — so a large finite vector passed the zero
+                // check and was then stored as exactly the zero vector this
+                // error exists to reject, scoring 0.0 against everything
+                // including itself.
+                let norm = vector
+                    .iter()
+                    .map(|x| f64::from(*x) * f64::from(*x))
+                    .sum::<f64>()
+                    .sqrt();
                 if norm == 0.0 {
                     return Err(IndexError::ZeroVectorUnderCosine);
                 }
-                Ok(vector.iter().map(|x| x / norm).collect())
+                Ok(vector
+                    .iter()
+                    .map(|x| (f64::from(*x) / norm) as f32)
+                    .collect())
             }
             Metric::L2 => Ok(vector.to_vec()),
         }
@@ -556,5 +633,90 @@ mod tests {
     #[test]
     fn a_malformed_snapshot_is_reported_not_panicked_on() {
         assert!(VectorIndex::open("{ not json").is_err());
+    }
+
+    #[test]
+    fn a_snapshot_with_the_wrong_number_of_floats_is_rejected_not_left_to_panic() {
+        // Parses cleanly: two ids, but only one vector's worth of floats. Before
+        // `open` validated, this restored fine, reported len() == 2, and panicked
+        // on the first search with a slice range error.
+        let broken = r#"{"dim":2,"metric":"Cosine","ids":[1,2],"vectors":[1.0,0.0]}"#;
+        let err = VectorIndex::open(broken).unwrap_err();
+        assert!(matches!(err, IndexError::CorruptSnapshot(_)), "got {err:?}");
+        assert!(err.to_string().contains("need 4 floats"), "{err}");
+    }
+
+    #[test]
+    fn a_snapshot_repeating_an_id_is_rejected() {
+        // Two rows claiming one id: whichever won the map, the other row would
+        // stay searchable and answer for an id it does not own.
+        let broken = r#"{"dim":2,"metric":"Cosine","ids":[7,7],"vectors":[1.0,0.0,0.0,1.0]}"#;
+        assert!(matches!(
+            VectorIndex::open(broken).unwrap_err(),
+            IndexError::CorruptSnapshot(_)
+        ));
+    }
+
+    #[test]
+    fn a_snapshot_holding_a_non_finite_component_is_rejected() {
+        let broken = r#"{"dim":2,"metric":"L2","ids":[1],"vectors":[1e400,0.0]}"#;
+        assert!(VectorIndex::open(broken).is_err());
+    }
+
+    #[test]
+    fn snapshots_are_byte_stable() {
+        // `rm_store` promises snapshots that diff, and this crate has to keep
+        // that promise: a serialised HashMap iterates in a per-process order, so
+        // an identical index used to emit different bytes every run.
+        let mut ix = VectorIndex::new(2, Metric::Cosine);
+        for id in 0..24u64 {
+            ix.insert(id, &[1.0, id as f32 + 1.0]).unwrap();
+        }
+        let once = ix.snapshot();
+        let twice = VectorIndex::open(&once).unwrap().snapshot();
+        assert_eq!(once, twice);
+        assert!(
+            !once.contains("positions"),
+            "the derived map should not be persisted at all"
+        );
+    }
+
+    #[test]
+    fn a_restored_index_still_removes_correctly() {
+        // The rebuilt map has to be a working map, not just a populated one.
+        let mut ix = VectorIndex::open(&index().snapshot()).unwrap();
+        assert!(ix.remove(1));
+        assert!(!ix.contains(1));
+        assert_eq!(ids(&ix.search(&[1.0, 0.0, 0.0], 3).unwrap()), vec![3, 2]);
+    }
+
+    // ---- numeric edges -----------------------------------------------------
+
+    #[test]
+    fn a_huge_but_finite_vector_normalises_instead_of_collapsing_to_zero() {
+        // Summing squares in f32 overflows to infinity around 1e19, and x/inf is
+        // 0.0 — so this passed the zero-vector check and was then stored as the
+        // very zero vector that check exists to reject, scoring 0.0 against
+        // everything including itself.
+        let mut ix = VectorIndex::new(4, Metric::Cosine);
+        let huge = [2e19f32; 4];
+        ix.insert(1, &huge).unwrap();
+        let hits = ix.search(&huge, 1).unwrap();
+        assert_eq!(hits[0].id, 1);
+        assert!(
+            (hits[0].score - 1.0).abs() < 1e-5,
+            "a vector must be identical to itself, got {}",
+            hits[0].score
+        );
+    }
+
+    #[test]
+    fn a_tiny_vector_keeps_its_direction() {
+        // The same arithmetic at the other end: squares underflow to zero in f32
+        // long before the vector itself is zero.
+        let mut ix = VectorIndex::new(2, Metric::Cosine);
+        ix.insert(1, &[3e-23, 4e-23]).unwrap();
+        let hits = ix.search(&[3.0, 4.0], 1).unwrap();
+        assert!((hits[0].score - 1.0).abs() < 1e-5, "got {}", hits[0].score);
     }
 }
