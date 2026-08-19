@@ -1611,6 +1611,13 @@ mod tests {
         );
     }
 
+    /// The ingestion timestamps of a version log, in the order the log holds
+    /// them. Names what a test means by "the order", so an assertion about it
+    /// reads as a claim about ordering rather than as a bare vector of numbers.
+    fn ingestion_order(versions: &[EdgeVersion]) -> Vec<Timestamp> {
+        versions.iter().map(|v| v.ingested_at()).collect()
+    }
+
     #[test]
     fn erase_edges_does_not_touch_attributes_and_erase_does_not_touch_edges() {
         // A caller reaching for either is usually answering a deletion request
@@ -1825,6 +1832,110 @@ mod tests {
             store.edges_from(kept, OCT, OCT)[0].valid,
             Interval::since(JUL),
             "the later append wins the tie, as it does without a merge"
+        );
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn a_move_into_an_empty_destination_keeps_the_log_in_the_order_it_was_appended() {
+        // `edge_history` documents itself as append order, and `push_edge`
+        // appends in call order, so a log can legitimately run backwards along
+        // the ingestion axis: asserted in March, then corrected by something
+        // only heard about in January. A move onto an entity holding no such
+        // triple has merged nothing, so it has nothing to reorder and must hand
+        // the log over exactly as it stood. Sorting it anyway would be invisible
+        // to every query -- `in_force` takes the maximum ingestion however the
+        // vector is ordered -- which is precisely why nothing else would catch
+        // it silently rewriting an audit trail nobody asked to merge.
+        let (mut store, kept) = store_with_user();
+        let absorbed = store.create_entity("person", JAN);
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                absorbed,
+                "employed_by",
+                acme,
+                Interval::since(JUL),
+                user_said(MAR),
+            )
+            .unwrap();
+        store
+            .relate(
+                absorbed,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        assert_eq!(
+            ingestion_order(store.edge_history(absorbed, "employed_by", acme)),
+            vec![MAR, JAN],
+            "setup: the source log has to run backwards, or this proves nothing"
+        );
+
+        assert_eq!(store.repoint_edges(absorbed, kept).unwrap(), 1);
+        assert_eq!(
+            ingestion_order(store.edge_history(kept, "employed_by", acme)),
+            vec![MAR, JAN],
+            "an empty destination merged nothing, so nothing was reordered"
+        );
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn a_merged_log_keeps_versions_sharing_an_ingestion_time_in_their_relative_order() {
+        // `in_force` breaks an ingestion tie on position, so where versions
+        // share an ingestion time the merge's own ordering is what decides
+        // which one answers. Only a stable sort makes that ordering a property
+        // of the inputs rather than of whatever the sort happened to do.
+        //
+        // Twelve versions a side, not three: an unstable sort falls back to
+        // insertion sort on short slices and preserves order there by accident,
+        // so a handful of versions would pin nothing. Each is identified by its
+        // valid start, which is the only thing separating versions that share a
+        // provenance.
+        let (mut store, kept) = store_with_user();
+        let absorbed = store.create_entity("person", JAN);
+        let acme = store.create_entity("org", JAN);
+        for start in 200..212 {
+            store
+                .relate(
+                    kept,
+                    "employed_by",
+                    acme,
+                    Interval::since(start),
+                    user_said(SEP),
+                )
+                .unwrap();
+        }
+        for start in 100..112 {
+            store
+                .relate(
+                    absorbed,
+                    "employed_by",
+                    acme,
+                    Interval::since(start),
+                    user_said(JAN),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.repoint_edges(absorbed, kept).unwrap(), 1);
+        let expected: Vec<Interval> = (100..112).chain(200..212).map(Interval::since).collect();
+        assert_eq!(
+            store
+                .edge_history(kept, "employed_by", acme)
+                .iter()
+                .map(|v| v.valid)
+                .collect::<Vec<_>>(),
+            expected,
+            "the absorbed log sorts ahead by ingestion, and neither group is shuffled inside itself"
+        );
+        assert_eq!(
+            store.edges_from(kept, 250, 250)[0].valid,
+            Interval::since(211),
+            "so the tie-break still names the last version appended before the merge"
         );
         assert_maps_agree(&store);
     }
