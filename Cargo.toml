@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rm-core", "crates/rm-survivor", "crates/rm-store", "crates/rm-resolve", "crates/rm-index", "crates/rm-engine", "crates/rm-graph"]
+members = ["crates/rm-core", "crates/rm-survivor", "crates/rm-store", "crates/rm-resolve", "crates/rm-index", "crates/rm-engine", "crates/rm-graph", "crates/rm-extract"]
 resolver = "2"
 # The ANN bake-off is run by hand, not in CI: it pulls hnsw_rs and takes
 # minutes. See benches/ann-bakeoff/README.md.
@@ -20,6 +20,7 @@ rm-resolve = { path = "crates/rm-resolve" }
 rm-index = { path = "crates/rm-index" }
 rm-engine = { path = "crates/rm-engine" }
 rm-graph = { path = "crates/rm-graph" }
+rm-extract = { path = "crates/rm-extract" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

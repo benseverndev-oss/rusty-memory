@@ -54,6 +54,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rm-extract"
+version = "0.0.0"
+dependencies = [
+ "rm-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rm-graph"
 version = "0.0.0"
 dependencies = [
