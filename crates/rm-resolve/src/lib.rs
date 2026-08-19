@@ -37,10 +37,12 @@ pub mod compare;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+
 pub use compare::{jaro, jaro_winkler, normalize, token_jaccard, Comparator};
 
 /// A record to be resolved: a bag of named fields.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub fields: BTreeMap<String, String>,
 }
@@ -172,7 +174,16 @@ pub enum BlockingKey {
 }
 
 impl BlockingKey {
-    fn keys_for(&self, record: &Record) -> Vec<String> {
+    /// The blocking keys this rule derives from one record.
+    ///
+    /// Public so a caller maintaining its own incremental index can key a record
+    /// as it arrives. [`Ruleset::candidate_pairs`] rebuilds every block from
+    /// scratch, which is right for a batch and quadratic for a store that writes
+    /// one record at a time. The alternative — callers reimplementing the key
+    /// format — guarantees the two drift apart silently, and a blocking key that
+    /// disagrees with the one used at query time loses true matches without
+    /// erroring.
+    pub fn keys_for(&self, record: &Record) -> Vec<String> {
         match self {
             BlockingKey::Exact(f) => record
                 .get(f)
@@ -292,6 +303,11 @@ impl Ruleset {
                 Some(s * rule.agreement_weight() + (1.0 - s) * rule.disagreement_weight())
             })
             .sum()
+    }
+
+    /// The blocking rules, for callers maintaining their own index.
+    pub fn blocking(&self) -> &[BlockingKey] {
+        &self.blocking
     }
 
     /// Which band a score falls in.
@@ -779,5 +795,26 @@ mod tests {
         assert_eq!(rs.decide(7.999), Decision::Review);
         assert_eq!(rs.decide(2.0), Decision::Review);
         assert_eq!(rs.decide(1.999), Decision::NonMatch);
+    }
+
+    #[test]
+    fn blocking_keys_are_derivable_by_a_caller_maintaining_its_own_index() {
+        // An incremental store cannot call candidate_pairs on every write without
+        // rebuilding every block, so it needs the keys for one record at a time.
+        let key = BlockingKey::Exact("city".to_string());
+        let record = Record::new().with("city", "  Bristol ");
+        assert_eq!(key.keys_for(&record), vec!["city=bristol".to_string()]);
+
+        let ruleset = ruleset();
+        assert!(!ruleset.blocking().is_empty());
+    }
+
+    #[test]
+    fn a_record_round_trips_through_json() {
+        // The engine persists its identity records, so these have to survive a
+        // snapshot without the engine reaching inside them to do it by hand.
+        let r = Record::new().with("name", "Ben Severn");
+        let json = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Record>(&json).unwrap(), r);
     }
 }
