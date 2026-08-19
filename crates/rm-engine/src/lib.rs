@@ -124,12 +124,11 @@ pub struct Engine {
     /// lesson that persisted derived state lets a snapshot disagree with itself.
     pub(crate) blocks: BTreeMap<String, Vec<StableId>>,
     pub(crate) assertions: BTreeMap<AssertionId, AssertionRef>,
-    /// Filed by resolution's `Review` band, added in a later task.
-    #[allow(dead_code)]
+    /// Filed by resolution's `Review` band: pairs the resolver could not call,
+    /// waiting on an answer from `pending_review`.
     pub(crate) review: BTreeMap<ReviewId, PendingReview>,
     pub(crate) next_assertion: AssertionId,
-    /// Advanced when a review is filed, added in a later task.
-    #[allow(dead_code)]
+    /// Advanced each time `file_review` opens a question.
     pub(crate) next_review: ReviewId,
 }
 
@@ -260,14 +259,32 @@ impl Engine {
         }
     }
 
-    /// File an open question: two entities that may be the same, and the
-    /// evidence that could not decide either way.
+    /// Record an open question about two entities.
     ///
-    /// Unimplemented until Task 7. No test in this task should reach it — the
-    /// test ruleset's blocking keeps genuinely different names apart, and a
-    /// pair of identical mentions scores a confident `Match`, not `Review`.
-    fn file_review(&mut self, _a: StableId, _b: StableId, _score: f64) -> ReviewId {
-        unimplemented!("Task 7")
+    /// Ordered so the lower id is always `a`, making a pair's identity
+    /// independent of which observation arrived first.
+    fn file_review(&mut self, a: StableId, b: StableId, score: f64) -> ReviewId {
+        let id = self.next_review;
+        self.next_review += 1;
+        self.review.insert(
+            id,
+            PendingReview {
+                id,
+                a: a.min(b),
+                b: a.max(b),
+                score,
+            },
+        );
+        id
+    }
+
+    /// Every pair still waiting on an answer, oldest first.
+    ///
+    /// Returned rather than logged because a review nobody can reach is the
+    /// same as no review: the whole point of keeping the middle band is that
+    /// someone gets asked.
+    pub fn pending_review(&self) -> Vec<&PendingReview> {
+        self.review.values().collect()
     }
 
     /// Create an entity and register its identity fields.
@@ -502,5 +519,57 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(e.entity_count(), 2, "the two Ben Severns are one entity");
+    }
+
+    /// A near-miss name: close enough to be worth asking about, not close
+    /// enough to merge.
+    fn ambiguous() -> Observation {
+        let mut obs = observation("Ben Severne", "employer", "Globex", 2);
+        obs.mention = Record::new()
+            .with("name", "Ben Severne")
+            .with("city", "Bath");
+        obs
+    }
+
+    #[test]
+    fn a_review_pair_is_never_merged_silently() {
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let out = e.remember(ambiguous()).unwrap();
+
+        let Remembered::CreatedPendingReview { review, .. } = out else {
+            panic!("a middle-band score must not merge; got {out:?}");
+        };
+        assert_eq!(review.len(), 1);
+        assert_eq!(e.entity_count(), 2, "kept apart until someone answers");
+    }
+
+    #[test]
+    fn a_review_decision_still_remembers_the_fact() {
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let out = e.remember(ambiguous()).unwrap();
+        let Remembered::CreatedPendingReview { assertion, .. } = out else {
+            panic!("expected a review");
+        };
+        // Uncertainty is about whose fact it is, never about whether we heard it.
+        assert!(e.assertion(assertion).is_some());
+        assert_eq!(e.index_len(), 2);
+    }
+
+    #[test]
+    fn open_questions_are_reported_deterministically() {
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        e.remember(ambiguous()).unwrap();
+        let open = e.pending_review();
+        assert_eq!(open.len(), 1);
+        assert!(
+            open[0].score > 0.0,
+            "a review pair has real evidence behind it"
+        );
     }
 }
