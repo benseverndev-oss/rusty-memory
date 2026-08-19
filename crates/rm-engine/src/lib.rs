@@ -449,6 +449,16 @@ impl Engine {
             self.store.erase(absorbed, attribute).map_err(on_write)?;
         }
 
+        // Edges follow the merge. Left alone they name an id nothing resolves,
+        // and a walk would cross into it — the same class of defect as leaving
+        // an assertion pointing at a stale version index: a well-formed wrong
+        // answer with nothing to raise an error about. Done here, after both
+        // ids are still meaningful (the absorbed entity is not erased from the
+        // store) and before `adopt_assertions` renumbers the version logs, so
+        // repointing edges — which touches only the store's edge tables — has
+        // no way to disturb the offsets that renumbering depends on.
+        self.store.repoint_edges(absorbed, kept).map_err(on_write)?;
+
         // Ownership and position move together, after the copy: the offsets
         // were read before it, so the assertion map is only touched once the
         // log it points into is in its final shape.
@@ -1277,6 +1287,113 @@ mod tests {
         let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 5)).unwrap();
         assert_eq!(hits.len(), 1, "forget took the survivor's vector with it");
         assert_eq!(hits[0].value.as_deref(), Some("Globex"));
+    }
+
+    #[test]
+    fn a_merge_repoints_edges_in_both_directions() {
+        // The absorbed entity's relationships are the survivor's now. Left
+        // alone they would point at a dead id, and a walk would follow them.
+        let mut e = engine();
+        let Remembered::Created { entity: kept, .. } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: acme, .. } = e
+            .remember(observation("Acme Corp", "kind", "company", 2))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: boss, .. } = e
+            .remember(observation("Wei Zhang", "role", "manager", 3))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let out = e.remember(ambiguous()).unwrap();
+        let Remembered::CreatedPendingReview {
+            entity: absorbed,
+            review,
+            ..
+        } = out
+        else {
+            panic!("expected a review, got {out:?}")
+        };
+
+        let prov = Provenance::new(Source::UserAssertion, 4, "s");
+        e.relate(
+            absorbed,
+            "employed_by",
+            acme,
+            Interval::since(1),
+            prov.clone(),
+        )
+        .unwrap();
+        e.relate(boss, "manages", absorbed, Interval::since(1), prov)
+            .unwrap();
+
+        let survivor = e.confirm(review[0]).unwrap();
+        assert_eq!(survivor, kept.min(absorbed));
+
+        let out_edges = e.neighborhood(&Walk::new(vec![survivor], 1, 10, 5, 5));
+        assert!(
+            out_edges.reached.iter().any(|r| r.entity == acme),
+            "outgoing followed the merge"
+        );
+
+        let in_edges =
+            e.neighborhood(&Walk::new(vec![survivor], 1, 10, 5, 5).direction(Direction::In));
+        assert!(
+            in_edges.reached.iter().any(|r| r.entity == boss),
+            "incoming followed the merge"
+        );
+
+        let dead = e.neighborhood(&Walk::new(vec![kept.max(absorbed)], 1, 10, 5, 5));
+        assert!(
+            dead.reached.len() <= 1,
+            "nothing still hangs off the absorbed id"
+        );
+    }
+
+    #[test]
+    fn a_merge_drops_an_edge_that_would_become_a_self_edge() {
+        // The two turned out to be the same person, so "A manages B" is now
+        // "A manages A" -- which relate() refuses to create.
+        let mut e = engine();
+        let Remembered::Created { entity: kept, .. } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let out = e.remember(ambiguous()).unwrap();
+        let Remembered::CreatedPendingReview {
+            entity: absorbed,
+            review,
+            ..
+        } = out
+        else {
+            panic!("expected a review")
+        };
+
+        e.relate(
+            kept,
+            "knows",
+            absorbed,
+            Interval::since(1),
+            Provenance::new(Source::UserAssertion, 4, "s"),
+        )
+        .unwrap();
+
+        let survivor = e.confirm(review[0]).unwrap();
+        let n = e.neighborhood(&Walk::new(vec![survivor], 2, 10, 5, 5).direction(Direction::Both));
+        assert_eq!(
+            n.reached.len(),
+            1,
+            "only the survivor, with no edge to itself"
+        );
     }
 
     #[test]
