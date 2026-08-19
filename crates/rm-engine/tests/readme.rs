@@ -1,13 +1,14 @@
 //! The project's central claim, through the public API only.
 //!
-//! Everything here uses `rm_engine`'s exported surface. If this test needs a
-//! `pub(crate)` to compile, the API is missing something a caller will need.
+//! One `use`, from one crate. That is the point of the file as much as the
+//! assertions are: if this test needs a `pub(crate)` to compile the API is
+//! missing something a caller will need, and if it needs a second crate in the
+//! manifest then so does everyone who wants to call `remember`.
 
-use rm_core::{Interval, Provenance, Source};
-use rm_engine::{Believed, Engine, Observation, Policy, Query, Remembered};
-use rm_index::{Metric, VectorIndex};
-use rm_resolve::{BlockingKey, Comparator, FieldRule, Record, Ruleset};
-use rm_survivor::Strategy;
+use rm_engine::{
+    Believed, BlockingKey, Comparator, Engine, FieldRule, Interval, Metric, Observation, Policy,
+    Provenance, Query, Record, Remembered, Ruleset, Source, Strategy, VectorIndex, Version,
+};
 
 const MARCH: i64 = 1_710_000_000_000;
 const MAY: i64 = 1_715_000_000_000;
@@ -79,6 +80,11 @@ fn a_change_of_employer_is_two_facts_not_a_contradiction() {
         .find(|h| h.value.as_deref() == Some("Acme"))
         .unwrap();
     assert!(acme.superseded);
+
+    // And the raw audit trail underneath, whose element type a caller can name
+    // without taking a dependency on the store crate.
+    let history: &[Version] = engine.store_history(entity, "employer");
+    assert_eq!(history.len(), 2, "two facts, neither overwritten");
 }
 
 #[test]

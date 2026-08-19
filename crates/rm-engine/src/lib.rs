@@ -32,18 +32,34 @@ mod review;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
-use rm_core::{Interval, Provenance, Timestamp};
-#[cfg(test)]
-use rm_index::Metric;
-use rm_index::{IndexError, VectorIndex};
-use rm_resolve::{Decision, Record, Ruleset};
-use rm_store::{MemoryStore, StableId, StoreError};
-use rm_survivor::Refused;
+use rm_resolve::Decision;
+use rm_store::MemoryStore;
 use serde::{Deserialize, Serialize};
 
 pub use policy::Policy;
 pub use read::{Believed, Query, Recalled};
 pub use review::{PendingReview, ReviewId, Settled};
+
+// Everything a caller needs to construct an `Observation`, build the index and
+// ruleset `Engine::new` takes, and read what comes back.
+//
+// Re-exported rather than left to the caller to depend on directly, because
+// every one of these types appears in this crate's own signatures: `Ruleset`
+// and `VectorIndex` in `new`, `Record`/`Interval`/`Provenance` in
+// `Observation`, `StableId` in nearly everything, `Version` in the return type
+// of `store_history`. A caller could not name the last of those at all without
+// adding `rm-store` to their manifest, which makes an internal decomposition —
+// five crates instead of one — into something the caller has to know about and
+// track. `tests/readme.rs` exists to prove the public API is sufficient, and it
+// was importing four sibling crates to compile.
+//
+// Only the surface those signatures reach is re-exported. `MemoryStore`,
+// `Outcome` and the rest stay behind the engine, which owns them.
+pub use rm_core::{Interval, Provenance, Source, Timestamp};
+pub use rm_index::{IndexError, Metric, VectorIndex};
+pub use rm_resolve::{BlockingKey, Comparator, FieldRule, Record, Ruleset};
+pub use rm_store::{StableId, StoreError, Version};
+pub use rm_survivor::{Refused, Strategy};
 
 /// Identifies one stored assertion. Doubles as the vector index's `EntryId`, so
 /// a search hit resolves to a stored fact with one lookup rather than a
@@ -390,7 +406,7 @@ impl Engine {
     /// Appending to the survivor's logs moves every absorbed assertion's
     /// position in them, so the lengths those logs had before the copy are read
     /// first and the assertions are renumbered against them afterwards — see
-    /// [`Engine::adopt_assertions`].
+    /// `adopt_assertions`, below.
     pub fn confirm(&mut self, review: ReviewId) -> Result<StableId, EngineError> {
         let pair = self
             .review
@@ -404,7 +420,7 @@ impl Engine {
         // How long each of the survivor's own logs is *before* anything is
         // appended to it. This is the whole of the renumbering argument, and it
         // is read from the store rather than counted off the assertion map on
-        // purpose — see [`Engine::adopt_assertions`].
+        // purpose — see `adopt_assertions`, below.
         let attributes: Vec<String> = self
             .store
             .entity(absorbed)
@@ -742,9 +758,6 @@ pub enum Remembered {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rm_core::{Source, Timestamp};
-    use rm_resolve::{BlockingKey, Comparator, FieldRule};
-    use rm_survivor::Strategy;
 
     /// A deliberately ordinary ruleset: names are typo-prone but discriminating,
     /// cities agree often by chance.
