@@ -39,6 +39,14 @@
 //! silently laundered into an LLM's context as established fact and shapes every
 //! later turn. So every strategy here refuses when its inputs cannot answer the
 //! question, and the refusal names what was missing.
+//!
+//! # Three states, not two
+//!
+//! Upstream's candidates are values or nulls. Memory needs a third: a source can
+//! assert that a field is *empty* ("they are between jobs"), which is a claim
+//! that competes, and distinct from having said nothing at all. See [`Asserted`].
+//! `rm_store` already draws this line with `Known`; this crate needed it as soon
+//! as anything read from that store and resolved with this one.
 
 use rm_core::{Interval, Provenance, Source, Timestamp};
 use serde::{Deserialize, Serialize};
@@ -59,27 +67,94 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+/// What one source said about a field.
+///
+/// Three states, not two, because `rm_store` writes three. A tombstone — "this
+/// attribute has no value" — is a positive claim that competes for the survivor
+/// slot. Silence is the absence of a claim and competes for nothing. Collapsing
+/// them makes a deliberate "they are between jobs" indistinguishable from a
+/// source that simply did not mention employment, which is how an agent ends up
+/// asserting a stale employer forever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asserted<'a> {
+    /// The source asserted this value.
+    Value(&'a str),
+    /// The source asserted the field has no value.
+    Absent,
+    /// The source had nothing to say about this field.
+    Silent,
+}
+
+impl<'a> Asserted<'a> {
+    /// The value, if one was asserted. `Absent` and `Silent` both give `None`,
+    /// so only reach for this where the difference genuinely does not matter.
+    pub fn value(self) -> Option<&'a str> {
+        match self {
+            Asserted::Value(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a claim at all. `Silent` is not.
+    pub fn is_assertion(self) -> bool {
+        !matches!(self, Asserted::Silent)
+    }
+}
+
+/// What survivorship concluded actually held. The owned counterpart to
+/// [`Asserted`], minus `Silent` — silence never wins, so a result can never be
+/// one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Held {
+    Value(String),
+    Absent,
+}
+
+impl Held {
+    /// The value, if this is one. `Absent` gives `None`.
+    pub fn value(&self) -> Option<&str> {
+        match self {
+            Held::Value(v) => Some(v),
+            Held::Absent => None,
+        }
+    }
+}
+
 /// One assertion of a field's value, with the provenance that decides how it
 /// competes.
-///
-/// `value: None` is a missing observation, not an assertion of emptiness — the
-/// source had nothing to say. Absence never contradicts presence.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate<'a> {
-    pub value: Option<&'a str>,
+    pub value: Asserted<'a>,
     pub provenance: &'a Provenance,
 }
 
 impl<'a> Candidate<'a> {
+    /// A candidate from an optional value. `None` means the source said
+    /// *nothing*; for a source asserting the field is empty, use
+    /// [`Candidate::absent`].
     pub fn new(value: Option<&'a str>, provenance: &'a Provenance) -> Self {
-        Candidate { value, provenance }
+        Candidate {
+            value: match value {
+                Some(v) => Asserted::Value(v),
+                None => Asserted::Silent,
+            },
+            provenance,
+        }
+    }
+
+    /// A candidate asserting the field has no value — a tombstone.
+    pub fn absent(provenance: &'a Provenance) -> Self {
+        Candidate {
+            value: Asserted::Absent,
+            provenance,
+        }
     }
 }
 
 /// A value paired with the span of valid time over which it held.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fact {
-    pub value: String,
+    pub value: Held,
     pub valid: Interval,
 }
 
@@ -90,8 +165,8 @@ pub struct Fact {
 /// survives"; that one answers "what was true when".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
-    /// One winner, or `None` when the candidates yield no survivor.
-    Survivor(Option<String>),
+    /// One winner, or `None` when no candidate asserted anything at all.
+    Survivor(Option<Held>),
     /// A timeline of values with non-overlapping validity, oldest first. Empty
     /// when nothing was ever asserted.
     Timeline(Vec<Fact>),
@@ -104,9 +179,9 @@ impl Outcome {
     /// for one unless the timeline holds exactly one fact.
     pub fn survivor(&self) -> Option<&str> {
         match self {
-            Outcome::Survivor(v) => v.as_deref(),
+            Outcome::Survivor(v) => v.as_ref().and_then(Held::value),
             Outcome::Timeline(facts) => match facts.as_slice() {
-                [only] => Some(&only.value),
+                [only] => only.value.value(),
                 _ => None,
             },
         }
@@ -114,15 +189,20 @@ impl Outcome {
 
     /// The value in force at `t`.
     ///
-    /// For a `Survivor` this ignores `t` — a single survivor is the answer at
-    /// every instant, because nothing in the outcome says otherwise.
+    /// Reports an asserted absence as `None`, the same as no coverage at all.
+    /// Use [`Outcome::held_at`] where the difference matters — it does to a
+    /// memory store, and this method is the convenience, not the precise answer.
     pub fn as_of(&self, t: Timestamp) -> Option<&str> {
+        self.held_at(t).and_then(Held::value)
+    }
+
+    /// What held at `t`, distinguishing an asserted absence from no coverage.
+    pub fn held_at(&self, t: Timestamp) -> Option<&Held> {
         match self {
-            Outcome::Survivor(v) => v.as_deref(),
-            Outcome::Timeline(facts) => facts
-                .iter()
-                .find(|f| f.valid.contains(t))
-                .map(|f| f.value.as_str()),
+            Outcome::Survivor(v) => v.as_ref(),
+            Outcome::Timeline(facts) => {
+                facts.iter().find(|f| f.valid.contains(t)).map(|f| &f.value)
+            }
         }
     }
 }
@@ -191,47 +271,64 @@ pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcom
         return timeline(candidates).map(Outcome::Timeline);
     }
 
-    let non_null: Vec<&Candidate<'_>> = candidates.iter().filter(|c| c.value.is_some()).collect();
-    if non_null.is_empty() {
+    let asserted: Vec<&Candidate<'_>> = candidates
+        .iter()
+        .filter(|c| c.value.is_assertion())
+        .collect();
+    if asserted.is_empty() {
         return Ok(Outcome::Survivor(None));
     }
 
-    // Every non-null assertion agrees -> that value, whatever the strategy.
-    // Runs before any strategy so unanimity never depends on the rule chosen.
-    let first = non_null[0].value.expect("filtered to non-null");
-    if non_null.iter().all(|c| c.value == Some(first)) {
-        return Ok(Outcome::Survivor(Some(first.to_string())));
+    // Every assertion agrees -> that answer, whatever the strategy. Runs before
+    // any strategy so unanimity never depends on the rule chosen.
+    let first = asserted[0].value;
+    if asserted.iter().all(|c| c.value == first) {
+        return Ok(Outcome::Survivor(Some(held(first))));
     }
 
-    let winner: Option<String> = match strategy {
-        Strategy::MostComplete | Strategy::LongestValue => longest(&non_null),
-        Strategy::MajorityVote | Strategy::ConfidenceMajority => plurality(&non_null),
-        Strategy::FirstNonNull => Some(first.to_string()),
+    let winner: Option<Held> = match strategy {
+        Strategy::MostComplete | Strategy::LongestValue => longest(&asserted),
+        Strategy::MajorityVote | Strategy::ConfidenceMajority => plurality(&asserted),
+        Strategy::FirstNonNull => Some(held(first)),
         // Unanimity was handled by the early-out above, so reaching here means
         // the sources disagree. A gap is the point of this strategy.
         Strategy::UnanimousOrNull => None,
-        Strategy::MostRecent => Some(most_recent(&non_null)?),
-        Strategy::SourcePriority(order) => Some(by_source_priority(&non_null, order)?),
+        Strategy::MostRecent => Some(most_recent(&asserted)?),
+        Strategy::SourcePriority(order) => Some(by_source_priority(&asserted, order)?),
         Strategy::ValidInterval => unreachable!("handled above"),
     };
 
     Ok(Outcome::Survivor(winner))
 }
 
+/// An assertion as the owned result it would be if it won.
+///
+/// Never called with `Silent`: silence is filtered before any strategy runs, so
+/// a `Silent` reaching here is a bug rather than a value to represent.
+fn held(a: Asserted<'_>) -> Held {
+    match a {
+        Asserted::Value(v) => Held::Value(v.to_string()),
+        Asserted::Absent => Held::Absent,
+        Asserted::Silent => unreachable!("silence is filtered before any strategy runs"),
+    }
+}
+
 /// Longest value, measured in characters.
 ///
 /// Characters, not bytes: a byte length would rank "café" (4 chars, 5 bytes)
 /// above "abcd" and tie it with "abcde", making completeness depend on the
-/// accents in the text. Ties take the first seen.
-fn longest(non_null: &[&Candidate<'_>]) -> Option<String> {
-    let max = non_null
+/// accents in the text. Ties take the first seen. An `Absent` measures 0, so it
+/// loses to any value — correct, since "most complete" prefers a value over an
+/// absence.
+fn longest(asserted: &[&Candidate<'_>]) -> Option<Held> {
+    let max = asserted
         .iter()
-        .map(|c| c.value.unwrap_or_default().chars().count())
+        .map(|c| c.value.value().unwrap_or_default().chars().count())
         .max()?;
-    non_null
+    asserted
         .iter()
-        .find(|c| c.value.unwrap_or_default().chars().count() == max)
-        .map(|c| c.value.unwrap_or_default().to_string())
+        .find(|c| c.value.value().unwrap_or_default().chars().count() == max)
+        .map(|c| held(c.value))
 }
 
 /// Most frequent value, breaking count ties by first appearance.
@@ -239,10 +336,10 @@ fn longest(non_null: &[&Candidate<'_>]) -> Option<String> {
 /// The tally is an insertion-ordered `Vec`, not a `HashMap`: iteration order
 /// *is* the tie-break rule, and a hash map would make the winner depend on hash
 /// seeding — a different answer per process for the same input.
-fn plurality(non_null: &[&Candidate<'_>]) -> Option<String> {
-    let mut counts: Vec<(&str, usize)> = Vec::new();
-    for c in non_null {
-        let v = c.value.unwrap_or_default();
+fn plurality(asserted: &[&Candidate<'_>]) -> Option<Held> {
+    let mut counts: Vec<(Asserted<'_>, usize)> = Vec::new();
+    for c in asserted {
+        let v = c.value;
         match counts.iter_mut().find(|(k, _)| *k == v) {
             Some((_, n)) => *n += 1,
             None => counts.push((v, 1)),
@@ -251,11 +348,11 @@ fn plurality(non_null: &[&Candidate<'_>]) -> Option<String> {
     // Strict `>` keeps the first maximum. `max_by_key` would keep the last.
     counts
         .iter()
-        .fold(None::<(&str, usize)>, |best, &(v, n)| match best {
+        .fold(None::<(Asserted<'_>, usize)>, |best, &(v, n)| match best {
             Some((_, bn)) if n <= bn => best,
             _ => Some((v, n)),
         })
-        .map(|(v, _)| v.to_string())
+        .map(|(v, _)| held(v))
 }
 
 /// The value from the latest observation.
@@ -264,23 +361,23 @@ fn plurality(non_null: &[&Candidate<'_>]) -> Option<String> {
 /// observed at the same instant have no order between them, and picking either
 /// would be the arbitrary answer wearing a deterministic hat that upstream
 /// refuses to give.
-fn most_recent(non_null: &[&Candidate<'_>]) -> Result<String, Refused> {
-    let latest = non_null
+fn most_recent(asserted: &[&Candidate<'_>]) -> Result<Held, Refused> {
+    let latest = asserted
         .iter()
         .map(|c| c.provenance.observed_at)
         .max()
         .expect("non-empty");
 
-    let mut at_latest: Vec<&str> = non_null
+    let mut at_latest: Vec<Asserted<'_>> = asserted
         .iter()
         .filter(|c| c.provenance.observed_at == latest)
-        .map(|c| c.value.unwrap_or_default())
+        .map(|c| c.value)
         .collect();
     at_latest.dedup();
 
     match at_latest.as_slice() {
-        [only] => Ok((*only).to_string()),
-        [first, ..] if at_latest.iter().all(|v| v == first) => Ok((*first).to_string()),
+        [only] => Ok(held(*only)),
+        [first, ..] if at_latest.iter().all(|v| v == first) => Ok(held(*first)),
         _ => Err(Refused(format!(
             "{} different values share the latest observation time ({latest}); \
              simultaneous contradictory assertions have no \"most recent\". \
@@ -295,7 +392,7 @@ fn most_recent(non_null: &[&Candidate<'_>]) -> Result<String, Refused> {
 /// Refuses when an asserting source is unlisted rather than ranking it last:
 /// an unranked source is an unanswered policy question, and defaulting it to
 /// lowest priority silently prefers whatever the caller did remember to list.
-fn by_source_priority(non_null: &[&Candidate<'_>], order: &[Source]) -> Result<String, Refused> {
+fn by_source_priority(asserted: &[&Candidate<'_>], order: &[Source]) -> Result<Held, Refused> {
     if order.is_empty() {
         return Err(Refused(
             "SourcePriority was given an empty priority list, so it ranks nothing. \
@@ -306,7 +403,7 @@ fn by_source_priority(non_null: &[&Candidate<'_>], order: &[Source]) -> Result<S
 
     let unlisted: Vec<String> = {
         let mut seen: Vec<&Source> = Vec::new();
-        for c in non_null {
+        for c in asserted {
             let s = &c.provenance.source;
             if !order.contains(s) && !seen.contains(&s) {
                 seen.push(s);
@@ -324,7 +421,7 @@ fn by_source_priority(non_null: &[&Candidate<'_>], order: &[Source]) -> Result<S
     }
 
     for source in order {
-        let tier: Vec<&Candidate<'_>> = non_null
+        let tier: Vec<&Candidate<'_>> = asserted
             .iter()
             .copied()
             .filter(|c| &c.provenance.source == source)
@@ -337,7 +434,7 @@ fn by_source_priority(non_null: &[&Candidate<'_>], order: &[Source]) -> Result<S
         return most_recent(&tier);
     }
 
-    // Unreachable in practice: non_null is non-empty and every source is
+    // Unreachable in practice: asserted is non-empty and every source is
     // listed, so some tier matched. Refuse rather than unwrap if that changes.
     Err(Refused(
         "no candidate matched any listed source, despite every source being listed. \
@@ -354,38 +451,38 @@ fn by_source_priority(non_null: &[&Candidate<'_>], order: &[Source]) -> Result<S
 /// not a change. A value that returns after being superseded (Acme, Globex, Acme)
 /// correctly yields three spans: it was true, then not, then true again.
 fn timeline(candidates: &[Candidate<'_>]) -> Result<Vec<Fact>, Refused> {
-    let mut non_null: Vec<&Candidate<'_>> =
-        candidates.iter().filter(|c| c.value.is_some()).collect();
-    if non_null.is_empty() {
+    let mut asserted: Vec<&Candidate<'_>> = candidates
+        .iter()
+        .filter(|c| c.value.is_assertion())
+        .collect();
+    if asserted.is_empty() {
         return Ok(Vec::new());
     }
 
     // Stable sort: candidates sharing a timestamp keep their input order, which
     // matters for the conflict check below reporting the caller's own ordering.
-    non_null.sort_by_key(|c| c.provenance.observed_at);
+    asserted.sort_by_key(|c| c.provenance.observed_at);
 
-    for pair in non_null.windows(2) {
+    for pair in asserted.windows(2) {
         let (a, b) = (pair[0], pair[1]);
         if a.provenance.observed_at == b.provenance.observed_at && a.value != b.value {
             return Err(Refused(format!(
                 "{:?} and {:?} were both observed at {}, so neither supersedes the other \
                  and no validity range can be assigned. Distinguish their observation \
                  times, or resolve with SourcePriority.",
-                a.value.unwrap_or_default(),
-                b.value.unwrap_or_default(),
-                a.provenance.observed_at
+                a.value, b.value, a.provenance.observed_at
             )));
         }
     }
 
     let mut facts: Vec<Fact> = Vec::new();
-    for c in &non_null {
-        let value = c.value.expect("filtered to non-null");
+    for c in &asserted {
+        let value = held(c.value);
         if facts.last().is_some_and(|f| f.value == value) {
             continue; // same value restated: extends the open span, no new fact
         }
         facts.push(Fact {
-            value: value.to_string(),
+            value,
             valid: Interval::since(c.provenance.observed_at),
         });
     }
@@ -628,11 +725,11 @@ mod tests {
             out,
             Outcome::Timeline(vec![
                 Fact {
-                    value: "acme".into(),
+                    value: Held::Value("acme".to_string()),
                     valid: Interval::between(100, 200)
                 },
                 Fact {
-                    value: "globex".into(),
+                    value: Held::Value("globex".to_string()),
                     valid: Interval::since(200)
                 },
             ])
@@ -719,7 +816,7 @@ mod tests {
         assert_eq!(
             out,
             Outcome::Timeline(vec![Fact {
-                value: "acme".into(),
+                value: Held::Value("acme".to_string()),
                 valid: Interval::since(100)
             }])
         );
@@ -767,5 +864,58 @@ mod tests {
         assert!(!Strategy::FirstNonNull.needs_provenance());
         assert!(!Strategy::UnanimousOrNull.needs_provenance());
         assert!(!Strategy::ConfidenceMajority.needs_provenance());
+    }
+
+    #[test]
+    fn an_absence_competes_rather_than_being_treated_as_silence() {
+        // "They left Acme and are between jobs" is an assertion, not a gap in
+        // what we heard. Under MostRecent it has to be able to win.
+        let early = prov(Source::UserAssertion, 1);
+        let late = prov(Source::UserAssertion, 2);
+        let candidates = vec![
+            Candidate::new(Some("Acme"), &early),
+            Candidate::absent(&late),
+        ];
+        let outcome = merge(&candidates, &Strategy::MostRecent).unwrap();
+        assert_eq!(outcome.held_at(0), Some(&Held::Absent));
+    }
+
+    #[test]
+    fn silence_still_never_contradicts_an_assertion() {
+        // The existing rule is unchanged: a source with nothing to say does not
+        // compete, even when it is the most recent thing we heard.
+        let early = prov(Source::UserAssertion, 1);
+        let late = prov(Source::UserAssertion, 2);
+        let candidates = vec![
+            Candidate::new(Some("Acme"), &early),
+            Candidate::new(None, &late),
+        ];
+        let outcome = merge(&candidates, &Strategy::MostRecent).unwrap();
+        assert_eq!(outcome.as_of(0), Some("Acme"));
+    }
+
+    #[test]
+    fn a_timeline_can_hold_a_gap_between_two_values() {
+        // Acme, then unemployed, then Globex: three spans, the middle one absent.
+        let p1 = prov(Source::UserAssertion, 10);
+        let p2 = prov(Source::UserAssertion, 20);
+        let p3 = prov(Source::UserAssertion, 30);
+        let candidates = vec![
+            Candidate::new(Some("Acme"), &p1),
+            Candidate::absent(&p2),
+            Candidate::new(Some("Globex"), &p3),
+        ];
+        let outcome = merge(&candidates, &Strategy::ValidInterval).unwrap();
+        assert_eq!(outcome.held_at(15), Some(&Held::Value("Acme".to_string())));
+        assert_eq!(outcome.held_at(25), Some(&Held::Absent));
+        assert_eq!(
+            outcome.held_at(35),
+            Some(&Held::Value("Globex".to_string()))
+        );
+        assert_eq!(
+            outcome.as_of(25),
+            None,
+            "as_of reports an absence as no value"
+        );
     }
 }
