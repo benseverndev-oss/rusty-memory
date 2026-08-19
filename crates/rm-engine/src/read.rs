@@ -4,7 +4,7 @@ use rm_core::{Interval, Provenance, Source, Timestamp};
 use rm_store::StableId;
 use rm_survivor::{merge, Candidate, Held};
 
-use crate::{AssertionId, Engine, EngineError, Policy};
+use crate::{AssertionId, AssertionRef, Engine, EngineError, Policy};
 
 /// What the engine concluded an attribute held.
 ///
@@ -46,6 +46,44 @@ pub struct Recalled {
     pub score: f32,
     /// A later assertion superseded this one as of the query's `tx_t`.
     pub superseded: bool,
+}
+
+impl Query {
+    /// A recall over everything, as of now.
+    ///
+    /// `as_of` defaults to `None`, meaning unbounded on both axes rather than
+    /// "now" — this crate takes no clock, and inventing one here would make the
+    /// result depend on a wall clock the caller cannot control in a test.
+    pub fn new(embedding: Vec<f32>, k: usize) -> Self {
+        Query {
+            embedding,
+            k,
+            as_of: None,
+            entity: None,
+            source: None,
+            session: None,
+        }
+    }
+
+    pub fn as_of(mut self, valid_t: Timestamp, tx_t: Timestamp) -> Self {
+        self.as_of = Some((valid_t, tx_t));
+        self
+    }
+
+    pub fn about_entity(mut self, entity: StableId) -> Self {
+        self.entity = Some(entity);
+        self
+    }
+
+    pub fn in_session(mut self, session: impl Into<String>) -> Self {
+        self.session = Some(session.into());
+        self
+    }
+
+    pub fn from_source(mut self, source: Source) -> Self {
+        self.source = Some(source);
+        self
+    }
 }
 
 impl Engine {
@@ -113,5 +151,95 @@ impl Engine {
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// The `k` nearest assertions matching the query's scope.
+    ///
+    /// Scoping is handed to `rm_index::VectorIndex::search_filtered` as a
+    /// closure, so it runs *during* the scan rather than afterwards. Fetching a
+    /// top-`k` and filtering it after the fact silently returns two results for
+    /// "what do I know about Alice in this session" whenever eight
+    /// better-scoring assertions belong to other sessions — the caller sees a
+    /// short list with no way to tell it was truncated by the filter rather
+    /// than by the data. `rm_index` was built specifically to avoid that
+    /// failure, and reintroducing it one layer up would waste the work.
+    pub fn recall(&self, q: &Query) -> Result<Vec<Recalled>, EngineError> {
+        let keep = |id: rm_index::EntryId| self.in_scope(id, q);
+        let hits = self.index.search_filtered(&q.embedding, q.k, keep)?;
+
+        Ok(hits
+            .into_iter()
+            .filter_map(|hit| {
+                let entry = self.assertions.get(&hit.id)?;
+                let version = self
+                    .store
+                    .history(entry.entity, &entry.attribute)
+                    .get(entry.version)?;
+                Some(Recalled {
+                    entity: entry.entity,
+                    assertion: hit.id,
+                    attribute: entry.attribute.clone(),
+                    value: version.value.clone(),
+                    valid: version.valid,
+                    provenance: version.provenance.clone(),
+                    score: hit.score,
+                    superseded: self.is_superseded(entry, version, q),
+                })
+            })
+            .collect())
+    }
+
+    /// Whether one assertion passes the query's non-vector filters.
+    ///
+    /// Called from inside `search_filtered`'s scan rather than after it — see
+    /// [`Engine::recall`] for why that ordering is the point.
+    fn in_scope(&self, id: rm_index::EntryId, q: &Query) -> bool {
+        let Some(entry) = self.assertions.get(&id) else {
+            return false;
+        };
+        if q.entity.is_some_and(|e| e != entry.entity) {
+            return false;
+        }
+        let Some(version) = self
+            .store
+            .history(entry.entity, &entry.attribute)
+            .get(entry.version)
+        else {
+            return false;
+        };
+        if let Some(session) = &q.session {
+            if &version.provenance.source_ref != session {
+                return false;
+            }
+        }
+        if let Some(source) = &q.source {
+            if &version.provenance.source != source {
+                return false;
+            }
+        }
+        if let Some((valid_t, tx_t)) = q.as_of {
+            if version.ingested_at() > tx_t || !version.valid.contains(valid_t) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a later assertion about the same attribute overtook this one, as
+    /// of the query's `tx_t` (or unbounded, if the query has none).
+    ///
+    /// Reported rather than filtered: semantic recall of a fact that *was* true
+    /// is often exactly what was wanted ("what did I believe about her employer
+    /// in May"), and dropping a superseded fact would make that unanswerable.
+    /// Returning it unmarked is worse — it lets a caller state a stale fact as
+    /// current. Marking it is the only option that does neither.
+    fn is_superseded(&self, entry: &AssertionRef, version: &rm_store::Version, q: &Query) -> bool {
+        let horizon = q.as_of.map(|(_, tx)| tx).unwrap_or(Timestamp::MAX);
+        self.store
+            .history(entry.entity, &entry.attribute)
+            .iter()
+            .any(|other| {
+                other.ingested_at() <= horizon && other.ingested_at() > version.ingested_at()
+            })
     }
 }

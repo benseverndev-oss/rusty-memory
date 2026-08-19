@@ -1157,4 +1157,133 @@ mod tests {
             Err(EngineError::Refused(_))
         ));
     }
+
+    /// An observation carrying a caller-chosen embedding, for exercising
+    /// `recall`'s geometry directly instead of through whatever
+    /// `observation()`'s fixed vector happens to produce.
+    fn embedded(
+        name: &str,
+        attribute: &str,
+        value: &str,
+        at: Timestamp,
+        v: [f32; 3],
+    ) -> Observation {
+        let mut obs = observation(name, attribute, value, at);
+        obs.embedding = v.to_vec();
+        obs
+    }
+
+    #[test]
+    fn recall_returns_the_nearest_assertions_with_their_provenance() {
+        let mut e = engine();
+        e.remember(embedded(
+            "Ben Severn",
+            "employer",
+            "Acme",
+            1,
+            [1.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        e.remember(embedded(
+            "Wei Zhang",
+            "employer",
+            "Globex",
+            2,
+            [0.0, 1.0, 0.0],
+        ))
+        .unwrap();
+
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 1)).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].value.as_deref(), Some("Acme"));
+        assert_eq!(hits[0].provenance.source_ref, "session-1");
+    }
+
+    #[test]
+    fn filtering_by_session_happens_during_the_scan() {
+        // Ten better-scoring assertions from another session must not crowd out
+        // the one that matches: post-filtering a top-k would return nothing.
+        let mut e = engine();
+        for i in 0..10 {
+            let mut obs = embedded("Person A", "note", "other", i + 1, [1.0, 0.0, 0.0]);
+            obs.provenance = Provenance::new(Source::UserAssertion, i + 1, "session-other");
+            e.remember(obs).unwrap();
+        }
+        let mut wanted = embedded("Person B", "note", "wanted", 20, [0.6, 0.8, 0.0]);
+        wanted.provenance = Provenance::new(Source::UserAssertion, 20, "session-mine");
+        e.remember(wanted).unwrap();
+
+        let q = Query::new(vec![1.0, 0.0, 0.0], 5).in_session("session-mine");
+        let hits = e.recall(&q).unwrap();
+        assert_eq!(hits.len(), 1, "post-filtering would have returned 0");
+        assert_eq!(hits[0].value.as_deref(), Some("wanted"));
+    }
+
+    #[test]
+    fn a_superseded_fact_is_returned_marked_not_dropped() {
+        // "What did I believe about her employer in May" needs the old fact, and
+        // a caller stating it as current needs to be stopped from doing so.
+        let mut e = engine();
+        e.remember(embedded(
+            "Ben Severn",
+            "employer",
+            "Acme",
+            10,
+            [1.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        e.remember(embedded(
+            "Ben Severn",
+            "employer",
+            "Globex",
+            20,
+            [0.9, 0.1, 0.0],
+        ))
+        .unwrap();
+
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 2)).unwrap();
+        assert_eq!(hits.len(), 2);
+        let acme = hits
+            .iter()
+            .find(|h| h.value.as_deref() == Some("Acme"))
+            .unwrap();
+        assert!(acme.superseded, "an old fact must be returned marked");
+        let globex = hits
+            .iter()
+            .find(|h| h.value.as_deref() == Some("Globex"))
+            .unwrap();
+        assert!(!globex.superseded);
+    }
+
+    #[test]
+    fn recall_as_of_a_past_tx_time_does_not_see_later_knowledge() {
+        let mut e = engine();
+        e.remember(embedded(
+            "Ben Severn",
+            "employer",
+            "Acme",
+            10,
+            [1.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        e.remember(embedded(
+            "Ben Severn",
+            "employer",
+            "Globex",
+            20,
+            [0.9, 0.1, 0.0],
+        ))
+        .unwrap();
+
+        let q = Query::new(vec![1.0, 0.0, 0.0], 5).as_of(15, 15);
+        let hits = e.recall(&q).unwrap();
+        assert_eq!(hits.len(), 1, "September's news is not August's knowledge");
+        assert_eq!(hits[0].value.as_deref(), Some("Acme"));
+    }
+
+    #[test]
+    fn a_query_whose_vector_is_rejected_reports_it() {
+        let e = engine();
+        assert!(e.recall(&Query::new(vec![1.0, 0.0], 1)).is_err());
+    }
 }
