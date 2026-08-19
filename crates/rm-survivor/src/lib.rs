@@ -53,7 +53,7 @@ use serde::{Deserialize, Serialize};
 
 /// A refusal to guess, and why.
 ///
-/// Distinct from "no survivor" ([`Outcome::Survivor(None)`]), which is a real
+/// Distinct from "no survivor" ([`Outcome::Survivor`]`(None)`), which is a real
 /// answer: the candidates were considered and none won. A `Refused` means the
 /// question could not be asked with the data supplied.
 #[derive(Clone, Debug, PartialEq, Eq)]
