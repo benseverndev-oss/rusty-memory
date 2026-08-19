@@ -1360,10 +1360,28 @@ mod tests {
     #[test]
     fn a_merge_drops_an_edge_that_would_become_a_self_edge() {
         // The two turned out to be the same person, so "A manages B" is now
-        // "A manages A" -- which relate() refuses to create.
+        // "A manages A" -- which relate() refuses to create, and repoint_edges
+        // must not smuggle one in through a merge instead.
+        //
+        // A walk cannot witness this: `neighborhood` inserts a seed into its
+        // `seen` set *before* it looks at that seed's own neighbours, so a
+        // survivor -> survivor edge can never be reached a second time from
+        // the survivor itself. That is a property of breadth-first search
+        // from a single seed, not a gap in this fixture -- no choice of
+        // `Direction` or hop count makes a self-edge observable that way. So
+        // this reaches for `erase_edges`'s return count instead: it is a
+        // flat scan of every edge touching the entity, self-edges included,
+        // and a phantom survivor -> survivor edge would make it count one
+        // higher than the real edges alone.
         let mut e = engine();
         let Remembered::Created { entity: kept, .. } = e
             .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: boss, .. } = e
+            .remember(observation("Wei Zhang", "role", "manager", 2))
             .unwrap()
         else {
             panic!("setup")
@@ -1378,6 +1396,8 @@ mod tests {
             panic!("expected a review")
         };
 
+        // Collapses into a self-edge once the merge lands, and must not
+        // survive it.
         e.relate(
             kept,
             "knows",
@@ -1386,13 +1406,24 @@ mod tests {
             Provenance::new(Source::UserAssertion, 4, "s"),
         )
         .unwrap();
+        // Untouched by the merge, so its presence in the count tells the two
+        // cases apart: a lingering self-edge shows up as one edge too many,
+        // not as the only edge present.
+        e.relate(
+            boss,
+            "manages",
+            kept,
+            Interval::since(1),
+            Provenance::new(Source::UserAssertion, 5, "s"),
+        )
+        .unwrap();
 
         let survivor = e.confirm(review[0]).unwrap();
-        let n = e.neighborhood(&Walk::new(vec![survivor], 2, 10, 5, 5).direction(Direction::Both));
         assert_eq!(
-            n.reached.len(),
+            e.erase_edges(survivor).unwrap(),
             1,
-            "only the survivor, with no edge to itself"
+            "only the real manages-edge should remain; a surviving self-edge \
+             would count as a second"
         );
     }
 
