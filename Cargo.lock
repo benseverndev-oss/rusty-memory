@@ -53,6 +53,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rm-graph"
+version = "0.0.0"
+dependencies = [
+ "rm-core",
+ "rm-store",
+]
+
+[[package]]
 name = "rm-index"
 version = "0.0.0"
 dependencies = [
