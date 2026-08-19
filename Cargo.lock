@@ -40,6 +40,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rm-engine"
+version = "0.0.0"
+dependencies = [
+ "rm-core",
+ "rm-index",
+ "rm-resolve",
+ "rm-store",
+ "rm-survivor",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rm-index"
 version = "0.0.0"
 dependencies = [
