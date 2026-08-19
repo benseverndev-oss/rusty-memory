@@ -1,5 +1,8 @@
 //! Proves the graph re-exports are sufficient, the same way `readme.rs` proves
-//! it for `remember`/`recall`/`forget`.
+//! it for `remember`/`recall`/`forget` — and tells the story the whole crate
+//! exists for: a two-hop walk answers a question about an entity that names
+//! neither of the entities it actually depends on, which semantic recall
+//! alone cannot reach.
 //!
 //! One `use`, from one crate. A caller composing a [`Walk`] and reading back a
 //! [`Neighborhood`] of [`Reached`] entities, choosing a [`Direction`], and
@@ -41,6 +44,21 @@ fn person(name: &str, at: i64) -> Observation {
         valid: Interval::since(at),
         provenance: Provenance::new(Source::UserAssertion, at, "s"),
         embedding: vec![1.0, 0.0, 0.0],
+    }
+}
+
+/// An observation of `attribute: value` for `name`, with a caller-chosen
+/// embedding so distinct entities (a person, a company, a city) don't
+/// resolve into one another under blocking.
+fn seen(name: &str, attribute: &str, value: &str, at: i64, v: [f32; 3]) -> Observation {
+    Observation {
+        kind: "thing".to_string(),
+        mention: Record::new().with("name", name),
+        attribute: attribute.to_string(),
+        value: Some(value.to_string()),
+        valid: Interval::since(at),
+        provenance: Provenance::new(Source::UserAssertion, at, "session-1"),
+        embedding: v.to_vec(),
     }
 }
 
@@ -101,5 +119,125 @@ fn a_caller_can_compose_a_walk_from_rm_engine_alone() {
         e.erase_edges(9999),
         Err(EngineError::UnknownEntity(9999)),
         "the error variant is nameable without a second crate too"
+    );
+}
+
+#[test]
+fn a_two_hop_walk_answers_what_recall_alone_cannot() {
+    // "Where is my employer based" is a question about Alice that names
+    // neither Acme nor Bristol. Semantic recall cannot get there; the graph
+    // can.
+    let mut e = engine();
+    let Remembered::Created { entity: alice, .. } = e
+        .remember(seen("Ben Severn", "role", "engineer", 1, [1.0, 0.0, 0.0]))
+        .unwrap()
+    else {
+        panic!("setup")
+    };
+    let Remembered::Created { entity: acme, .. } = e
+        .remember(seen("Acme Corp", "kind", "company", 2, [0.0, 1.0, 0.0]))
+        .unwrap()
+    else {
+        panic!("setup")
+    };
+    let Remembered::Created {
+        entity: bristol, ..
+    } = e
+        .remember(seen("Bristol", "kind", "city", 3, [0.0, 0.0, 1.0]))
+        .unwrap()
+    else {
+        panic!("setup")
+    };
+
+    let prov = Provenance::new(Source::UserAssertion, 4, "session-2");
+    e.relate(alice, "employed_by", acme, Interval::since(1), prov.clone())
+        .unwrap();
+    e.relate(acme, "based_in", bristol, Interval::since(1), prov)
+        .unwrap();
+
+    let n = e.neighborhood(&Walk::new(vec![alice], 2, 10, 5, 9));
+    let hit = n.reached.iter().find(|r| r.entity == bristol).unwrap();
+    assert_eq!(hit.distance, 2);
+    assert!(!n.truncated);
+}
+
+#[test]
+fn a_walk_answers_as_of_a_past_moment_the_way_the_rest_of_the_store_does() {
+    let mut e = engine();
+    let Remembered::Created { entity: alice, .. } = e
+        .remember(seen("Ben Severn", "role", "engineer", 1, [1.0, 0.0, 0.0]))
+        .unwrap()
+    else {
+        panic!("setup")
+    };
+    let Remembered::Created { entity: acme, .. } = e
+        .remember(seen("Acme Corp", "kind", "company", 2, [0.0, 1.0, 0.0]))
+        .unwrap()
+    else {
+        panic!("setup")
+    };
+
+    // Told in September that it started in July.
+    e.relate(
+        alice,
+        "employed_by",
+        acme,
+        Interval::since(7),
+        Provenance::new(Source::UserAssertion, 9, "s"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        e.neighborhood(&Walk::new(vec![alice], 1, 10, 8, 8))
+            .reached
+            .len(),
+        1
+    );
+    assert_eq!(
+        e.neighborhood(&Walk::new(vec![alice], 1, 10, 8, 10))
+            .reached
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn edges_survive_a_snapshot_round_trip() {
+    let mut e = engine();
+    let Remembered::Created { entity: alice, .. } = e
+        .remember(seen("Ben Severn", "role", "engineer", 1, [1.0, 0.0, 0.0]))
+        .unwrap()
+    else {
+        panic!("setup")
+    };
+    let Remembered::Created { entity: acme, .. } = e
+        .remember(seen("Acme Corp", "kind", "company", 2, [0.0, 1.0, 0.0]))
+        .unwrap()
+    else {
+        panic!("setup")
+    };
+    e.relate(
+        alice,
+        "employed_by",
+        acme,
+        Interval::since(1),
+        Provenance::new(Source::UserAssertion, 3, "s"),
+    )
+    .unwrap();
+
+    let restored =
+        Engine::open(&e.snapshot(), ruleset(), Policy::new(Strategy::MostRecent)).unwrap();
+
+    let out = restored.neighborhood(&Walk::new(vec![alice], 1, 10, 5, 9));
+    assert_eq!(out.reached.len(), 2);
+
+    // The reverse direction proves the derived map was rebuilt, not persisted.
+    let into = restored.neighborhood(&Walk::new(vec![acme], 1, 10, 5, 9).direction(Direction::In));
+    assert_eq!(into.reached.len(), 2);
+
+    assert_eq!(
+        restored.snapshot(),
+        e.snapshot(),
+        "still byte-stable with edges"
     );
 }
