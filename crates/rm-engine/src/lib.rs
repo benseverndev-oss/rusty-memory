@@ -114,8 +114,8 @@ pub struct Engine {
     pub(crate) store: MemoryStore,
     pub(crate) index: VectorIndex,
     pub(crate) ruleset: Ruleset,
-    /// Read by survivorship on recall, added in a later task.
-    #[allow(dead_code)]
+    /// Read by survivorship in [`Engine::about`]. Swappable via
+    /// [`Engine::with_policy`] without touching a single stored version.
     pub(crate) policy: Policy,
     /// Resolution fields per entity, so a new mention can be scored against
     /// what we already know without reading them back out of the store.
@@ -1002,5 +1002,98 @@ mod tests {
             open[0].score > 0.0,
             "a review pair has real evidence behind it"
         );
+    }
+
+    #[test]
+    fn changing_the_policy_changes_the_answer_without_rewriting_history() {
+        // The same two facts, read two ways. This is the thesis: resolution is
+        // a query, so the store never had to pick.
+        let mut e = Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        );
+        let out = e
+            .remember(observation("Ben Severn", "employer", "Acme", 10))
+            .unwrap();
+        let Remembered::Created { entity, .. } = out else {
+            panic!("setup")
+        };
+        e.remember(observation("Ben Severn", "employer", "Globex", 20))
+            .unwrap();
+
+        // MostRecent: one winner, at every instant.
+        assert_eq!(
+            e.about(entity, "employer", 15, 100).unwrap(),
+            Believed::Value("Globex".into())
+        );
+
+        // ValidInterval: both survive, and the answer depends on when you ask.
+        let e = e.with_policy(Policy::new(Strategy::ValidInterval));
+        assert_eq!(
+            e.about(entity, "employer", 15, 100).unwrap(),
+            Believed::Value("Acme".into())
+        );
+        assert_eq!(
+            e.about(entity, "employer", 25, 100).unwrap(),
+            Believed::Value("Globex".into())
+        );
+    }
+
+    #[test]
+    fn an_attribute_never_discussed_is_unknown_not_absent() {
+        let mut e = engine();
+        let out = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let Remembered::Created { entity, .. } = out else {
+            panic!("setup")
+        };
+        assert_eq!(e.about(entity, "spouse", 5, 5).unwrap(), Believed::Unknown);
+    }
+
+    #[test]
+    fn a_tombstone_reads_as_absent_not_unknown() {
+        let mut e = engine();
+        let mut obs = observation("Ben Severn", "employer", "Acme", 1);
+        let Remembered::Created { entity, .. } = e.remember(obs.clone()).unwrap() else {
+            panic!("setup")
+        };
+        obs.value = None;
+        obs.provenance = Provenance::new(Source::UserAssertion, 5, "session-2");
+        obs.valid = Interval::since(5);
+        e.remember(obs).unwrap();
+        assert_eq!(
+            e.about(entity, "employer", 10, 10).unwrap(),
+            Believed::Absent
+        );
+    }
+
+    #[test]
+    fn asking_about_an_unknown_entity_is_unknown_not_an_error() {
+        let e = engine();
+        assert_eq!(e.about(9999, "employer", 1, 1).unwrap(), Believed::Unknown);
+    }
+
+    #[test]
+    fn a_refusal_propagates_instead_of_falling_back_to_a_looser_strategy() {
+        // Two different values at the same instant: MostRecent has no answer,
+        // and a memory chosen by a rule the caller did not ask for is exactly
+        // the plausible wrong answer the refusals exist to prevent.
+        let mut e = engine();
+        let Remembered::Created { entity, .. } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 7))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let mut same_instant = observation("Ben Severn", "employer", "Globex", 7);
+        same_instant.embedding = vec![0.0, 1.0, 0.0];
+        e.remember(same_instant).unwrap();
+
+        assert!(matches!(
+            e.about(entity, "employer", 10, 10),
+            Err(EngineError::Refused(_))
+        ));
     }
 }
