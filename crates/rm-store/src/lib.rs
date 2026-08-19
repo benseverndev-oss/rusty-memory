@@ -48,7 +48,7 @@
 use std::collections::BTreeMap;
 
 use rm_core::{Interval, Provenance, Timestamp};
-use rm_survivor::{merge, Candidate, Outcome, Refused, Strategy};
+use rm_survivor::{merge, Candidate, Held, Outcome, Refused, Strategy};
 use serde::{Deserialize, Serialize};
 
 /// A durable entity id: assigned once, monotonic, never reused.
@@ -256,8 +256,10 @@ impl MemoryStore {
 
         // The resolution is known as of the newest thing it considered, and
         // speaks about valid time from the oldest.
-        let asserted: Vec<&Candidate<'_>> =
-            candidates.iter().filter(|c| c.value.is_some()).collect();
+        let asserted: Vec<&Candidate<'_>> = candidates
+            .iter()
+            .filter(|c| c.value.is_assertion())
+            .collect();
         let (Some(earliest), Some(latest)) = (
             asserted.iter().map(|c| c.provenance.observed_at).min(),
             asserted
@@ -273,7 +275,7 @@ impl MemoryStore {
             Outcome::Survivor(Some(value)) => self.assert(
                 id,
                 attribute,
-                Some(value),
+                held_to_value(value),
                 Interval::since(earliest),
                 latest.clone(),
             ),
@@ -282,7 +284,7 @@ impl MemoryStore {
                     self.assert(
                         id,
                         attribute.clone(),
-                        Some(fact.value),
+                        held_to_value(fact.value),
                         fact.valid,
                         latest.clone(),
                     )?;
@@ -362,6 +364,17 @@ impl MemoryStore {
     /// Restore from a snapshot.
     pub fn open(snapshot: &str) -> Result<Self, StoreError> {
         serde_json::from_str(snapshot).map_err(|e| StoreError::Parse(e.to_string()))
+    }
+}
+
+/// A survived value in this store's own convention: `None` is a tombstone, not
+/// a missing observation. This is the exact mapping [`Held`] exists for —
+/// `Held::Absent` is a positive claim of emptiness, which is what `None` means
+/// here, and `Held::Value` is a known value.
+fn held_to_value(held: Held) -> Option<String> {
+    match held {
+        Held::Value(v) => Some(v),
+        Held::Absent => None,
     }
 }
 
