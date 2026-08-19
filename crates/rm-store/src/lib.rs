@@ -656,12 +656,21 @@ impl MemoryStore {
     /// needs to know exactly what was removed; a convenience that quietly did
     /// both would make that question unanswerable.
     ///
-    /// Erasing edges on an entity that has none is not an error — it reports 0,
-    /// because the caller's goal ("these must not be here") is already true.
-    /// Unlike `erase` it does not reject an unknown id, because it has nothing
-    /// to reject with: ids are never reused, so an id naming no entity also
-    /// names no edge, and the count already says nothing was found.
-    pub fn erase_edges(&mut self, entity: StableId) -> usize {
+    /// Erasing edges on an entity that holds none is not an error — it reports
+    /// `Ok(0)`, because the caller's goal ("these must not be here") is already
+    /// true. An id the store does not hold *is* an error, exactly as it is for
+    /// [`MemoryStore::erase`]: the caller is working from an id that means
+    /// nothing, and a bare 0 would let a typo read as a completed deletion.
+    /// That distinction is the whole reason this call reports at all, so the two
+    /// deletion doors answer a mistake the same way rather than two ways.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnknownEntity`] if `entity` names no entity in this store.
+    pub fn erase_edges(&mut self, entity: StableId) -> Result<usize, StoreError> {
+        if !self.entities.contains_key(&entity) {
+            return Err(StoreError::UnknownEntity(entity));
+        }
         let mut removed = 0;
 
         // Outgoing: drop the whole subtree, then unhook each object from the
@@ -692,7 +701,7 @@ impl MemoryStore {
                 self.prune_empty(subject, &predicate);
             }
         }
-        removed
+        Ok(removed)
     }
 
     /// Move every edge touching `from` onto `to`, returning how many left
@@ -714,22 +723,33 @@ impl MemoryStore {
     /// reporting a merge has to say. Counting only the survivors would make
     /// "there was nothing to move" and "everything collapsed into the survivor"
     /// the same number.
-    pub fn repoint_edges(&mut self, from: StableId, to: StableId) -> usize {
-        // Merging an entity into itself has to be caught here rather than left
-        // to fall through: every edge on `from` would also be an edge on `to`,
-        // so the self-edge rule below would read the whole neighbourhood as
+    ///
+    /// Merging an entity into itself is a no-op reporting `Ok(0)` rather than an
+    /// error: both ids are real and the caller's goal is already true, which is
+    /// the same reading `erase` gives an attribute nobody ever discussed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnknownEntity`] if either id names no entity in this store.
+    /// `relate` rejects an endpoint naming no entity and [`MemoryStore::open`]
+    /// rejects a snapshot holding one, so moving edges onto one would write a
+    /// store that cannot be reopened — damage found at restore, long after the
+    /// call that caused it. Reporting 0 instead would be no better: it is what
+    /// "there was nothing to move" says, so a caller could not tell a merge that
+    /// found nothing from one aimed at an id that never existed.
+    pub fn repoint_edges(&mut self, from: StableId, to: StableId) -> Result<usize, StoreError> {
+        for id in [from, to] {
+            if !self.entities.contains_key(&id) {
+                return Err(StoreError::UnknownEntity(id));
+            }
+        }
+        // Checked after the endpoints, so merging an unknown id into itself is
+        // still the error it is anywhere else. Caught here rather than left to
+        // fall through: every edge on `from` would also be an edge on `to`, so
+        // the self-edge rule below would read the whole neighbourhood as
         // collapsing and delete it.
         if from == to {
-            return 0;
-        }
-        // An unknown survivor moves nothing. `relate` rejects an endpoint that
-        // names no entity and `open` rejects a snapshot containing one, so
-        // moving edges onto one would build a store that cannot be reopened —
-        // damage found at restore, long after the call that caused it. This
-        // returns a count rather than a `Result`, so the caller sees 0 and the
-        // edges stay where they are, findable, instead.
-        if !self.entities.contains_key(&to) {
-            return 0;
+            return Ok(0);
         }
         let mut moved = 0;
 
@@ -769,7 +789,7 @@ impl MemoryStore {
                 self.absorb_edge(subject, predicate, to, versions);
             }
         }
-        moved
+        Ok(moved)
     }
 
     /// Add one triple's versions to the forward map and its reverse.
@@ -1624,7 +1644,7 @@ mod tests {
             "erase left the edge"
         );
 
-        assert_eq!(store.erase_edges(user), 1);
+        assert_eq!(store.erase_edges(user).unwrap(), 1);
         assert_eq!(store.edges_from(user, MAR, OCT).len(), 0);
         assert_maps_agree(&store);
     }
@@ -1644,7 +1664,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.erase_edges(acme),
+            store.erase_edges(acme).unwrap(),
             1,
             "erasing the object clears it too"
         );
@@ -1671,7 +1691,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(store.erase_edges(acme), 1);
+        assert_eq!(store.erase_edges(acme).unwrap(), 1);
         assert_eq!(store.snapshot(), before);
         assert_maps_agree(&store);
     }
@@ -1701,7 +1721,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(store.repoint_edges(absorbed, kept), 2);
+        assert_eq!(store.repoint_edges(absorbed, kept).unwrap(), 2);
         assert_eq!(store.edges_from(kept, MAR, OCT).len(), 1);
         assert_eq!(store.edges_into(kept, MAR, OCT).len(), 1);
         assert_eq!(store.edges_from(absorbed, MAR, OCT).len(), 0);
@@ -1726,7 +1746,7 @@ mod tests {
             )
             .unwrap();
 
-        store.repoint_edges(absorbed, kept);
+        store.repoint_edges(absorbed, kept).unwrap();
         assert_eq!(store.edges_from(kept, MAR, OCT).len(), 0);
         assert_eq!(store.edges_into(kept, MAR, OCT).len(), 0);
         assert_maps_agree(&store);
@@ -1758,7 +1778,7 @@ mod tests {
             )
             .unwrap();
 
-        store.repoint_edges(absorbed, kept);
+        store.repoint_edges(absorbed, kept).unwrap();
         assert_eq!(store.edges_from(kept, MAR, OCT).len(), 1);
         assert_eq!(
             store.edge_history(kept, "employed_by", acme).len(),
@@ -1796,7 +1816,7 @@ mod tests {
             )
             .unwrap();
 
-        store.repoint_edges(absorbed, kept);
+        store.repoint_edges(absorbed, kept).unwrap();
         let history = store.edge_history(kept, "employed_by", acme);
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].valid, Interval::since(JAN), "the survivor's own");
@@ -1831,18 +1851,36 @@ mod tests {
             .relate(boss, "manages", user, Interval::since(JAN), user_said(JAN))
             .unwrap();
 
-        assert_eq!(store.repoint_edges(user, user), 0);
+        assert_eq!(store.repoint_edges(user, user).unwrap(), 0);
         assert_eq!(store.edges_from(user, MAR, OCT).len(), 1);
         assert_eq!(store.edges_into(user, MAR, OCT).len(), 1);
         assert_maps_agree(&store);
     }
 
     #[test]
-    fn repointing_onto_an_id_that_names_no_entity_moves_nothing() {
+    fn erasing_edges_on_an_unknown_entity_is_an_error() {
+        // The same answer `erase` gives the same mistake, and for the same
+        // reason: the caller is working from an id that means nothing, and a
+        // bare 0 would let a typo read as a completed deletion. An entity that
+        // exists and simply has no edges still reports Ok(0) -- what the caller
+        // wanted is already true there.
+        let (mut store, user) = store_with_user();
+        assert_eq!(
+            store.erase_edges(9999),
+            Err(StoreError::UnknownEntity(9999))
+        );
+        assert_eq!(store.erase_edges(user).unwrap(), 0);
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn repointing_either_end_of_a_merge_onto_an_unknown_id_is_an_error() {
         // `relate` rejects an endpoint naming no entity and `open` rejects a
-        // snapshot holding one, so moving edges there would write a store that
-        // cannot be reopened. Leaving them where they are keeps them findable
-        // and keeps the damage inside the caller's own bad id.
+        // snapshot holding one, so moving edges onto one would write a store
+        // that cannot be reopened -- damage found at restore, long after this
+        // call. Reporting 0 would not be enough either: that is what "there was
+        // nothing to move" says, so the caller could not tell the two apart.
+        // The edges stay where they are, findable, and the store still opens.
         let (mut store, user) = store_with_user();
         let acme = store.create_entity("org", JAN);
         store
@@ -1855,7 +1893,21 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(store.repoint_edges(user, 9999), 0);
+        assert_eq!(
+            store.repoint_edges(user, 9999),
+            Err(StoreError::UnknownEntity(9999))
+        );
+        assert_eq!(
+            store.repoint_edges(9999, user),
+            Err(StoreError::UnknownEntity(9999)),
+            "the absorbed id is checked too, not just the survivor"
+        );
+        assert_eq!(
+            store.repoint_edges(9999, 9999),
+            Err(StoreError::UnknownEntity(9999)),
+            "an unknown id merged into itself is still unknown, not a no-op"
+        );
+
         assert_eq!(store.edges_from(user, MAR, OCT).len(), 1);
         assert!(MemoryStore::open(&store.snapshot()).is_ok());
         assert_maps_agree(&store);
@@ -1888,7 +1940,7 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(store.repoint_edges(absorbed, kept), 3);
+        assert_eq!(store.repoint_edges(absorbed, kept).unwrap(), 3);
         assert_eq!(MemoryStore::open(&store.snapshot()).unwrap(), store);
         assert_maps_agree(&store);
     }
