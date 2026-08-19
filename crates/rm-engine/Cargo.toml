@@ -14,5 +14,6 @@ rm-survivor = { workspace = true }
 rm-store = { workspace = true }
 rm-resolve = { workspace = true }
 rm-index = { workspace = true }
+rm-graph = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
