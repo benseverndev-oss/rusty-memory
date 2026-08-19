@@ -35,7 +35,7 @@ use rm_core::{Interval, Provenance};
 #[cfg(test)]
 use rm_index::Metric;
 use rm_index::{IndexError, VectorIndex};
-use rm_resolve::{Record, Ruleset};
+use rm_resolve::{Decision, Record, Ruleset};
 use rm_store::{MemoryStore, StableId, StoreError};
 use rm_survivor::Refused;
 use serde::{Deserialize, Serialize};
@@ -165,14 +165,109 @@ impl Engine {
     /// leaves the store and the index exactly as they were, because the
     /// alternative — a fact in the store with nothing able to find it — is a
     /// failure no caller can detect and no later query can report.
+    ///
+    /// The mention is then resolved against every blocked candidate before
+    /// deciding whether this is a new entity: writing first and reconciling
+    /// later would mean the store could momentarily hold two entities that
+    /// should have been one, with no guarantee anything ever notices.
     pub fn remember(&mut self, obs: Observation) -> Result<Remembered, EngineError> {
         // Door first. `prepare` is what `insert` would run anyway; running it
         // here buys the guarantee that a refusal costs nothing.
         self.index.check(&obs.embedding)?;
 
+        // Score the mention against every blocked candidate, keeping the best
+        // match and every pair that landed in the review band.
+        let mut best: Option<(StableId, f64)> = None;
+        let mut review_pairs: Vec<(StableId, f64)> = Vec::new();
+        for id in self.candidates(&obs.mention) {
+            let Some(known) = self.identity.get(&id) else {
+                continue;
+            };
+            let score = self.ruleset.score(&obs.mention, known);
+            match self.ruleset.decide(score) {
+                Decision::Match => {
+                    if best.is_none_or(|(_, b)| score > b) {
+                        best = Some((id, score));
+                    }
+                }
+                Decision::Review => review_pairs.push((id, score)),
+                Decision::NonMatch => {}
+            }
+        }
+
+        // A confident match wins outright. Pairs that only reached the review
+        // band are not raised in that case: the question "is this the same
+        // person" has been answered by stronger evidence elsewhere.
+        if let Some((entity, _)) = best {
+            let assertion = self.write(entity, &obs)?;
+            self.remember_identity(entity, &obs.mention);
+            return Ok(Remembered::Merged { entity, assertion });
+        }
+
         let entity = self.create_entity(&obs);
         let assertion = self.write(entity, &obs)?;
-        Ok(Remembered::Created { entity, assertion })
+
+        if review_pairs.is_empty() {
+            return Ok(Remembered::Created { entity, assertion });
+        }
+
+        let review = review_pairs
+            .into_iter()
+            .map(|(other, score)| self.file_review(entity, other, score))
+            .collect();
+        Ok(Remembered::CreatedPendingReview {
+            entity,
+            assertion,
+            review,
+        })
+    }
+
+    /// Entities sharing at least one blocking key with this mention.
+    ///
+    /// Deduplicated: a pair sharing several keys is one candidate, not several.
+    /// With no blocking rules configured this returns every entity, matching
+    /// `Ruleset::candidate_pairs`, which is correct and quadratic.
+    fn candidates(&self, mention: &Record) -> Vec<StableId> {
+        if self.ruleset.blocking().is_empty() {
+            return self.identity.keys().copied().collect();
+        }
+        let mut seen: Vec<StableId> = Vec::new();
+        for key in self.keys_for(mention) {
+            for &id in self.blocks.get(&key).map_or(&[][..], |v| v.as_slice()) {
+                if !seen.contains(&id) {
+                    seen.push(id);
+                }
+            }
+        }
+        seen.sort_unstable();
+        seen
+    }
+
+    /// Fold a new mention's fields into what we already hold for an entity.
+    ///
+    /// Fields already present are kept: the first spelling seen is the one the
+    /// blocking map was built from, and rewriting it would leave stale keys
+    /// pointing at this entity.
+    fn remember_identity(&mut self, entity: StableId, mention: &Record) {
+        let Some(known) = self.identity.get_mut(&entity) else {
+            return;
+        };
+        for (field, value) in &mention.fields {
+            known
+                .fields
+                .entry(field.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+
+    /// File an open question: two entities that may be the same, and the
+    /// evidence that could not decide either way.
+    ///
+    /// Unimplemented until Task 7. No test in this task should reach it — the
+    /// test ruleset's blocking keeps genuinely different names apart, and a
+    /// pair of identical mentions scores a confident `Match`, not `Review`.
+    fn file_review(&mut self, _a: StableId, _b: StableId, _score: f64) -> ReviewId {
+        unimplemented!("Task 7")
     }
 
     /// Create an entity and register its identity fields.
@@ -364,5 +459,48 @@ mod tests {
         obs.embedding = vec![0.0, 0.0, 0.0];
         assert!(e.remember(obs).is_err());
         assert_eq!(e.entity_count(), 0);
+    }
+
+    #[test]
+    fn a_second_observation_about_the_same_person_merges() {
+        let mut e = engine();
+        let first = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let second = e
+            .remember(observation("Ben Severn", "city", "Bristol", 2))
+            .unwrap();
+
+        let (Remembered::Created { entity: a, .. }, Remembered::Merged { entity: b, .. }) =
+            (first, second)
+        else {
+            panic!("expected Created then Merged");
+        };
+        assert_eq!(a, b);
+        assert_eq!(e.entity_count(), 1);
+    }
+
+    #[test]
+    fn a_clearly_different_person_gets_their_own_entity() {
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let out = e
+            .remember(observation("Wei Zhang", "employer", "Globex", 2))
+            .unwrap();
+        assert!(matches!(out, Remembered::Created { .. }), "got {out:?}");
+        assert_eq!(e.entity_count(), 2);
+    }
+
+    #[test]
+    fn blocking_finds_the_same_matches_as_comparing_everything() {
+        // The incremental blocking map must agree with rm-resolve's batch
+        // candidate_pairs, or the engine silently loses true matches.
+        let mut e = engine();
+        for (i, name) in ["Ben Severn", "Wei Zhang", "Ben Severn"].iter().enumerate() {
+            e.remember(observation(name, "employer", "Acme", i as Timestamp + 1))
+                .unwrap();
+        }
+        assert_eq!(e.entity_count(), 2, "the two Ben Severns are one entity");
     }
 }
