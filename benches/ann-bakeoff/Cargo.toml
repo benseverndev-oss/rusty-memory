@@ -1,0 +1,12 @@
+[package]
+name = "ann-bakeoff"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Decides whether rm-index needs an approximate tier, and which one"
+
+[dependencies]
+hnsw_rs = "0.3"
+
+[profile.release]
+opt-level = 3

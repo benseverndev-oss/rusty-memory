@@ -113,10 +113,17 @@ worse than a gap.
 filter. Memory needs all three — recall is almost always scoped ("what do I know
 about X *in this session*", "*as of* last week").
 
-Flagging honestly: at 687 lines this is the component most likely to need
-replacing. Benchmark against `hnsw_rs` / `usearch` for recall@k and build time
-before committing to it. Nothing else in the stack has a credible off-the-shelf
-substitute; this one does.
+**Update — benchmarked, and this was wrong.** `benches/ann-bakeoff` measured
+`goldenhnsw` against `hnsw_rs` 0.3.4 on 20k 128-dimensional vectors. On
+clustered data it builds 3.3x faster, queries 3.4x faster, and has better
+recall (0.976 vs 0.951 at ef=200). It does not need replacing.
+
+The same run changed the plan in a second way: at that scale exact brute force
+answers in 2.2 ms against HNSW's 292 us, and the approximate version costs ~5 s
+of build time, a graph to keep consistent across deletions, recall below 1.0,
+and a much harder filtered-search story. So `rm-index` ships **exact**, with the
+API shaped so an approximate tier slots underneath unchanged -- and when a store
+outgrows it, `goldenhnsw`'s design is the one the numbers point to.
 
 ### 4. Extraction
 

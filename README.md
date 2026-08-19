@@ -49,7 +49,7 @@ time. Contradiction resolution is a query, not a lossy write.
 | `rm-store` | in progress | Bi-temporal record store with attribute history |
 | `rm-graph` | planned | Entity graph, k-hop retrieval |
 | `rm-resolve` | in progress | Probabilistic entity resolution, with a review band |
-| `rm-index` | planned | Vector index with persistence and filtered search |
+| `rm-index` | in progress | Exact vector search: deletion, filtering, persistence |
 | `rm-extract` | planned | Turn → mentions/edges. The only networked crate. |
 | `rm-engine` | planned | `remember()` / `recall()` / `forget()` |
 | `rm-mcp` / `rm-cli` | planned | MCP server and `rmem` binary |
