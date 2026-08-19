@@ -67,6 +67,16 @@ pub enum StoreError {
     Refused(Refused),
     /// A snapshot could not be read.
     Parse(String),
+    /// A snapshot was read, and describes a store that cannot exist.
+    ///
+    /// Distinct from [`StoreError::Parse`] because the two ask different things
+    /// of a caller: `Parse` means these bytes are not a store, which a truncated
+    /// write or a wrong file produces and a retry can fix. This means the bytes
+    /// *are* a store, and one whose own invariants contradict each other — a
+    /// retry writes the same thing again. `rm_index` and `rm_engine` already
+    /// draw that line with a variant of this name; drawing it differently here
+    /// would make the three doors read as three unrelated designs.
+    CorruptSnapshot(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -75,6 +85,12 @@ impl std::fmt::Display for StoreError {
             StoreError::UnknownEntity(id) => write!(f, "no entity with id {id}"),
             StoreError::Refused(r) => write!(f, "{r}"),
             StoreError::Parse(m) => write!(f, "could not read snapshot: {m}"),
+            StoreError::CorruptSnapshot(why) => {
+                write!(
+                    f,
+                    "snapshot parsed but describes an impossible store: {why}"
+                )
+            }
         }
     }
 }
@@ -391,8 +407,35 @@ impl MemoryStore {
     }
 
     /// Restore from a snapshot.
+    ///
+    /// `next_id` is checked rather than trusted. It names the *next* id to hand
+    /// out, so a snapshot carrying it at or below an id already in use is one
+    /// where the very next [`MemoryStore::create_entity`] returns a live id and
+    /// `entities.insert` overwrites an existing entity — silently, since
+    /// inserting over a `BTreeMap` key is not an error anywhere. An entity and
+    /// every version it held would simply stop existing, with nothing returning
+    /// `Err` and no count moving.
+    ///
+    /// Checking it here rather than in each caller is deliberate: the counter is
+    /// this type's invariant, so this is the only place that can enforce it for
+    /// everyone who restores a store. The bound is one-directional on purpose —
+    /// a `next_id` *above* the highest live id wastes id space but cannot
+    /// collide, and rejecting it would break any caller that reserves ranges.
     pub fn open(snapshot: &str) -> Result<Self, StoreError> {
-        serde_json::from_str(snapshot).map_err(|e| StoreError::Parse(e.to_string()))
+        let store: MemoryStore =
+            serde_json::from_str(snapshot).map_err(|e| StoreError::Parse(e.to_string()))?;
+
+        // Keyed on the map, not on `Entity::id`: `create_entity` inserts at
+        // `next_id`, so the keys are what a reissued id would collide with.
+        if let Some(&highest) = store.entities.keys().next_back() {
+            if store.next_id <= highest {
+                return Err(StoreError::CorruptSnapshot(format!(
+                    "next_id is {}, but entity {highest} exists, so the next create_entity would overwrite it",
+                    store.next_id
+                )));
+            }
+        }
+        Ok(store)
     }
 }
 
@@ -756,6 +799,33 @@ mod tests {
             s.snapshot(),
             MemoryStore::open(&s.snapshot()).unwrap().snapshot()
         );
+    }
+
+    #[test]
+    fn a_snapshot_whose_id_counter_was_rewound_is_rejected_not_restored() {
+        // The snapshot is otherwise perfect -- the entity, its attributes and
+        // every version are intact. Only the counter lies, and it lies about
+        // the *next* write rather than about anything stored, so without this
+        // check `open` returns Ok and the damage lands on a later
+        // `create_entity` that also returns normally.
+        let (s, id) = store_with_user();
+        let mut doc: serde_json::Value = serde_json::from_str(&s.snapshot()).unwrap();
+        assert_eq!(doc["next_id"], id + 1, "setup: one entity was created");
+        // Rewound to the id of a live entity, not below it: the counter names
+        // the next id to hand out, so equality is already a collision.
+        doc["next_id"] = serde_json::json!(id);
+
+        let err = MemoryStore::open(&doc.to_string()).unwrap_err();
+        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+    }
+
+    #[test]
+    fn an_empty_store_has_no_counter_to_contradict() {
+        // No entities, so nothing bounds `next_id` from below and any value is
+        // consistent. Guards the check against rejecting the empty case, which
+        // is the one every caller starts from.
+        let empty = MemoryStore::new();
+        assert!(MemoryStore::open(&empty.snapshot()).is_ok());
     }
 
     #[test]

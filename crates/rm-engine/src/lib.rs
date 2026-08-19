@@ -1713,10 +1713,12 @@ mod tests {
     #[test]
     fn a_snapshot_whose_index_and_store_disagree_is_rejected_not_panicked_on() {
         // An assertion naming an entity the store does not hold. Parses fine,
-        // and every read of it would panic or lie. The nested `index` is the
-        // vector index's own snapshot carried as a string, so it appears here
-        // escaped -- see `Persisted::index` for why it is not a nested object.
-        let broken = r#"{"store":{"entities":{},"next_id":0},
+        // and every read of it would panic or lie. The nested `store` and
+        // `index` are each that crate's own snapshot carried as a string, so
+        // they appear here escaped -- see `Persisted` for why neither is a
+        // nested object. Both are individually valid, so the only thing wrong
+        // with this snapshot is the disagreement between them.
+        let broken = r#"{"store":"{\"entities\":{},\"next_id\":0}",
             "index":"{\"dim\":3,\"metric\":\"Cosine\",\"ids\":[0],\"vectors\":[1.0,0.0,0.0]}",
             "assertions":{"0":{"entity":7,"attribute":"employer","version":0}},
             "review":{},"identity":{},"rejected":[],"next_assertion":1,"next_review":0}"#;
@@ -1846,6 +1848,39 @@ mod tests {
         };
         assert!(
             matches!(err, EngineError::CorruptSnapshot(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_whose_store_counter_was_rewound_is_rejected_by_the_stores_own_door() {
+        // The third counter of the same shape, and the one this crate cannot
+        // check itself. It is caught because the store is restored through
+        // `MemoryStore::open` rather than by derived `Deserialize` -- the same
+        // reason the index's own invariants are enforced here without this
+        // crate restating them.
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&e.snapshot()).unwrap();
+
+        // The store is nested as its own snapshot string, so reach through it
+        // and put it back the same way.
+        let mut store: serde_json::Value =
+            serde_json::from_str(doc["store"].as_str().unwrap()).unwrap();
+        assert_eq!(store["next_id"], 1, "setup: one entity was created");
+        store["next_id"] = serde_json::json!(0);
+        doc["store"] = serde_json::json!(store.to_string());
+
+        let Err(err) = Engine::open(
+            &doc.to_string(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        ) else {
+            panic!("a counter that would reissue a live entity id must not open");
+        };
+        assert!(
+            matches!(err, EngineError::Store(StoreError::CorruptSnapshot(_))),
             "got {err:?}"
         );
     }

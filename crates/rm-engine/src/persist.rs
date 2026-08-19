@@ -24,7 +24,18 @@ use crate::{
 /// and two engines can be compared by diffing their snapshots.
 #[derive(Serialize, Deserialize)]
 struct Persisted {
-    store: MemoryStore,
+    /// The store's *own* snapshot, carried as an opaque string for the same
+    /// reason as `index` below: it is the only way in that goes through
+    /// [`MemoryStore::open`].
+    ///
+    /// A nested `MemoryStore` would arrive by derived `Deserialize`, which
+    /// bypasses that door entirely — the store would come in through a window
+    /// while the index came in through a validating entrance. `MemoryStore::open`
+    /// checks that `next_id` still exceeds every entity it holds, and a snapshot
+    /// that fails that check makes the next `create_entity` return a live id and
+    /// overwrite an existing entity, silently. Same failure class as a rewound
+    /// `next_assertion`, one layer down.
+    store: String,
     /// The index's *own* snapshot, carried as an opaque string rather than as a
     /// nested [`VectorIndex`].
     ///
@@ -59,7 +70,7 @@ impl Engine {
     /// and a snapshot diffs against its predecessor rather than reshuffling.
     pub fn snapshot(&self) -> String {
         let p = Persisted {
-            store: self.store.clone(),
+            store: self.store.snapshot(),
             index: self.index.snapshot(),
             identity: self.identity.clone(),
             assertions: self.assertions.clone(),
@@ -90,22 +101,23 @@ impl Engine {
     /// it. Trusting the store's list would resurrect a merged-away entity on
     /// every reload, and the merge would quietly undo itself across a restart.
     ///
-    /// One counter of the same kind is *not* checked, and deliberately named
-    /// here rather than left to be discovered: `MemoryStore`'s own `next_id`.
-    /// Rewound below a live `StableId`, a later `create_entity` would overwrite
-    /// an existing entity exactly as a rewound `next_assertion` would overwrite
-    /// an assertion. `rm_store` exposes no accessor for it, so this crate
-    /// cannot inspect it without reaching around the type; closing it belongs
-    /// in `rm_store`, next to the counter itself.
+    /// The store and the index are both restored through their own crates'
+    /// `open`, never by derived `Deserialize`, so each arrives having enforced
+    /// invariants this crate does not have to know about — `MemoryStore::open`
+    /// checks its `next_id`, `VectorIndex::open` rebuilds its id-to-row map and
+    /// checks its rows. What is left here is only what neither of them can see:
+    /// whether the two agree with each other, and with this crate's own state.
     pub fn open(snapshot: &str, ruleset: Ruleset, policy: Policy) -> Result<Engine, EngineError> {
         let p: Persisted = serde_json::from_str(snapshot)
             .map_err(|e| EngineError::CorruptSnapshot(e.to_string()))?;
 
-        // Reuses the index's own door rather than reimplementing it: this both
-        // rebuilds the derived position map and rejects an index whose rows and
-        // ids disagree. `IndexError` converts, so a corrupt index arrives as
-        // itself rather than flattened into a string that loses which invariant
-        // broke.
+        // Both nested crates come in through their own door rather than by
+        // derived `Deserialize`, so each reimplements nothing here: the store
+        // checks its own `next_id`, and the index rebuilds its derived position
+        // map and rejects rows and ids that disagree. `StoreError` and
+        // `IndexError` both convert, so a corrupt one arrives as itself rather
+        // than flattened into a string that loses which invariant broke.
+        let store = MemoryStore::open(&p.store)?;
         let index = VectorIndex::open(&p.index)?;
 
         // The counters name the *next* id to hand out, so anything at or below
@@ -120,7 +132,7 @@ impl Engine {
         if let Some(&highest) = p.assertions.keys().next_back() {
             if p.next_assertion <= highest {
                 return Err(EngineError::CorruptSnapshot(format!(
-                    "next_assertion is {}, but assertion {highest} already exists, so the next                      write would overwrite a stored fact",
+                    "next_assertion is {}, but assertion {highest} exists, so the next write would overwrite it",
                     p.next_assertion
                 )));
             }
@@ -131,14 +143,14 @@ impl Engine {
         if let Some(&highest) = p.review.keys().next_back() {
             if p.next_review <= highest {
                 return Err(EngineError::CorruptSnapshot(format!(
-                    "next_review is {}, but review {highest} is already open, so the next                      question would overwrite it",
+                    "next_review is {}, but review {highest} is open, so the next question would overwrite it",
                     p.next_review
                 )));
             }
         }
 
         for (id, entry) in &p.assertions {
-            if p.store.entity(entry.entity).is_none() {
+            if store.entity(entry.entity).is_none() {
                 return Err(EngineError::CorruptSnapshot(format!(
                     "assertion {id} belongs to entity {}, which the store does not hold",
                     entry.entity
@@ -155,7 +167,7 @@ impl Engine {
                     entry.entity
                 )));
             }
-            if p.store.history(entry.entity, &entry.attribute).len() <= entry.version {
+            if store.history(entry.entity, &entry.attribute).len() <= entry.version {
                 return Err(EngineError::CorruptSnapshot(format!(
                     "assertion {id} names version {} of {:?}, which has fewer",
                     entry.version, entry.attribute
@@ -179,7 +191,7 @@ impl Engine {
         }
 
         let mut engine = Engine {
-            store: p.store,
+            store,
             index,
             ruleset,
             policy,
