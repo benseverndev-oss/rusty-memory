@@ -177,6 +177,14 @@ impl Outcome {
     ///
     /// A `Timeline` has no single survivor by construction, so this is `None`
     /// for one unless the timeline holds exactly one fact.
+    ///
+    /// Carries the same caveat as [`Outcome::as_of`], and for the same reason:
+    /// a winning [`Held::Absent`] collapses to `None`, indistinguishable here
+    /// from no candidate having asserted anything at all. Those are opposite
+    /// statements — one is a positive claim that the attribute has no value,
+    /// the other is silence — and the whole of [`Held`] exists to keep them
+    /// apart. This method is the convenience; match on the [`Outcome`] itself
+    /// where the difference matters, as a memory store must.
     pub fn survivor(&self) -> Option<&str> {
         match self {
             Outcome::Survivor(v) => v.as_ref().and_then(Held::value),

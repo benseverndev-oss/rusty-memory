@@ -170,6 +170,19 @@ impl Engine {
         Ok(hits
             .into_iter()
             .filter_map(|hit| {
+                // A hit that resolves to nothing is dropped rather than
+                // reported, and that is not a shrug. `in_scope` already
+                // performed both of these lookups during the scan and returned
+                // false for anything that failed them, so reaching here with a
+                // missing assertion or version would mean the index and the
+                // assertion map disagreed *within a single call* — a state
+                // `Engine::open` rejects at the door and no `&mut self` method
+                // can produce. Reporting it would mean adding an error variant
+                // for a condition that cannot arise, and every caller would
+                // then have to handle it; `?` on an `Option` keeps `recall`
+                // total instead. The reverse direction — a vector no assertion
+                // claims — is the one that used to slip through a restore, and
+                // it is checked in `open` where it can actually be caught.
                 let entry = self.assertions.get(&hit.id)?;
                 let version = self
                     .store

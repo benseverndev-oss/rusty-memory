@@ -372,14 +372,19 @@ impl Engine {
 
     /// Whether this pair has already been answered "not the same".
     ///
-    /// Checked by id *and* by identity record. The id check is the cheap,
-    /// obvious one. The record check exists because rejecting a pair and then
-    /// hearing the same ambiguous mention again produces a *new* id, and
-    /// matching on ids alone would ask the identical question every time.
+    /// Compared by identity record, never by id. An id comparison is the
+    /// obvious first thing to write and it is dead code here: the only caller
+    /// is [`Engine::remember`], and the entity it asks about is one it created
+    /// moments earlier, so the pair cannot already be in `rejected` under those
+    /// ids. It was removed rather than kept as a fast path, because a branch
+    /// that cannot run is a claim about the code that stops being true silently.
+    ///
+    /// The record comparison is the one that does the work: rejecting a pair
+    /// and then hearing the same ambiguous mention again produces a *new* id,
+    /// and matching on ids would ask the identical question every time. That is
+    /// also why `rejected` still stores ids — they are how the answer is looked
+    /// up again through `identity`, and `confirm` rewrites them on a merge.
     fn already_rejected(&self, a: StableId, b: StableId) -> bool {
-        if self.rejected.contains(&(a.min(b), a.max(b))) {
-            return true;
-        }
         let (Some(ra), Some(rb)) = (self.identity.get(&a), self.identity.get(&b)) else {
             return false;
         };
@@ -608,6 +613,18 @@ impl Engine {
     ///
     /// Uses `assert`, not `assert_resolved`: writes stay lossless and
     /// survivorship runs on read. See the module docs.
+    ///
+    /// Three mutations in sequence, and the promise that a `remember` either
+    /// happens completely or not at all rests on neither of the first two being
+    /// able to fail here. `store.assert`'s only error is `UnknownEntity`, and
+    /// `remember` reaches this with an id it either just created or read out of
+    /// `identity` — which `Engine::open` checks the store holds. `index.insert`
+    /// re-runs the validation `remember` already ran through `index.check`
+    /// before touching anything, which is the entire reason that check is a
+    /// separate call. Take either of those away and the failure is a version in
+    /// the store with no vector able to find it: no error, nothing downstream
+    /// able to detect it, and the exact outcome `remember`'s ordering exists to
+    /// prevent.
     fn write(&mut self, entity: StableId, obs: &Observation) -> Result<AssertionId, EngineError> {
         self.store.assert(
             entity,
@@ -1535,6 +1552,66 @@ mod tests {
     }
 
     #[test]
+    fn scoping_a_recall_to_one_entity_happens_during_the_scan() {
+        // The same shape as the session filter, on the axis a caller reaches
+        // for most: "what do I know about *this* person". The entity asked
+        // about is the *worse* geometric match of the two, so a post-filtered
+        // top-1 would hand back the other one's fact — or, once the filter had
+        // run, nothing at all.
+        let mut e = engine();
+        let Remembered::Created { entity: wanted, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                1,
+                [0.6, 0.8, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        e.remember(embedded(
+            "Wei Zhang",
+            "employer",
+            "Globex",
+            2,
+            [1.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        assert_eq!(e.entity_count(), 2, "setup: two entities to choose between");
+
+        let hits = e
+            .recall(&Query::new(vec![1.0, 0.0, 0.0], 1).about_entity(wanted))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "post-filtering would have returned 0");
+        assert_eq!(hits[0].entity, wanted);
+        assert_eq!(hits[0].value.as_deref(), Some("Acme"));
+    }
+
+    #[test]
+    fn scoping_a_recall_to_one_source_keeps_out_what_another_source_said() {
+        // Provenance is not decoration: "what did the CRM tell me" has to be
+        // answerable separately from "what did the user tell me", or a caller
+        // cannot tell a stated fact from an inferred one.
+        let mut e = engine();
+        let mut inferred = embedded("Ben Severn", "employer", "guessed", 1, [1.0, 0.0, 0.0]);
+        inferred.provenance = Provenance::new(Source::AgentInference, 1, "session-1");
+        e.remember(inferred).unwrap();
+
+        let mut stated = embedded("Ben Severn", "employer", "stated", 2, [0.99, 0.1, 0.0]);
+        stated.provenance = Provenance::new(Source::UserAssertion, 2, "session-1");
+        e.remember(stated).unwrap();
+
+        let hits = e
+            .recall(&Query::new(vec![1.0, 0.0, 0.0], 5).from_source(Source::UserAssertion))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "an inference is not something the user said");
+        assert_eq!(hits[0].value.as_deref(), Some("stated"));
+        assert_eq!(hits[0].provenance.source, Source::UserAssertion);
+    }
+
+    #[test]
     fn a_superseded_fact_is_returned_marked_not_dropped() {
         // "What did I believe about her employer in May" needs the old fact, and
         // a caller stating it as current needs to be stopped from doing so.
@@ -1895,7 +1972,7 @@ mod tests {
         assert_ne!(survivor, absorbed, "setup: the merge has to move something");
         assert!(
             e.store.entity(absorbed).is_some(),
-            "setup: the absorbed entity is still in the store, holding nothing --              that is the trap this test exists for"
+            "setup: the absorbed entity is still in the store, holding nothing -- that is the trap this test exists for"
         );
         assert_eq!(e.entity_count(), 1, "setup: identity is what dropped it");
 
