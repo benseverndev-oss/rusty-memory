@@ -113,10 +113,28 @@ worse than a gap.
 filter. Memory needs all three — recall is almost always scoped ("what do I know
 about X *in this session*", "*as of* last week").
 
-Flagging honestly: at 687 lines this is the component most likely to need
-replacing. Benchmark against `hnsw_rs` / `usearch` for recall@k and build time
-before committing to it. Nothing else in the stack has a credible off-the-shelf
-substitute; this one does.
+**Update — benchmarked, and this was wrong.** `benches/ann-bakeoff` measured
+`goldenhnsw` against `hnsw_rs` 0.3.4 on 20k 128-dimensional vectors. On
+clustered data it returns perfect recall against `hnsw_rs`'s 0.987, and queries
+about 5x faster at matched ef. It does not need replacing.
+
+The same run changed the plan in a second way: at that scale exact brute force
+answers in 2.7 ms against HNSW's 104 us, and the approximate version costs a
+graph to keep consistent across deletions and a much harder filtered-search
+story — for a saving no agent turn can perceive next to a 400 ms embedding call.
+So `rm-index` ships **exact**, with the API shaped so an approximate tier slots
+underneath unchanged -- and when a store outgrows it, `goldenhnsw`'s design is
+the one the numbers point to.
+
+Worth recording how close this came to being decided on a false premise. The
+first version of that benchmark drew its clustered *queries* from a different
+set of 200 centroids than the corpus, so it measured out-of-distribution
+retrieval while its own comment claimed the opposite, and every column still
+looked plausible — the bug was invisible in the output. It made HNSW's recall
+look like 0.976 rather than 1.000, which became one of the stated reasons to
+ship exact search. That reason is now withdrawn: the case rests on complexity,
+not accuracy. The benchmark prints mean top-1 cosine so the same mistake cannot
+be silent twice.
 
 ### 4. Extraction
 
