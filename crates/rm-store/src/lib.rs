@@ -895,6 +895,22 @@ impl MemoryStore {
     /// everyone who restores a store. The bound is one-directional on purpose —
     /// a `next_id` *above* the highest live id wastes id space but cannot
     /// collide, and rejecting it would break any caller that reserves ranges.
+    ///
+    /// The edge map is held to everything the write path enforces: both
+    /// endpoints must exist, no edge may start and end at the same entity, no
+    /// triple may carry an empty version log, and no subject or predicate level
+    /// may be left empty. The first three are what [`MemoryStore::relate`]
+    /// refuses outright; the last is what `prune_empty` removes after every
+    /// in-process removal. Accepting here what the front door rejects would
+    /// make a snapshot a way to build a store no sequence of calls could, and
+    /// the damage would surface as a wrong answer from a later query rather
+    /// than as an error from the restore.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Parse`] if the bytes are not a store at all, and
+    /// [`StoreError::CorruptSnapshot`] if they are a store whose own invariants
+    /// contradict each other.
     pub fn open(snapshot: &str) -> Result<Self, StoreError> {
         let mut store: MemoryStore =
             serde_json::from_str(snapshot).map_err(|e| StoreError::Parse(e.to_string()))?;
@@ -910,10 +926,12 @@ impl MemoryStore {
             }
         }
 
-        // Every endpoint must name an entity the snapshot holds. An edge to a
-        // missing id parses cleanly and then walks a traversal into nothing --
-        // the restore path is a door, and this crate has already paid once for
-        // treating one as a formality.
+        // The edge map has to satisfy everything the write path enforces. An
+        // edge that parses cleanly and then breaks an invariant is worse than
+        // one that fails to parse: the store answers queries and looks healthy.
+        // The restore path is a door, and a door that accepts what the front
+        // door refuses is not a door -- so each check below names the call it
+        // is standing in for.
         let mut reverse: BTreeMap<StableId, BTreeSet<(StableId, String)>> = BTreeMap::new();
         for (&subject, by_predicate) in &store.edges {
             if !store.entities.contains_key(&subject) {
@@ -921,11 +939,47 @@ impl MemoryStore {
                     "an edge starts at entity {subject}, which the snapshot does not hold"
                 )));
             }
+            // `prune_empty` deletes a subject whose last predicate went, so a
+            // snapshot carrying one was not written by this crate's own
+            // removals. Rejecting it rather than pruning it on the way in is
+            // deliberate: silently repairing a snapshot means the store a
+            // caller restores is not the store they saved, and the difference
+            // never gets reported.
+            if by_predicate.is_empty() {
+                return Err(StoreError::CorruptSnapshot(format!(
+                    "entity {subject} holds an edge map with no predicates in it, which prune_empty removes rather than stores"
+                )));
+            }
             for (predicate, by_object) in by_predicate {
-                for &object in by_object.keys() {
+                if by_object.is_empty() {
+                    return Err(StoreError::CorruptSnapshot(format!(
+                        "entity {subject}'s {predicate:?} names no object, which prune_empty removes rather than stores"
+                    )));
+                }
+                for (&object, versions) in by_object {
                     if !store.entities.contains_key(&object) {
                         return Err(StoreError::CorruptSnapshot(format!(
                             "an edge from entity {subject} points at entity {object}, which the snapshot does not hold"
+                        )));
+                    }
+                    // `push_edge` refuses a self-edge, so `relate` and
+                    // `unrelate` cannot make one and `confirm` drops the ones a
+                    // merge creates. Restoring one would leave `edges_from`
+                    // handing a traversal an edge no call in this crate could
+                    // have written, and every walk crossing it would arrive
+                    // back where it started.
+                    if subject == object {
+                        return Err(StoreError::CorruptSnapshot(format!(
+                            "an edge runs from entity {subject} to itself, which relate refuses to create"
+                        )));
+                    }
+                    // A triple with no versions has never been asserted, so
+                    // `edge_history` cannot distinguish it from one nobody has
+                    // discussed -- and it still earns a reverse-map entry,
+                    // which makes `edges_into` walk a triple that says nothing.
+                    if versions.is_empty() {
+                        return Err(StoreError::CorruptSnapshot(format!(
+                            "the edge from entity {subject} to entity {object} via {predicate:?} carries no versions, so nothing was ever asserted about it"
                         )));
                     }
                     reverse
@@ -1566,6 +1620,136 @@ mod tests {
         assert!(clash.is_none(), "setup: 4242 must not already be a key");
 
         let err = MemoryStore::open(&doc.to_string()).unwrap_err();
+        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_snapshot_whose_edge_starts_at_an_unknown_entity_is_rejected() {
+        // The mirror of the object-side test above, and it exists because the
+        // two are separate `if` blocks rather than one shared check: an
+        // inverted condition in the subject branch would restore a store whose
+        // `edges_into` hands a walk a subject that does not exist, and the
+        // object-side test would stay green throughout. Same JSON-mutation
+        // approach and for the same reason -- renaming a key in the parsed
+        // document cannot match more or less than the one entry it means to.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        let mut doc: serde_json::Value = serde_json::from_str(&store.snapshot()).unwrap();
+        let edges = doc["edges"]
+            .as_object_mut()
+            .expect("setup: the forward map is keyed by subject");
+        let by_predicate = edges.remove(&user.to_string());
+        assert!(
+            by_predicate.is_some(),
+            "the mutation must actually remove a real subject entry, or this test is vacuous"
+        );
+        let clash = edges.insert("4242".to_string(), by_predicate.unwrap());
+        assert!(clash.is_none(), "setup: 4242 must not already be a key");
+
+        let err = MemoryStore::open(&doc.to_string()).unwrap_err();
+        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_snapshot_carrying_a_self_edge_is_rejected_not_restored() {
+        // `push_edge` refuses one at the front door and `confirm` drops the
+        // ones a merge creates, so a restore that accepted one would be the
+        // only way into a state the rest of the crate is built to prevent.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        let mut doc: serde_json::Value = serde_json::from_str(&store.snapshot()).unwrap();
+        let by_object = doc["edges"][user.to_string()]["employed_by"]
+            .as_object_mut()
+            .expect("setup: the forward map holds subject -> predicate -> object -> versions");
+        let versions = by_object
+            .remove(&acme.to_string())
+            .expect("setup: the edge to acme is there to re-point");
+        // Re-pointed at the subject itself, which is the exact shape a merge
+        // would have produced and then dropped.
+        by_object.insert(user.to_string(), versions);
+
+        let err = MemoryStore::open(&doc.to_string()).unwrap_err();
+        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_snapshot_carrying_an_edge_with_no_versions_is_rejected_not_restored() {
+        // An empty log is indistinguishable from a triple nobody ever discussed
+        // as far as `edge_history` is concerned, but it still earns a
+        // reverse-map entry -- so `edges_into` would walk a triple that says
+        // nothing, and the two maps would disagree about what exists.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        let mut doc: serde_json::Value = serde_json::from_str(&store.snapshot()).unwrap();
+        let log = &mut doc["edges"][user.to_string()]["employed_by"][acme.to_string()];
+        assert!(
+            log.as_array().is_some_and(|v| !v.is_empty()),
+            "setup: the triple starts with a version in it"
+        );
+        *log = serde_json::json!([]);
+
+        let err = MemoryStore::open(&doc.to_string()).unwrap_err();
+        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_snapshot_carrying_an_empty_edge_level_is_rejected_not_restored() {
+        // Both levels, because `prune_empty` removes both and a snapshot is the
+        // only way either could come back. An empty level is bytes in every
+        // later snapshot and a line in every later diff, and it makes an entity
+        // that never had an edge indistinguishable from one whose edges all
+        // went -- the two differences `prune_empty` exists to prevent.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        let snapshot = store.snapshot();
+
+        let mut predicate_level: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        predicate_level["edges"][user.to_string()]["employed_by"] = serde_json::json!({});
+        let err = MemoryStore::open(&predicate_level.to_string()).unwrap_err();
+        assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
+
+        let mut subject_level: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        subject_level["edges"][user.to_string()] = serde_json::json!({});
+        let err = MemoryStore::open(&subject_level.to_string()).unwrap_err();
         assert!(matches!(err, StoreError::CorruptSnapshot(_)), "{err:?}");
     }
 
