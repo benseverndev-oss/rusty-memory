@@ -48,11 +48,10 @@ pub use review::{PendingReview, ReviewId, Settled};
 // and `VectorIndex` in `new`, `Record`/`Interval`/`Provenance` in
 // `Observation`, `StableId` in nearly everything, `Version` in the return type
 // of `store_history`, `Edge` in `edges_from` and `edges_into`, and
-// `EdgeVersion` in `edge_history`. A caller could not name the last of those
-// at all without
-// adding `rm-store` to their manifest, which makes an internal decomposition —
-// five crates instead of one — into something the caller has to know about and
-// track. `tests/readme.rs` exists to prove the public API is sufficient, and it
+// `EdgeVersion` in `edge_history`. A caller could not name the last of those at
+// all without adding `rm-store` to their manifest, which makes an internal
+// decomposition — five crates instead of one — into something the caller has to
+// know about and track. `tests/readme.rs` exists to prove the public API is sufficient, and it
 // was importing four sibling crates to compile.
 //
 // Only the surface those signatures reach is re-exported. `MemoryStore`,
@@ -1695,6 +1694,50 @@ mod tests {
         assert!(
             open[0].score > 0.0,
             "a review pair has real evidence behind it"
+        );
+    }
+
+    #[test]
+    fn one_history_answers_two_ways_without_the_engine_moving() {
+        // The same contrast as the test below, but on a single `&engine` and in
+        // successive lines. That shape is the claim: nothing is reconfigured
+        // between the two reads, nothing is rewritten, and the engine is not
+        // consumed and rebuilt -- only the question changes.
+        let mut e = Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        );
+        let out = e
+            .remember(observation("Ben Severn", "employer", "Acme", 10))
+            .unwrap();
+        let Remembered::Created { entity, .. } = out else {
+            panic!("setup")
+        };
+        e.remember(observation("Ben Severn", "employer", "Globex", 20))
+            .unwrap();
+
+        let recent = Policy::new(Strategy::MostRecent);
+        let interval = Policy::new(Strategy::ValidInterval);
+
+        // May, under two rules, from one borrow.
+        assert_eq!(
+            e.about_under(&recent, entity, "employer", 15, 100).unwrap(),
+            Believed::Value("Globex".into()),
+            "MostRecent names one winner, whatever instant is asked about"
+        );
+        assert_eq!(
+            e.about_under(&interval, entity, "employer", 15, 100)
+                .unwrap(),
+            Believed::Value("Acme".into()),
+            "ValidInterval keeps both and answers by time"
+        );
+
+        // And the engine's own policy is untouched by either call.
+        assert_eq!(
+            e.about(entity, "employer", 15, 100).unwrap(),
+            Believed::Value("Globex".into()),
+            "about_under must not leave the engine reading under a borrowed policy"
         );
     }
 
