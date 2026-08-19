@@ -43,7 +43,12 @@ pub enum Direction {
 }
 
 /// A traversal request.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// `Eq` as well as `PartialEq`, like [`Reached`] and [`Neighborhood`]: every
+/// field is an id, a count, an enum or a `Timestamp`, none of which has a value
+/// that compares unequal to itself. Leaving it at `PartialEq` would have said
+/// the opposite about one of them without naming which.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Walk {
     pub seeds: Vec<StableId>,
     /// Maximum hop distance from a seed. `0` returns just the seeds.
@@ -53,7 +58,8 @@ pub struct Walk {
     /// scale with entities returned, not with edges crossed.
     pub budget: usize,
     pub direction: Direction,
-    /// `None` traverses every predicate.
+    /// `None` traverses every predicate; `Some` traverses only those named,
+    /// and an empty `Some` therefore traverses none. See [`Walk::via`].
     pub predicates: Option<Vec<String>>,
     pub valid_t: Timestamp,
     pub tx_t: Timestamp,
@@ -85,6 +91,15 @@ impl Walk {
     }
 
     /// Restrict traversal to these predicates.
+    ///
+    /// An empty list matches nothing, so the walk crosses no edge at all and
+    /// returns only the seeds that exist. Reading it as "every predicate"
+    /// instead was rejected: `None` — the default, and what [`Walk::new`]
+    /// builds — already means every predicate, so the alternative would give
+    /// one request two spellings, and it would make the empty filter that
+    /// falls out of narrowing a list down to nothing silently widen into the
+    /// broadest walk there is. Answering a caller who asked for no predicates
+    /// with no edges is the honest reading of what they asked.
     pub fn via(mut self, predicates: Vec<String>) -> Self {
         self.predicates = Some(predicates);
         self
@@ -393,6 +408,35 @@ mod tests {
 
         let all = neighborhood(&store, &Walk::new(vec![alice], 2, 10, 5, 5));
         assert_eq!(all.reached.len(), 3);
+    }
+
+    #[test]
+    fn an_empty_predicate_filter_crosses_nothing_rather_than_everything() {
+        // Pinned because the opposite reading is the tempting one and it is
+        // silent: a caller narrowing a filter down to nothing would get the
+        // broadest walk there is instead of an empty one. `None` already means
+        // every predicate, and the same walk with it proves the difference is
+        // the filter and not the store.
+        let mut store = MemoryStore::new();
+        let alice = store.create_entity("person", 1);
+        let acme = store.create_entity("org", 1);
+        store
+            .relate(alice, "employed_by", acme, Interval::since(1), said(1))
+            .unwrap();
+
+        let filtered = neighborhood(&store, &Walk::new(vec![alice], 2, 10, 5, 5).via(vec![]));
+        assert_eq!(
+            filtered.reached,
+            vec![Reached {
+                entity: alice,
+                distance: 0
+            }],
+            "the seeds, and no edge crossed"
+        );
+        assert!(!filtered.truncated, "the budget was never the reason");
+
+        let unfiltered = neighborhood(&store, &Walk::new(vec![alice], 2, 10, 5, 5));
+        assert_eq!(unfiltered.reached.len(), 2, "None still means every one");
     }
 
     #[test]
