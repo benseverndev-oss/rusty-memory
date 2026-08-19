@@ -32,7 +32,7 @@ mod review;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
-use rm_core::{Interval, Provenance};
+use rm_core::{Interval, Provenance, Timestamp};
 #[cfg(test)]
 use rm_index::Metric;
 use rm_index::{IndexError, VectorIndex};
@@ -567,6 +567,74 @@ impl Engine {
     /// How many vectors are searchable.
     pub fn index_len(&self) -> usize {
         self.index.len()
+    }
+
+    /// Stop recalling an attribute, without destroying what was true.
+    ///
+    /// Appends a tombstone valid from `at` and drops the attribute's vectors, so
+    /// semantic recall goes quiet while `about` with an earlier `valid_t` still
+    /// answers. This is "stop telling me this", and it is deliberately not the
+    /// same operation as [`Engine::erase`] — collapsing the two would make it
+    /// impossible to honour a deletion request and a preference with the same
+    /// API while meaning different things by them.
+    pub fn forget(
+        &mut self,
+        entity: StableId,
+        attribute: &str,
+        at: Timestamp,
+        prov: Provenance,
+    ) -> Result<(), EngineError> {
+        self.store.assert(
+            entity,
+            attribute.to_string(),
+            None,
+            Interval::since(at),
+            prov,
+        )?;
+        self.drop_vectors(entity, attribute);
+        Ok(())
+    }
+
+    /// Destroy every version of an attribute and its vectors.
+    ///
+    /// Returns how many versions went. This punches a hole in the audit trail —
+    /// see `rm_store::MemoryStore::erase`. Reach for it when someone has asked
+    /// that a fact about them stop existing, and for nothing else: unlike
+    /// [`Engine::forget`], there is no tombstone left behind and no way to
+    /// answer `about` for a time before the erasure — the store no longer has
+    /// an opinion, not even that something used to be true.
+    ///
+    /// `store.erase` runs first, and its count is kept before `drop_vectors`
+    /// touches anything. Dropping vectors first would mean a failing erase
+    /// (unknown entity) leaves the index already stripped while the store
+    /// still holds the versions — a caller retrying with a valid id would then
+    /// find the fact intact but unsearchable, with no error to explain why.
+    /// Validating with the store first, exactly as `remember` validates the
+    /// embedding before writing, keeps a rejected call free of side effects.
+    pub fn erase(&mut self, entity: StableId, attribute: &str) -> Result<usize, EngineError> {
+        let removed = self.store.erase(entity, attribute)?;
+        self.drop_vectors(entity, attribute);
+        Ok(removed)
+    }
+
+    /// Remove every indexed vector for one attribute of one entity.
+    fn drop_vectors(&mut self, entity: StableId, attribute: &str) {
+        let doomed: Vec<AssertionId> = self
+            .assertions
+            .iter()
+            .filter(|(_, r)| r.entity == entity && r.attribute == attribute)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in doomed {
+            self.index.remove(id);
+            self.assertions.remove(&id);
+        }
+    }
+
+    /// The raw version log, for callers that want the audit trail rather than
+    /// an answer.
+    pub fn store_history(&self, entity: StableId, attribute: &str) -> &[rm_store::Version] {
+        self.store.history(entity, attribute)
     }
 }
 
@@ -1285,5 +1353,154 @@ mod tests {
     fn a_query_whose_vector_is_rejected_reports_it() {
         let e = engine();
         assert!(e.recall(&Query::new(vec![1.0, 0.0], 1)).is_err());
+    }
+
+    #[test]
+    fn forget_stops_recall_but_leaves_history_answerable() {
+        // `ValidInterval`, not `engine()`'s default `MostRecent`: "what was
+        // true in May" is a question about a point in time, and `MostRecent`
+        // answers with the single latest winner at *every* instant (see
+        // `changing_the_policy_changes_the_answer_without_rewriting_history`).
+        // Only `ValidInterval` produces a timeline `about` can read a `valid_t`
+        // back out of.
+        let mut e = engine().with_policy(Policy::new(Strategy::ValidInterval));
+        let Remembered::Created { entity, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                10,
+                [1.0, 0.0, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+
+        e.forget(
+            entity,
+            "employer",
+            20,
+            Provenance::new(Source::UserAssertion, 20, "s2"),
+        )
+        .unwrap();
+
+        // Nothing surfaces semantically any more.
+        assert!(e
+            .recall(&Query::new(vec![1.0, 0.0, 0.0], 5))
+            .unwrap()
+            .is_empty());
+        // But it was true in May, and that stays reconstructible.
+        assert_eq!(
+            e.about(entity, "employer", 15, 30).unwrap(),
+            Believed::Value("Acme".into())
+        );
+        // And now it is asserted to be nothing.
+        assert_eq!(
+            e.about(entity, "employer", 25, 30).unwrap(),
+            Believed::Absent
+        );
+    }
+
+    #[test]
+    fn forget_is_itself_a_fact_with_provenance() {
+        let mut e = engine();
+        let Remembered::Created { entity, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                10,
+                [1.0, 0.0, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        e.forget(
+            entity,
+            "employer",
+            20,
+            Provenance::new(Source::UserAssertion, 20, "s2"),
+        )
+        .unwrap();
+
+        let history = e.store_history(entity, "employer");
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[1].provenance.source_ref, "s2",
+            "who asked is recorded"
+        );
+    }
+
+    #[test]
+    fn erase_removes_it_from_history_too() {
+        let mut e = engine();
+        let Remembered::Created { entity, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                10,
+                [1.0, 0.0, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+
+        assert_eq!(e.erase(entity, "employer").unwrap(), 1);
+        assert_eq!(
+            e.about(entity, "employer", 15, 30).unwrap(),
+            Believed::Unknown
+        );
+        assert!(e
+            .recall(&Query::new(vec![1.0, 0.0, 0.0], 5))
+            .unwrap()
+            .is_empty());
+        assert_eq!(e.index_len(), 0, "the vector goes with the fact");
+    }
+
+    #[test]
+    fn forgetting_on_an_unknown_entity_is_an_error() {
+        let mut e = engine();
+        let p = Provenance::new(Source::UserAssertion, 1, "s");
+        assert!(matches!(
+            e.forget(9999, "employer", 1, p),
+            Err(EngineError::Store(_)) | Err(EngineError::UnknownEntity(_))
+        ));
+    }
+
+    #[test]
+    fn erasing_an_unknown_entity_is_an_error_and_touches_nothing() {
+        // The ordering that matters: `store.erase` runs before `drop_vectors`,
+        // so a rejected call (unknown entity) costs nothing — same discipline
+        // `remember` uses for a rejected embedding.
+        let mut e = engine();
+        let Remembered::Created { entity, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                10,
+                [1.0, 0.0, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+
+        assert!(matches!(
+            e.erase(9999, "employer"),
+            Err(EngineError::Store(_)) | Err(EngineError::UnknownEntity(_))
+        ));
+
+        // The unrelated entity's vector and history are untouched by the
+        // failed call.
+        assert_eq!(e.index_len(), 1);
+        assert_eq!(
+            e.about(entity, "employer", 15, 30).unwrap(),
+            Believed::Value("Acme".into())
+        );
     }
 }
