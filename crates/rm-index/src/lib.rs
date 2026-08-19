@@ -193,6 +193,14 @@ impl VectorIndex {
         self.positions.contains_key(&id)
     }
 
+    /// Whether this vector would be accepted, without storing it.
+    ///
+    /// For callers that write to more than one place and need the rejection to
+    /// arrive before the first write, not between the first and the second.
+    pub fn check(&self, vector: &[f32]) -> Result<(), IndexError> {
+        self.prepare(vector).map(|_| ())
+    }
+
     /// Add or replace the vector for `id`.
     ///
     /// Re-inserting an existing id overwrites in place. A memory whose text was
@@ -614,6 +622,14 @@ mod tests {
         ] {
             assert!(err.to_string().len() > 40, "{err:?}");
         }
+    }
+
+    #[test]
+    fn check_rejects_what_insert_would_reject_without_storing_it() {
+        let ix = index();
+        assert!(ix.check(&[1.0, 0.0]).is_err());
+        assert!(ix.check(&[1.0, 0.0, 0.0]).is_ok());
+        assert_eq!(ix.len(), 3, "check must not store");
     }
 
     // ---- persistence -------------------------------------------------------

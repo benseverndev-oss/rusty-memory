@@ -31,6 +31,7 @@ mod review;
 
 use std::collections::BTreeMap;
 
+use rm_core::{Interval, Provenance};
 #[cfg(test)]
 use rm_index::Metric;
 use rm_index::{IndexError, VectorIndex};
@@ -108,18 +109,12 @@ impl From<Refused> for EngineError {
 }
 
 /// The engine.
-///
-/// `#[allow(dead_code)]`: this task only wires up construction and
-/// `entity_count`. Every other field is read by `remember`, `about`, `forget`
-/// and snapshot round-tripping, added over the next several tasks — the first
-/// of which (`remember`) removes this allow. Scoped to the struct rather than
-/// the module so nothing else in this crate can quietly grow unread state
-/// under the same cover.
-#[allow(dead_code)]
 pub struct Engine {
     pub(crate) store: MemoryStore,
     pub(crate) index: VectorIndex,
     pub(crate) ruleset: Ruleset,
+    /// Read by survivorship on recall, added in a later task.
+    #[allow(dead_code)]
     pub(crate) policy: Policy,
     /// Resolution fields per entity, so a new mention can be scored against
     /// what we already know without reading them back out of the store.
@@ -129,8 +124,12 @@ pub struct Engine {
     /// lesson that persisted derived state lets a snapshot disagree with itself.
     pub(crate) blocks: BTreeMap<String, Vec<StableId>>,
     pub(crate) assertions: BTreeMap<AssertionId, AssertionRef>,
+    /// Filed by resolution's `Review` band, added in a later task.
+    #[allow(dead_code)]
     pub(crate) review: BTreeMap<ReviewId, PendingReview>,
     pub(crate) next_assertion: AssertionId,
+    /// Advanced when a review is filed, added in a later task.
+    #[allow(dead_code)]
     pub(crate) next_review: ReviewId,
 }
 
@@ -159,11 +158,129 @@ impl Engine {
     pub fn entity_count(&self) -> usize {
         self.identity.len()
     }
+
+    /// Record one observation.
+    ///
+    /// The embedding is validated before anything is written. A rejected vector
+    /// leaves the store and the index exactly as they were, because the
+    /// alternative — a fact in the store with nothing able to find it — is a
+    /// failure no caller can detect and no later query can report.
+    pub fn remember(&mut self, obs: Observation) -> Result<Remembered, EngineError> {
+        // Door first. `prepare` is what `insert` would run anyway; running it
+        // here buys the guarantee that a refusal costs nothing.
+        self.index.check(&obs.embedding)?;
+
+        let entity = self.create_entity(&obs);
+        let assertion = self.write(entity, &obs)?;
+        Ok(Remembered::Created { entity, assertion })
+    }
+
+    /// Create an entity and register its identity fields.
+    fn create_entity(&mut self, obs: &Observation) -> StableId {
+        let id = self
+            .store
+            .create_entity(&obs.kind, obs.provenance.observed_at);
+        for key in self.keys_for(&obs.mention) {
+            self.blocks.entry(key).or_default().push(id);
+        }
+        self.identity.insert(id, obs.mention.clone());
+        id
+    }
+
+    /// Every blocking key a mention falls under.
+    fn keys_for(&self, mention: &Record) -> Vec<String> {
+        self.ruleset
+            .blocking()
+            .iter()
+            .flat_map(|k| k.keys_for(mention))
+            .collect()
+    }
+
+    /// Append the version, index its vector, and record the mapping.
+    ///
+    /// Uses `assert`, not `assert_resolved`: writes stay lossless and
+    /// survivorship runs on read. See the module docs.
+    fn write(&mut self, entity: StableId, obs: &Observation) -> Result<AssertionId, EngineError> {
+        self.store.assert(
+            entity,
+            obs.attribute.clone(),
+            obs.value.clone(),
+            obs.valid,
+            obs.provenance.clone(),
+        )?;
+        let version = self.store.history(entity, &obs.attribute).len() - 1;
+
+        let id = self.next_assertion;
+        self.next_assertion += 1;
+        self.index.insert(id, &obs.embedding)?;
+        self.assertions.insert(
+            id,
+            AssertionRef {
+                entity,
+                attribute: obs.attribute.clone(),
+                version,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Where a given assertion lives.
+    pub fn assertion(&self, id: AssertionId) -> Option<&AssertionRef> {
+        self.assertions.get(&id)
+    }
+
+    /// How many vectors are searchable.
+    pub fn index_len(&self) -> usize {
+        self.index.len()
+    }
+}
+
+/// One thing learned: what it is about, what it says, and how we know.
+#[derive(Clone, Debug)]
+pub struct Observation {
+    /// The entity's kind, e.g. `"person"`. Passed to the store on creation.
+    pub kind: String,
+    /// The fields identifying who or what this is about, for resolution.
+    pub mention: Record,
+    pub attribute: String,
+    /// `None` asserts the attribute has no value — a tombstone, distinct from
+    /// having said nothing. An observation that says nothing is not an
+    /// observation and should not be passed here.
+    pub value: Option<String>,
+    pub valid: Interval,
+    pub provenance: Provenance,
+    /// Caller-supplied. `rm_extract` is the only crate permitted to reach the
+    /// network, so nothing here computes an embedding.
+    pub embedding: Vec<f32>,
+}
+
+/// What `remember` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Remembered {
+    /// Landed on an entity we already knew.
+    Merged {
+        entity: StableId,
+        assertion: AssertionId,
+    },
+    /// Nothing matched; this is a new entity.
+    Created {
+        entity: StableId,
+        assertion: AssertionId,
+    },
+    /// A new entity *and* one or more open questions: it scored in the review
+    /// band against something already known. The fact is remembered either way;
+    /// what is uncertain is only whose it is.
+    CreatedPendingReview {
+        entity: StableId,
+        assertion: AssertionId,
+        review: Vec<ReviewId>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rm_core::{Source, Timestamp};
     use rm_resolve::{BlockingKey, Comparator, FieldRule};
     use rm_survivor::Strategy;
 
@@ -190,5 +307,62 @@ mod tests {
             Policy::new(Strategy::MostRecent),
         );
         assert_eq!(engine.entity_count(), 0);
+    }
+
+    fn observation(name: &str, attribute: &str, value: &str, at: Timestamp) -> Observation {
+        Observation {
+            kind: "person".to_string(),
+            mention: Record::new().with("name", name).with("city", "Bristol"),
+            attribute: attribute.to_string(),
+            value: Some(value.to_string()),
+            valid: Interval::since(at),
+            provenance: Provenance::new(Source::UserAssertion, at, "session-1"),
+            embedding: vec![1.0, 0.0, 0.0],
+        }
+    }
+
+    fn engine() -> Engine {
+        Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        )
+    }
+
+    #[test]
+    fn remembering_something_new_creates_an_entity_and_indexes_it() {
+        let mut e = engine();
+        let out = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let Remembered::Created { entity, assertion } = out else {
+            panic!("expected Created, got {out:?}");
+        };
+        assert_eq!(e.entity_count(), 1);
+        assert_eq!(e.assertion(assertion).unwrap().entity, entity);
+        assert_eq!(e.assertion(assertion).unwrap().attribute, "employer");
+    }
+
+    #[test]
+    fn a_rejected_vector_leaves_the_store_untouched() {
+        // Wrong dimension. The fact must not land: a memory that exists and
+        // cannot be found is undetectable from the outside.
+        let mut e = engine();
+        let mut obs = observation("Ben Severn", "employer", "Acme", 1);
+        obs.embedding = vec![1.0, 0.0];
+
+        let err = e.remember(obs).unwrap_err();
+        assert!(matches!(err, EngineError::Index(_)), "got {err:?}");
+        assert_eq!(e.entity_count(), 0, "no entity may survive a refused write");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn a_zero_vector_under_cosine_is_refused_before_anything_is_written() {
+        let mut e = engine();
+        let mut obs = observation("Ben Severn", "employer", "Acme", 1);
+        obs.embedding = vec![0.0, 0.0, 0.0];
+        assert!(e.remember(obs).is_err());
+        assert_eq!(e.entity_count(), 0);
     }
 }
