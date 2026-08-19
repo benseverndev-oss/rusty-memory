@@ -155,9 +155,10 @@ pub struct Entity {
 
 /// The store.
 ///
-/// Append-only by construction: there is no API to modify or remove a
-/// [`Version`]. Forgetting is a future operation on entities, not an edit to
-/// history.
+/// Append-only for every operation but one. Nothing modifies a [`Version`], and
+/// only [`MemoryStore::erase`] removes one — deliberately narrow, deliberately
+/// hard to reach for, and documented as destroying what the rest of the crate
+/// exists to preserve.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryStore {
     entities: BTreeMap<StableId, Entity>,
@@ -351,6 +352,34 @@ impl MemoryStore {
             .get(&id)
             .and_then(|e| e.attributes.get(attribute))
             .map_or(&[], |v| v.as_slice())
+    }
+
+    /// Remove every version of an attribute, returning how many went.
+    ///
+    /// **This is the only call in the crate that mutates history, and it does
+    /// destroy it.** After it, `as_of` answers `Unknown` for every point on both
+    /// axes — not `Absent`, because the store no longer has an opinion rather
+    /// than holding that there was none.
+    ///
+    /// It exists for the request that cannot be answered any other way: someone
+    /// asking that a fact about them stop existing. A tombstone is the right
+    /// answer to "stop telling me this" and the wrong answer to that, since it
+    /// leaves the value legible in `history`.
+    ///
+    /// Erasing an attribute that was never discussed is not an error — it
+    /// reports 0, because the caller's goal ("this must not be here") is already
+    /// true. Erasing on an unknown entity *is* an error: the caller is working
+    /// from an id that means nothing, and silently succeeding would let a typo
+    /// read as a completed deletion.
+    pub fn erase(&mut self, id: StableId, attribute: &str) -> Result<usize, StoreError> {
+        let entity = self
+            .entities
+            .get_mut(&id)
+            .ok_or(StoreError::UnknownEntity(id))?;
+        Ok(entity
+            .attributes
+            .remove(attribute)
+            .map_or(0, |versions| versions.len()))
     }
 
     /// Serialise to canonical JSON.
@@ -622,6 +651,53 @@ mod tests {
         assert_eq!(s.current(id, "employer", OCT), Known::Unknown);
         assert_eq!(s.current(404, "employer", OCT), Known::Unknown);
         assert!(s.history(404, "employer").is_empty());
+    }
+
+    // ---- erase --------------------------------------------------------------
+
+    #[test]
+    fn erase_removes_history_where_a_tombstone_only_supersedes_it() {
+        let (mut store, user) = store_with_user();
+        store
+            .assert(
+                user,
+                "employer",
+                Some("Acme".into()),
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .assert(user, "employer", None, Interval::since(JUL), user_said(JUL))
+            .unwrap();
+
+        // Before erasing: the tombstone wins now, and January is still answerable.
+        assert_eq!(store.as_of(user, "employer", AUG, AUG), Known::Absent);
+        assert_eq!(
+            store.as_of(user, "employer", MAR, AUG),
+            Known::Value("Acme")
+        );
+
+        assert_eq!(store.erase(user, "employer").unwrap(), 2);
+
+        // After: not superseded, gone. The store has no opinion at any point.
+        assert_eq!(store.as_of(user, "employer", MAR, AUG), Known::Unknown);
+        assert!(store.history(user, "employer").is_empty());
+    }
+
+    #[test]
+    fn erasing_something_never_discussed_reports_zero_rather_than_failing() {
+        let (mut store, user) = store_with_user();
+        assert_eq!(store.erase(user, "employer").unwrap(), 0);
+    }
+
+    #[test]
+    fn erasing_on_an_unknown_entity_is_an_error() {
+        let (mut store, _) = store_with_user();
+        assert_eq!(
+            store.erase(9999, "employer"),
+            Err(StoreError::UnknownEntity(9999))
+        );
     }
 
     // ---- persistence -------------------------------------------------------
