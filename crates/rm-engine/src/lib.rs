@@ -523,7 +523,7 @@ impl Engine {
     }
 
     /// Every blocking key a mention falls under.
-    fn keys_for(&self, mention: &Record) -> Vec<String> {
+    pub(crate) fn keys_for(&self, mention: &Record) -> Vec<String> {
         self.ruleset
             .blocking()
             .iter()
@@ -1555,5 +1555,244 @@ mod tests {
             "drop_vectors must not run before store.erase has a chance to fail"
         );
         assert_eq!(e.index_len(), 1);
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_including_the_review_queue() {
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        e.remember(ambiguous()).unwrap();
+
+        let restored = Engine::open(
+            &e.snapshot(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        )
+        .unwrap();
+        assert_eq!(restored.entity_count(), e.entity_count());
+        assert_eq!(
+            restored.pending_review().len(),
+            1,
+            "an open question that does not survive a restart is an answered one"
+        );
+        assert_eq!(restored.index_len(), e.index_len());
+        // Counting rows is not the same as being searchable: the index's
+        // id-to-row map is derived and rebuilt on open, and a restore that
+        // skipped rebuilding it would still report the right length while
+        // answering nothing.
+        assert_eq!(
+            restored
+                .recall(&Query::new(vec![1.0, 0.0, 0.0], 5))
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_restored_engine_still_resolves_against_what_it_knew() {
+        // The blocking map is rebuilt, not persisted -- it has to actually work.
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let mut restored = Engine::open(
+            &e.snapshot(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        )
+        .unwrap();
+
+        let out = restored
+            .remember(observation("Ben Severn", "city", "Bristol", 2))
+            .unwrap();
+        assert!(matches!(out, Remembered::Merged { .. }), "got {out:?}");
+        assert_eq!(restored.entity_count(), 1);
+    }
+
+    #[test]
+    fn snapshots_are_byte_stable() {
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let once = e.snapshot();
+        let twice = Engine::open(&once, test_ruleset(), Policy::new(Strategy::MostRecent))
+            .unwrap()
+            .snapshot();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn a_confirmed_merge_survives_a_snapshot_round_trip() {
+        // `confirm` copies the absorbed entity's versions onto the survivor and
+        // then erases them, and `rm_store::MemoryStore::erase` removes the
+        // attribute, not the entity. So the absorbed entity is still in the
+        // store afterwards, holding nothing; only `identity` records that it
+        // stopped being someone. An `open` that rebuilt the entity set from the
+        // store's entity list would hand it back on reload, and the merge would
+        // undo itself across a restart with nothing anywhere to say so.
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let out = e.remember(ambiguous()).unwrap();
+        let Remembered::CreatedPendingReview {
+            entity: absorbed,
+            assertion: globex,
+            review,
+        } = out
+        else {
+            panic!("setup: expected a review, got {out:?}");
+        };
+        let survivor = e.confirm(review[0]).unwrap();
+        assert_ne!(survivor, absorbed, "setup: the merge has to move something");
+        assert!(
+            e.store.entity(absorbed).is_some(),
+            "setup: the absorbed entity is still in the store, holding nothing --              that is the trap this test exists for"
+        );
+        assert_eq!(e.entity_count(), 1, "setup: identity is what dropped it");
+
+        let restored = Engine::open(
+            &e.snapshot(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        )
+        .unwrap();
+
+        assert_eq!(
+            restored.entity_count(),
+            1,
+            "a merged-away entity must not come back on reload"
+        );
+        assert_eq!(
+            restored.assertion(globex).unwrap().entity,
+            survivor,
+            "the absorbed entity's assertions still belong to the survivor"
+        );
+        assert_eq!(
+            value_of(&restored, globex).as_deref(),
+            Some("Globex"),
+            "and still name the fact they were made about"
+        );
+        assert!(restored.pending_review().is_empty());
+    }
+
+    #[test]
+    fn a_restored_engine_reads_under_the_policy_it_was_handed_not_a_stored_one() {
+        // The policy is configuration, not state, and is deliberately absent
+        // from the snapshot. If a copy ever crept in, the caller's argument
+        // would be silently ignored and the only evidence would be an answer
+        // that is plausible and wrong.
+        let mut e = engine();
+        let out = e
+            .remember(observation("Ben Severn", "employer", "Acme", 10))
+            .unwrap();
+        let Remembered::Created { entity, .. } = out else {
+            panic!("setup")
+        };
+        e.remember(observation("Ben Severn", "employer", "Globex", 20))
+            .unwrap();
+        assert_eq!(
+            e.about(entity, "employer", 15, 100).unwrap(),
+            Believed::Value("Globex".into()),
+            "setup: MostRecent picks one winner at every instant"
+        );
+
+        let restored = Engine::open(
+            &e.snapshot(),
+            test_ruleset(),
+            Policy::new(Strategy::ValidInterval),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.about(entity, "employer", 15, 100).unwrap(),
+            Believed::Value("Acme".into()),
+            "the strategy in force is the one open() was given"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_whose_index_and_store_disagree_is_rejected_not_panicked_on() {
+        // An assertion naming an entity the store does not hold. Parses fine,
+        // and every read of it would panic or lie. The nested `index` is the
+        // vector index's own snapshot carried as a string, so it appears here
+        // escaped -- see `Persisted::index` for why it is not a nested object.
+        let broken = r#"{"store":{"entities":{},"next_id":0},
+            "index":"{\"dim\":3,\"metric\":\"Cosine\",\"ids\":[0],\"vectors\":[1.0,0.0,0.0]}",
+            "assertions":{"0":{"entity":7,"attribute":"employer","version":0}},
+            "review":{},"identity":{},"rejected":[],"next_assertion":1,"next_review":0}"#;
+        // A `let Err(..) else` rather than `unwrap_err`, which would want
+        // `Engine: Debug`. Adding a derive to a public type to satisfy a test
+        // is the wrong way round.
+        let Err(err) = Engine::open(broken, test_ruleset(), Policy::new(Strategy::MostRecent))
+        else {
+            panic!("a snapshot describing an impossible engine must not open");
+        };
+        assert!(
+            matches!(err, EngineError::CorruptSnapshot(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_assertion_belonging_to_no_known_identity_is_rejected_not_restored() {
+        // Everything else about this snapshot is valid: the store holds the
+        // entity, the version index is in range, the vector is there. Only
+        // `identity` -- the engine's actual entity set -- has no record of it,
+        // which is precisely the state an entity set rebuilt from the store
+        // would wave through, and the fact would then be recalled while being
+        // uncounted and unresolvable-against forever.
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&e.snapshot()).unwrap();
+        doc["identity"] = serde_json::json!({});
+
+        let Err(err) = Engine::open(
+            &doc.to_string(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        ) else {
+            panic!("an assertion with no identity behind it must not open");
+        };
+        assert!(
+            matches!(err, EngineError::CorruptSnapshot(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_nested_index_is_rejected_by_the_indexs_own_door() {
+        // One id at three dimensions needs three floats. `rm_index` already
+        // rejects this and already has tests for it; restoring through
+        // `VectorIndex::open` rather than a derived `Deserialize` is what makes
+        // that work count here instead of being written a second time, weaker.
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&e.snapshot()).unwrap();
+        doc["index"] =
+            serde_json::json!(r#"{"dim":3,"metric":"Cosine","ids":[0],"vectors":[1.0,0.0]}"#);
+
+        let Err(err) = Engine::open(
+            &doc.to_string(),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        ) else {
+            panic!("a snapshot whose index cannot be rebuilt must not open");
+        };
+        assert!(
+            matches!(err, EngineError::Index(IndexError::CorruptSnapshot(_))),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_snapshot_is_reported_not_panicked_on() {
+        assert!(Engine::open(
+            "{ not json",
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent)
+        )
+        .is_err());
     }
 }
