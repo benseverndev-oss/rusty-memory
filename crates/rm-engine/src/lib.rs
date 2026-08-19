@@ -29,7 +29,8 @@ mod policy;
 mod read;
 mod review;
 
-use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rm_core::{Interval, Provenance};
 #[cfg(test)]
@@ -42,7 +43,7 @@ use serde::{Deserialize, Serialize};
 
 pub use policy::Policy;
 pub use read::{Believed, Query, Recalled};
-pub use review::{PendingReview, ReviewId};
+pub use review::{PendingReview, ReviewId, Settled};
 
 /// Identifies one stored assertion. Doubles as the vector index's `EntryId`, so
 /// a search hit resolves to a stored fact with one lookup rather than a
@@ -127,6 +128,10 @@ pub struct Engine {
     /// Filed by resolution's `Review` band: pairs the resolver could not call,
     /// waiting on an answer from `pending_review`.
     pub(crate) review: BTreeMap<ReviewId, PendingReview>,
+    /// Pairs answered "not the same". Kept for the lifetime of the engine: an
+    /// answered question that gets asked again is worse than an unasked one,
+    /// because it teaches the caller the queue is noise.
+    pub(crate) rejected: BTreeSet<Settled>,
     pub(crate) next_assertion: AssertionId,
     /// Advanced each time `file_review` opens a question.
     pub(crate) next_review: ReviewId,
@@ -148,6 +153,7 @@ impl Engine {
             blocks: BTreeMap::new(),
             assertions: BTreeMap::new(),
             review: BTreeMap::new(),
+            rejected: BTreeSet::new(),
             next_assertion: 0,
             next_review: 0,
         }
@@ -206,14 +212,18 @@ impl Engine {
         let entity = self.create_entity(&obs);
         let assertion = self.write(entity, &obs)?;
 
-        if review_pairs.is_empty() {
-            return Ok(Remembered::Created { entity, assertion });
-        }
-
-        let review = review_pairs
+        // Drop any pair someone has already answered "not the same". The
+        // emptiness check has to come *after* this filter rather than before
+        // it, because the filter is what can empty the list.
+        review_pairs.retain(|(other, _)| !self.already_rejected(entity, *other));
+        let review: Vec<ReviewId> = review_pairs
             .into_iter()
             .map(|(other, score)| self.file_review(entity, other, score))
             .collect();
+
+        if review.is_empty() {
+            return Ok(Remembered::Created { entity, assertion });
+        }
         Ok(Remembered::CreatedPendingReview {
             entity,
             assertion,
@@ -242,20 +252,46 @@ impl Engine {
         seen
     }
 
-    /// Fold a new mention's fields into what we already hold for an entity.
+    /// Fold a new mention's fields into what we already hold for an entity, and
+    /// register the blocking keys those new fields unlock.
     ///
     /// Fields already present are kept: the first spelling seen is the one the
     /// blocking map was built from, and rewriting it would leave stale keys
     /// pointing at this entity.
+    ///
+    /// A field arriving for the first time is the opposite case, and folding it
+    /// into `identity` without keying it was a real defect. `identity` is what
+    /// the blocking map is *derived from* — it is rebuilt from `identity` on
+    /// load rather than persisted — so an unkeyed field makes the live map a
+    /// strict subset of the one a reload would produce, and the same engine
+    /// then resolves the same mention differently either side of a snapshot
+    /// round trip. That is the worst shape a bug can take here: no error, no
+    /// difference in the stored facts, only a merge that happens or does not
+    /// depending on when the process last restarted.
     fn remember_identity(&mut self, entity: StableId, mention: &Record) {
         let Some(known) = self.identity.get_mut(&entity) else {
             return;
         };
+        let mut learned = false;
         for (field, value) in &mention.fields {
-            known
-                .fields
-                .entry(field.clone())
-                .or_insert_with(|| value.clone());
+            if let Entry::Vacant(slot) = known.fields.entry(field.clone()) {
+                slot.insert(value.clone());
+                learned = true;
+            }
+        }
+        if !learned {
+            return;
+        }
+
+        // Re-key from the *folded* record, not from the mention: a key can be
+        // derived from a field the mention did not carry, and re-keying the
+        // whole record is idempotent where keying the delta alone is not.
+        let folded = self.identity[&entity].clone();
+        for key in self.keys_for(&folded) {
+            let ids = self.blocks.entry(key).or_default();
+            if !ids.contains(&entity) {
+                ids.push(entity);
+            }
         }
     }
 
@@ -276,6 +312,193 @@ impl Engine {
             },
         );
         id
+    }
+
+    /// Whether this pair has already been answered "not the same".
+    ///
+    /// Checked by id *and* by identity record. The id check is the cheap,
+    /// obvious one. The record check exists because rejecting a pair and then
+    /// hearing the same ambiguous mention again produces a *new* id, and
+    /// matching on ids alone would ask the identical question every time.
+    fn already_rejected(&self, a: StableId, b: StableId) -> bool {
+        if self.rejected.contains(&(a.min(b), a.max(b))) {
+            return true;
+        }
+        let (Some(ra), Some(rb)) = (self.identity.get(&a), self.identity.get(&b)) else {
+            return false;
+        };
+        self.rejected.iter().any(|(x, y)| {
+            let (Some(rx), Some(ry)) = (self.identity.get(x), self.identity.get(y)) else {
+                return false;
+            };
+            (rx == ra && ry == rb) || (rx == rb && ry == ra)
+        })
+    }
+
+    /// Answer a review with "yes, the same" and merge the two entities.
+    ///
+    /// The lower id survives, because it is the one other records are more
+    /// likely to already reference, and `rm_store` promises ids are never
+    /// reused — so the absorbed id stays recognisable as absorbed rather than
+    /// missing.
+    ///
+    /// The absorbed entity's versions are re-appended under the survivor and
+    /// then erased, which is the one call in `rm_store` that destroys history.
+    /// Copy first, erase second: the copy is the half that can fail, and
+    /// failing after the erase would lose the facts outright.
+    pub fn confirm(&mut self, review: ReviewId) -> Result<StableId, EngineError> {
+        let pair = self
+            .review
+            .remove(&review)
+            .ok_or(EngineError::UnknownReview(review))?;
+        let (kept, absorbed) = (pair.a.min(pair.b), pair.a.max(pair.b));
+        if kept == absorbed {
+            return Ok(kept);
+        }
+
+        // Which assertions are about to change hands. Recorded now because
+        // re-pointing them destroys the only evidence of where they came from,
+        // and `reindex_versions` needs exactly that to renumber them.
+        let moved: BTreeSet<AssertionId> = self
+            .assertions
+            .iter()
+            .filter(|(_, entry)| entry.entity == absorbed)
+            .map(|(&id, _)| id)
+            .collect();
+
+        // Move every assertion's ownership across.
+        for entry in self.assertions.values_mut() {
+            if entry.entity == absorbed {
+                entry.entity = kept;
+            }
+        }
+
+        // Move the store's versions across, preserving append order.
+        let attributes: Vec<String> = self
+            .store
+            .entity(absorbed)
+            .map(|e| e.attributes.keys().cloned().collect())
+            .unwrap_or_default();
+        for attribute in attributes {
+            let versions: Vec<_> = self.store.history(absorbed, &attribute).to_vec();
+            for v in versions {
+                self.store
+                    .assert(kept, attribute.clone(), v.value, v.valid, v.provenance)?;
+            }
+            self.store.erase(absorbed, &attribute)?;
+        }
+
+        // Fold identity and re-point the blocking map.
+        if let Some(record) = self.identity.remove(&absorbed) {
+            self.remember_identity(kept, &record);
+            for key in self.keys_for(&record) {
+                if let Some(ids) = self.blocks.get_mut(&key) {
+                    ids.retain(|&id| id != absorbed);
+                    if !ids.contains(&kept) {
+                        ids.push(kept);
+                    }
+                }
+            }
+        }
+
+        // Any other open question naming the absorbed entity now names the
+        // survivor; a question about the survivor and itself is settled. Two
+        // questions that collapse onto the same pair become one, for the same
+        // reason `rejected` exists at all: the same pair asked twice reads as
+        // noise.
+        let mut seen: BTreeSet<Settled> = BTreeSet::new();
+        self.review.retain(|_, p| {
+            if p.a == absorbed {
+                p.a = kept;
+            }
+            if p.b == absorbed {
+                p.b = kept;
+            }
+            if p.a == p.b {
+                return false;
+            }
+            (p.a, p.b) = (p.a.min(p.b), p.a.max(p.b));
+            seen.insert((p.a, p.b))
+        });
+
+        // A settled "different" survives the merge: if X is not the absorbed
+        // entity, and the absorbed entity turns out to be the survivor, then X
+        // is not the survivor either.
+        self.rejected = self
+            .rejected
+            .iter()
+            .filter_map(|&(x, y)| {
+                let x = if x == absorbed { kept } else { x };
+                let y = if y == absorbed { kept } else { y };
+                (x != y).then_some((x.min(y), x.max(y)))
+            })
+            .collect();
+
+        self.reindex_versions(kept, &moved);
+        Ok(kept)
+    }
+
+    /// Renumber `AssertionRef::version` for one entity after a merge appended
+    /// versions to its logs.
+    ///
+    /// `version` is a position in an attribute's version log, so re-appending
+    /// the absorbed entity's versions under the survivor invalidates every
+    /// index the absorbed entity's assertions held. Left stale, a search hit
+    /// resolves to a real, well-formed, *wrong* fact: nothing errors and
+    /// nothing downstream can tell.
+    ///
+    /// `moved` names the assertions that changed hands, and has to be passed in
+    /// rather than inferred. Once ownership is re-pointed, an absorbed
+    /// assertion and one of the survivor's own can both claim version 0, and
+    /// nothing in the pair says which the store now holds first. Sorting on the
+    /// assertion id alone is wrong whenever the two entities' observations
+    /// interleaved — create A, create B, then a second fact about A — which is
+    /// the ordinary case rather than a corner one: A's second assertion has the
+    /// higher id and the lower position in the merged log.
+    fn reindex_versions(&mut self, entity: StableId, moved: &BTreeSet<AssertionId>) {
+        let mut by_attribute: BTreeMap<String, Vec<AssertionId>> = BTreeMap::new();
+        for (&id, entry) in &self.assertions {
+            if entry.entity == entity {
+                by_attribute
+                    .entry(entry.attribute.clone())
+                    .or_default()
+                    .push(id);
+            }
+        }
+
+        for (attribute, mut ids) in by_attribute {
+            // The survivor's own versions kept their order and their place; the
+            // absorbed ones all follow, in their own original order.
+            ids.sort_by_key(|id| {
+                let entry = &self.assertions[id];
+                (moved.contains(id), entry.version, *id)
+            });
+            debug_assert_eq!(
+                ids.len(),
+                self.store.history(entity, &attribute).len(),
+                "every version is written through `write`, so each has one assertion"
+            );
+            for (version, id) in ids.into_iter().enumerate() {
+                if let Some(entry) = self.assertions.get_mut(&id) {
+                    entry.version = version;
+                }
+            }
+        }
+    }
+
+    /// Answer a review with "no, different", and do not ask again.
+    ///
+    /// Recorded as a pair rather than acted on: there is nothing to undo in the
+    /// store, because the engine never merged them. All that happens is the
+    /// question stops being open, and stops coming back.
+    pub fn reject(&mut self, review: ReviewId) -> Result<(), EngineError> {
+        let pair = self
+            .review
+            .remove(&review)
+            .ok_or(EngineError::UnknownReview(review))?;
+        self.rejected
+            .insert((pair.a.min(pair.b), pair.a.max(pair.b)));
+        Ok(())
     }
 
     /// Every pair still waiting on an answer, oldest first.
@@ -557,6 +780,214 @@ mod tests {
         // Uncertainty is about whose fact it is, never about whether we heard it.
         assert!(e.assertion(assertion).is_some());
         assert_eq!(e.index_len(), 2);
+    }
+
+    #[test]
+    fn confirming_a_review_merges_both_entities_assertions() {
+        let mut e = engine();
+        let first = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let second = e.remember(ambiguous()).unwrap();
+        let (
+            Remembered::Created { entity: kept, .. },
+            Remembered::CreatedPendingReview {
+                entity: absorbed,
+                assertion,
+                review,
+                ..
+            },
+        ) = (first, second)
+        else {
+            panic!("setup")
+        };
+
+        let survivor = e.confirm(review[0]).unwrap();
+        assert_eq!(survivor, kept.min(absorbed));
+        assert_eq!(e.entity_count(), 1);
+        assert_eq!(
+            e.assertion(assertion).unwrap().entity,
+            survivor,
+            "the absorbed entity's assertions must follow it"
+        );
+        assert!(e.pending_review().is_empty());
+    }
+
+    /// The value an assertion currently points at, read straight out of the
+    /// store's version log the way `recall` will.
+    fn value_of(e: &Engine, assertion: AssertionId) -> Option<String> {
+        let r = e.assertion(assertion).expect("assertion exists");
+        e.store.history(r.entity, &r.attribute)[r.version]
+            .value
+            .clone()
+    }
+
+    #[test]
+    fn a_merged_assertion_still_resolves_to_its_own_value() {
+        // The two entities' observations interleave on purpose: the survivor
+        // has a fact either side of the absorbed entity's one. That is what
+        // makes a merge invalidate version indices in both directions, and it
+        // fails silently — every index still points at a real, plausible fact.
+        let mut e = engine();
+        let first = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let second = e.remember(ambiguous()).unwrap();
+        let third = e
+            .remember(observation("Ben Severn", "employer", "Initech", 3))
+            .unwrap();
+
+        let (
+            Remembered::Created {
+                assertion: acme, ..
+            },
+            Remembered::CreatedPendingReview {
+                assertion: globex,
+                review,
+                ..
+            },
+            Remembered::Merged {
+                assertion: initech, ..
+            },
+        ) = (first, second, third)
+        else {
+            panic!("setup")
+        };
+
+        e.confirm(review[0]).unwrap();
+
+        assert_eq!(value_of(&e, acme).as_deref(), Some("Acme"));
+        assert_eq!(
+            value_of(&e, globex).as_deref(),
+            Some("Globex"),
+            "an absorbed assertion must still name the fact it was made about"
+        );
+        assert_eq!(value_of(&e, initech).as_deref(), Some("Initech"));
+    }
+
+    #[test]
+    fn rejecting_a_review_stops_it_being_raised_again() {
+        let mut e = engine();
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let out = e.remember(ambiguous()).unwrap();
+        let Remembered::CreatedPendingReview { review, .. } = out else {
+            panic!("setup")
+        };
+
+        e.reject(review[0]).unwrap();
+        assert!(e.pending_review().is_empty());
+        assert_eq!(e.entity_count(), 2, "rejection keeps them apart");
+
+        // The same ambiguous mention again must not re-raise the settled pair.
+        e.remember(ambiguous()).unwrap();
+        assert!(
+            e.pending_review().is_empty(),
+            "an answered question must not be asked twice"
+        );
+    }
+
+    /// A ruleset where even perfect agreement falls short of `match_at`: one
+    /// weak field against a high bar, so the strongest evidence available is
+    /// still only a question. Contrived, and it is the shape under which
+    /// suppression has to work — every repeat mention files a review, so a
+    /// rejection that only matched on ids would be asked again forever.
+    fn never_confident_ruleset() -> Ruleset {
+        Ruleset::new(
+            vec![FieldRule::new("name", Comparator::JaroWinkler, 0.9, 0.01)],
+            vec![BlockingKey::Prefix("name".to_string(), 3)],
+            4.0,
+            20.0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_mention_matching_a_rejected_pair_is_not_asked_about_under_a_new_id() {
+        let mut e = Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            never_confident_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        );
+        e.remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        let out = e
+            .remember(observation("Ben Severn", "employer", "Acme", 2))
+            .unwrap();
+        let Remembered::CreatedPendingReview { review, .. } = out else {
+            panic!("setup: expected a review, got {out:?}")
+        };
+        e.reject(review[0]).unwrap();
+
+        // A third identical mention gets a third id, so the rejected pair of
+        // ids says nothing about it. What settles it is that the records are
+        // the ones already answered "different".
+        let out = e
+            .remember(observation("Ben Severn", "employer", "Acme", 3))
+            .unwrap();
+        assert!(matches!(out, Remembered::Created { .. }), "got {out:?}");
+        assert!(
+            e.pending_review().is_empty(),
+            "a new id for an already-answered pair must not reopen it"
+        );
+    }
+
+    #[test]
+    fn answering_a_review_that_does_not_exist_is_an_error() {
+        let mut e = engine();
+        assert_eq!(e.confirm(42), Err(EngineError::UnknownReview(42)));
+        assert_eq!(e.reject(42), Err(EngineError::UnknownReview(42)));
+    }
+
+    /// A ruleset that also blocks on `email` — a field `test_ruleset`'s records
+    /// never carry. Separate rather than an extra key on the shared one,
+    /// because the shared ruleset's thresholds are what put "Ben Severn" and
+    /// "Ben Severne" in the review band, and every other test here depends on
+    /// that placement staying exactly where it is.
+    fn email_blocking_ruleset() -> Ruleset {
+        Ruleset::new(
+            vec![
+                FieldRule::new("name", Comparator::JaroWinkler, 0.9, 0.01),
+                FieldRule::new("email", Comparator::Normalized, 0.95, 0.001),
+            ],
+            vec![
+                BlockingKey::Prefix("name".to_string(), 3),
+                BlockingKey::Exact("email".to_string()),
+            ],
+            2.0,
+            5.0,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_entity_gaining_a_blocking_field_later_is_still_found_by_it() {
+        let mut e = Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            email_blocking_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        );
+
+        let mut first = observation("Ben Severn", "employer", "Acme", 1);
+        first.mention = Record::new().with("name", "Ben Severn");
+        let Remembered::Created { entity, .. } = e.remember(first).unwrap() else {
+            panic!("setup")
+        };
+
+        // The email arrives on a later observation, so it was not in the
+        // blocking map when the entity was created.
+        let mut second = observation("Ben Severn", "city", "Bristol", 2);
+        second.mention = Record::new()
+            .with("name", "Ben Severn")
+            .with("email", "ben@example.com");
+        let out = e.remember(second).unwrap();
+        assert!(matches!(out, Remembered::Merged { .. }), "got {out:?}");
+
+        let by_email = Record::new().with("email", "ben@example.com");
+        assert!(
+            e.candidates(&by_email).contains(&entity),
+            "a blocking key learned on a later observation must still reach the entity"
+        );
     }
 
     #[test]

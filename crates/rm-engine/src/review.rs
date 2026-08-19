@@ -15,3 +15,13 @@ pub struct PendingReview {
     /// Total evidence in bits. Positive favours a match.
     pub score: f64,
 }
+
+/// A pair someone has already answered "not the same".
+///
+/// Kept so the same near-miss does not raise the same question on every
+/// subsequent observation. Being asked twice teaches a caller to stop reading
+/// the queue, which costs more than the occasional missed merge.
+///
+/// Ordered `(lower, higher)` on construction, so a pair means the same thing
+/// whichever of the two was mentioned first.
+pub type Settled = (StableId, StableId);
