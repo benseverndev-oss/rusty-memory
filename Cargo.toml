@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rm-core", "crates/rm-survivor"]
+members = ["crates/rm-core", "crates/rm-survivor", "crates/rm-store", "crates/rm-resolve"]
 resolver = "2"
 
 [workspace.package]
@@ -11,7 +11,9 @@ authors = ["rusty-memory contributors"]
 
 [workspace.dependencies]
 rm-core = { path = "crates/rm-core" }
+rm-survivor = { path = "crates/rm-survivor" }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [profile.release]
 opt-level = 3

@@ -46,9 +46,9 @@ time. Contradiction resolution is a query, not a lossy write.
 |---|---|---|
 | `rm-core` | in progress | Provenance and the bi-temporal model |
 | `rm-survivor` | in progress | Survivorship strategies |
-| `rm-store` | planned | Bi-temporal record store with attribute history |
+| `rm-store` | in progress | Bi-temporal record store with attribute history |
 | `rm-graph` | planned | Entity graph, k-hop retrieval |
-| `rm-resolve` | planned | Probabilistic entity resolution |
+| `rm-resolve` | in progress | Probabilistic entity resolution, with a review band |
 | `rm-index` | planned | Vector index with persistence and filtered search |
 | `rm-extract` | planned | Turn → mentions/edges. The only networked crate. |
 | `rm-engine` | planned | `remember()` / `recall()` / `forget()` |

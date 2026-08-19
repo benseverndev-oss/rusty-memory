@@ -1,0 +1,12 @@
+[package]
+name = "rm-resolve"
+version = "0.0.0"
+description = "Probabilistic entity resolution for agent memory, with an explicit review band"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
