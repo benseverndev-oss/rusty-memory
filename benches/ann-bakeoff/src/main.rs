@@ -55,15 +55,27 @@ fn recall(got: &[usize], truth: &[usize]) -> f64 {
     hits as f64 / truth.len() as f64
 }
 
-/// Vectors drawn near a set of centroids, then renormalised.
+/// A set of topic centroids. Generated once and shared by the corpus and the
+/// queries drawn from it.
+///
+/// Kept separate from [`clustered`] deliberately: when centroid generation
+/// lived inside it, calling it twice silently gave the queries their own
+/// unrelated 200 centroids. In 128 dimensions that makes every query effectively
+/// noise against the corpus — mean top-1 cosine 0.30 rather than 0.92 — so the
+/// run measured out-of-distribution retrieval while claiming the opposite.
+fn centroid_set(rng: &mut Rng, centroids: usize, dim: usize) -> Vec<Vec<f32>> {
+    (0..centroids).map(|_| rng.unit_vec(dim)).collect()
+}
+
+/// Vectors drawn near `centers`, then renormalised.
 ///
 /// Real sentence embeddings are strongly clustered by topic; uniform vectors on
 /// the sphere are not, and in 128 dimensions their pairwise distances
 /// concentrate so hard that a navigable-graph index has almost nothing to
 /// navigate. Benchmarking only on uniform data measures the pathological case
 /// and understates every ANN index.
-fn clustered(rng: &mut Rng, n: usize, dim: usize, centroids: usize, spread: f32) -> Vec<Vec<f32>> {
-    let centers: Vec<Vec<f32>> = (0..centroids).map(|_| rng.unit_vec(dim)).collect();
+fn clustered(rng: &mut Rng, centers: &[Vec<f32>], n: usize, dim: usize, spread: f32) -> Vec<Vec<f32>> {
+    let centroids = centers.len();
     (0..n)
         .map(|i| {
             let c = &centers[i % centroids];
@@ -95,10 +107,12 @@ fn run(label: &str, spread: Option<f32>) {
             (0..QUERIES).map(|_| rng.unit_vec(DIM)).collect(),
         ),
         Some(sp) => {
-            let d = clustered(&mut rng, N, DIM, 200, sp);
-            // Queries drawn from the same distribution: a real query looks like
-            // the corpus, not like noise.
-            let q = clustered(&mut rng, QUERIES, DIM, 200, sp);
+            // One centroid set, shared. A real query lands near a topic the
+            // corpus actually contains; drawing fresh centroids for the queries
+            // would ask every index to retrieve neighbours that are not there.
+            let centers = centroid_set(&mut rng, 200, DIM);
+            let d = clustered(&mut rng, &centers, N, DIM, sp);
+            let q = clustered(&mut rng, &centers, QUERIES, DIM, sp);
             (d, q)
         }
     };
@@ -107,7 +121,18 @@ fn run(label: &str, spread: Option<f32>) {
     let t = Instant::now();
     let truth: Vec<Vec<usize>> = queries.iter().map(|q| brute_force(&data, q, K)).collect();
     let bf_total = t.elapsed();
-    println!("N={N} dim={DIM} queries={QUERIES} k={K}");
+    // How close the queries actually land to the corpus. A clustered run whose
+    // queries came from foreign centroids looks identical in every other column,
+    // which is exactly how that bug survived a review — so state the number
+    // rather than trusting the generator. Expect ~0.9 clustered, ~0.3 uniform.
+    let mean_top1: f64 = queries
+        .iter()
+        .zip(&truth)
+        .map(|(q, t)| dot(q, &data[t[0]]) as f64)
+        .sum::<f64>()
+        / QUERIES as f64;
+
+    println!("N={N} dim={DIM} queries={QUERIES} k={K}  mean top-1 cosine={mean_top1:.3}");
     println!("{:<28} {:>10} {:>12} {:>10}", "backend", "build", "query(avg)", "recall@10");
     println!("{}", "-".repeat(64));
     println!(

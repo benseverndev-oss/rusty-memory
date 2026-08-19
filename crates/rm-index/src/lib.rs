@@ -8,38 +8,43 @@
 //! plan.
 //!
 //! **The first: `goldenhnsw` won.** Against `hnsw_rs` 0.3 on 20k 128-dimensional
-//! vectors, serial insert both sides, it built 3.3× faster, queried 3.4× faster,
-//! and had *better* recall (0.976 vs 0.951 at `ef=200`). It does not need
-//! replacing. (Caveat kept honest: `hnsw_rs` offers a parallel insert this
-//! comparison did not use, so its build column is not its best achievable.)
+//! vectors, serial insert both sides, it returned perfect recall where `hnsw_rs`
+//! returned 0.987–0.990, and answered about 5× faster at matched `ef`. It does
+//! not need replacing. (Caveat kept honest: `hnsw_rs` offers a parallel insert
+//! this comparison did not use, so its build column is not its best achievable.)
 //!
 //! **The second, and the reason this crate has no graph in it:** at the scale a
 //! personal memory store actually runs, approximate search is not yet worth its
-//! costs. On clustered data at N=20,000 exact brute force answered in 2.2 ms.
-//! HNSW answered in 292 µs — genuinely faster, and bought with ~5 s of build
-//! time, a graph to keep consistent across deletions, a recall figure below 1.0,
-//! and a filtered-search story that is materially harder to get right. A memory
-//! store holding a few tens of thousands of memories does not need that trade,
-//! and an agent turn that spends 400 ms waiting on an embedding API will not
-//! notice the 2 ms.
+//! costs. On clustered data at N=20,000 exact brute force answered in 2.7 ms,
+//! against 104 µs for HNSW at `ef=50`. Genuinely faster — and bought with a
+//! graph that has to stay consistent across deletions, and a filtered-search
+//! story that is materially harder to get right over a graph than over a scan.
+//! Filtering is the common case for memory, not the exception. An agent turn
+//! that spends 400 ms waiting on an embedding API will not notice the 2.7 ms.
+//!
+//! Note what is *not* in that list. An earlier draft of this argument also cited
+//! HNSW's recall being below 1.0, on numbers from a benchmark whose clustered
+//! queries were accidentally drawn from a different set of centroids than the
+//! corpus. Corrected, recall is 1.000 at `ef=50`, and the case for exact search
+//! does not get to lean on accuracy. It rests on complexity alone, which is a
+//! narrower claim and the honest one.
 //!
 //! So: exact now, with the API shaped so an ANN tier slots underneath without
 //! callers changing. When a store outgrows it, `goldenhnsw`'s design is the one
-//! the numbers point to. Shipping the approximate thing first would have been
-//! optimising a stage that is not the bottleneck, and paying in recall for it.
+//! the numbers point to.
 //!
 //! Both distributions from that run, for the record:
 //!
 //! ```text
-//! uniform on the sphere      build    query    recall@10
-//!   brute force                  -    2.4ms        1.000
-//!   goldenhnsw (ef=200)     21.70s    565µs        0.874
-//!   hnsw_rs    (ef=200)     37.93s    2.7ms        0.839
+//! uniform on the sphere      build    query    recall@10   mean top-1 cos 0.347
+//!   brute force                  -    4.2ms        1.000
+//!   goldenhnsw (ef=200)     32.55s    1.1ms        0.874
+//!   hnsw_rs    (ef=200)     57.09s    2.9ms        0.841
 //!
-//! clustered (200 topics)     build    query    recall@10
-//!   brute force                  -    2.2ms        1.000
-//!   goldenhnsw (ef=200)      5.26s    292µs        0.976
-//!   hnsw_rs    (ef=200)     17.55s    1.0ms        0.951
+//! clustered (200 topics)     build    query    recall@10   mean top-1 cos 0.919
+//!   brute force                  -    2.7ms        1.000
+//!   goldenhnsw (ef=50)       6.83s    104µs        1.000
+//!   hnsw_rs    (ef=50)      27.84s    582µs        0.987
 //! ```
 //!
 //! Uniform vectors are worth reporting because they are the case ANN benchmarks
@@ -49,6 +54,9 @@
 //! is why the second table is the one that should inform the decision — and why
 //! quoting only the first would have been misleading in the flattering
 //! direction.
+//!
+//! Build timings vary enough run to run (6.83 s and 15.60 s for the same
+//! clustered index) that only the recall column should be read as a measurement.
 
 use std::collections::HashMap;
 
@@ -286,7 +294,7 @@ impl VectorIndex {
         // Partition around k before sorting, so the cost is O(n) in the scan
         // plus O(k log k) on the survivors rather than O(n log n) on all of
         // them. At N=20,000 and k=10 the full sort was a real share of the
-        // 2.2 ms this crate's design argument rests on.
+        // 2.7 ms this crate's design argument rests on.
         if k < hits.len() {
             hits.select_nth_unstable_by(k, order);
             hits.truncate(k);

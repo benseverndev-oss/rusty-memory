@@ -1,1 +1,9 @@
 /target
+
+# The bake-off is excluded from the workspace, so it builds into its own target
+# dir; unanchored so any nested crate's output is covered too.
+target/
+
+# Vendored by the copy step in benches/ann-bakeoff/README.md. Third-party
+# source, and not ours to commit.
+benches/ann-bakeoff/src/goldenhnsw.rs
