@@ -196,13 +196,36 @@ impl HttpProvider {
     }
 
     /// Replace `<first 8 chars of the key> <anything> <last 4 chars of the
-    /// key>` with `[REDACTED]`, where `<anything>` is short enough to be a
-    /// mask of this key rather than unrelated prose.
+    /// key>` with `[REDACTED]`, where `<anything>` fits inside the key's own
+    /// length plus a little slack.
     ///
-    /// The window is the key's own length plus a little slack, so a mask that
-    /// pads to a slightly different width still matches while a prefix
-    /// appearing in one sentence and a suffix in the next does not join up
-    /// into one enormous redaction that swallows the provider's message.
+    /// # It over-redacts, and by how much depends on the key
+    ///
+    /// The window scales with the key, so for a long key it is long. Current
+    /// OpenAI project keys run to about 164 characters and their first 8
+    /// characters are `sk-proj-` — a public constant, not a secret, and one
+    /// that turns up in provider prose and documentation links. So a message
+    /// mentioning `sk-proj-` and then, within ~172 characters, any four
+    /// characters matching the key's tail collapses into `[REDACTED]`.
+    /// Measured, with a 164-character key ending `TAIL`:
+    ///
+    /// ```text
+    /// in : "You are using sk-proj- style keys now. See the migration guide, … then retry. Ref TAIL."
+    /// out: "You are using [REDACTED]."
+    /// ```
+    ///
+    /// 123 characters of the provider's explanation destroyed. That is worse
+    /// than the earlier claim here — "short enough to be a mask of this key
+    /// rather than unrelated prose" — which was simply not true for the
+    /// default provider's own current key format.
+    ///
+    /// It is not fixed, and deliberately. The window has to be at least the
+    /// key's length because the mask this exists to catch is padded to the
+    /// key's length; anything shorter stops catching the real case. The
+    /// failure direction is losing provider text, never leaking key material,
+    /// and between a mangled error message and a printed credential this is
+    /// the right way round. What is not acceptable is a doc comment that
+    /// describes the tolerable failure as if it did not happen.
     fn redact_masked(&self, text: &str) -> String {
         // Below 16 bytes the head and the tail would overlap, and a 12-of-16
         // character match is loose enough to start hitting ordinary text.
@@ -473,6 +496,36 @@ mod tests {
         );
         let text = "sk-FAKE- appears here, and then a long stretch of the provider explaining itself at length before anything ends in 6789";
         assert_eq!(provider.redact(text), text);
+    }
+
+    #[test]
+    fn a_long_key_makes_a_long_window_and_swallows_provider_prose_with_it() {
+        // Recorded rather than required. The window scales with the key, and a
+        // current OpenAI project key is ~164 characters whose first 8 are the
+        // public constant `sk-proj-` -- which appears in provider prose. So a
+        // message that mentions `sk-proj-` and then any four characters
+        // matching the key's tail loses everything between.
+        //
+        // This pins the direction, which is what matters: text is lost, key
+        // material is not. If it ever fails because the matcher was
+        // tightened, the doc comment on `redact_masked` is what needs
+        // updating -- it states this measurement, and a doc claim nothing
+        // checks is how the previous version of it came to be wrong.
+        let key = format!("sk-proj-{}TAIL", "F".repeat(152));
+        assert_eq!(key.len(), 164, "a current OpenAI project key's length");
+        let provider = HttpProvider::new("https://h".into(), key.clone(), "c".into(), "e".into());
+
+        let message =
+            "You are using sk-proj- style keys now. See the migration guide, then retry. Ref TAIL.";
+        let out = provider.redact(message);
+
+        assert!(!out.contains(&key), "key material survived: {out}");
+        assert!(out.contains("[REDACTED]"), "{out}");
+        assert!(
+            !out.contains("migration guide"),
+            "this is the over-redaction the doc comment describes; if it stopped happening, update that comment: {out}"
+        );
+        assert!(out.starts_with("You are using "), "{out}");
     }
 
     #[test]
