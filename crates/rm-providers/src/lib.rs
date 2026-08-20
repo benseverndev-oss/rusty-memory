@@ -168,8 +168,17 @@ impl HttpProvider {
             ureq::ErrorKind::Dns => {
                 "the host it names could not be resolved -- check the spelling, and that this machine has DNS"
             }
+            // Not only a refused connection. `ureq` maps a failed TLS
+            // handshake here too (`rtls.rs` turns `complete_io` failing into
+            // `ConnectionFailed`), so an unknown CA, an expired certificate or
+            // a corporate MITM proxy all arrive as this variant -- and those
+            // are the common enterprise failures. Something did accept the
+            // connection; the certificate was rejected. Saying only "check the
+            // firewall" sends whoever hit that to the wrong place for an
+            // afternoon, so the certificate case is named here rather than
+            // guessed at from a message we do not read.
             ureq::ErrorKind::ConnectionFailed => {
-                "nothing accepted a connection there -- check the host and port, and any proxy or firewall in the way"
+                "the connection did not establish -- either nothing accepted it, so check the host, the port and any proxy or firewall in the way, or it was accepted and the TLS handshake failed, so check that the certificate is one this machine trusts (an unknown CA, an expired certificate, or a proxy substituting its own)"
             }
             ureq::ErrorKind::InvalidUrl | ureq::ErrorKind::UnknownScheme => {
                 "it is not a URL this build can use -- it needs a scheme it knows, and a host"
@@ -195,7 +204,13 @@ impl HttpProvider {
             // Reached only for a non-2xx, which `handle_response` takes
             // through its own arm before this is ever called.
             ureq::ErrorKind::HTTP => "the provider answered with an error",
-            ureq::ErrorKind::Io => "the connection failed part way through",
+            // Also not only what it sounds like: both the connect and read
+            // timeouts land here, as does TLS session setup failing before the
+            // handshake starts. "Failed part way through" is not what a
+            // connect timeout is.
+            ureq::ErrorKind::Io => {
+                "the connection failed at the network layer -- it timed out, was reset, or TLS could not be set up at all"
+            }
         };
         ProviderError::Transport(format!(
             "{path}, under the base_url named in rmem.toml: {why}"
@@ -573,6 +588,43 @@ mod tests {
                 "{kind:?} says nothing a reader could act on: {message}"
             );
         }
+    }
+
+    /// The message `transport_failure` gives for `kind`.
+    fn transport_message(kind: ureq::ErrorKind) -> String {
+        let ProviderError::Transport(message) = HttpProvider::transport_failure(kind, "embeddings")
+        else {
+            panic!("a transport failure has to be one");
+        };
+        message
+    }
+
+    #[test]
+    fn a_rejected_certificate_is_not_reported_as_nothing_listening() {
+        // `ureq` maps a failed TLS handshake onto `ConnectionFailed`, the same
+        // variant a refused connection uses -- so an unknown CA, an expired
+        // certificate, or a corporate proxy substituting its own all used to
+        // be reported as "nothing accepted a connection there -- check the
+        // host, the port and the firewall". Something *did* accept the
+        // connection. Sending someone to their firewall when the fix is a CA
+        // bundle costs an afternoon, and behind a corporate proxy it is the
+        // likeliest failure there is.
+        let message = transport_message(ureq::ErrorKind::ConnectionFailed);
+        assert!(message.contains("certificate"), "{message}");
+        assert!(message.contains("TLS"), "{message}");
+        // And still names the other cause, which is the common one outside a
+        // corporate network.
+        assert!(message.contains("port"), "{message}");
+    }
+
+    #[test]
+    fn a_timeout_is_not_reported_as_a_connection_that_failed_part_way() {
+        // Both the connect and the read timeout arrive as `Io`, as does TLS
+        // session setup failing before a handshake begins. A connect timeout
+        // is not a connection that failed part way through, and a reader
+        // chasing the wrong one loses the same afternoon.
+        let message = transport_message(ureq::ErrorKind::Io);
+        assert!(message.contains("timed out"), "{message}");
     }
 
     #[test]
