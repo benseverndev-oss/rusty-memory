@@ -12,6 +12,17 @@ use crate::CliError;
 /// `Engine::open` deliberately does not persist them. That means there is one
 /// source for both and a stale copy inside a snapshot cannot quietly override
 /// what `rmem.toml` says.
+///
+/// The dimension and metric are checked against the restored store rather
+/// than merely passed through to `Engine::new`'s empty-store branch. `init`
+/// probes the embedding model instead of trusting a human to write the
+/// dimension down, for the same reason this checks it on the other end: a
+/// disagreement is not a parse error, so nothing about `Engine::open`
+/// succeeding proves the store agrees with what the current config expects
+/// to feed it. Left unchecked, that disagreement would still be caught --
+/// `VectorIndex::check` rejects a wrong-length vector -- but only on the
+/// first `remember` or `recall`, far from a message that could have named
+/// the actual cause.
 pub fn load(
     path: &Path,
     ruleset: Ruleset,
@@ -31,12 +42,28 @@ pub fn load(
             "could not read {}: {e}",
             path.display()
         ))),
-        Ok(text) => Engine::open(&text, ruleset, policy).map_err(|e| {
-            CliError::Store(format!(
-                "{} is not a store this build can open: {e}",
-                path.display()
-            ))
-        }),
+        Ok(text) => {
+            let engine = Engine::open(&text, ruleset, policy).map_err(|e| {
+                CliError::Store(format!(
+                    "{} is not a store this build can open: {e}",
+                    path.display()
+                ))
+            })?;
+            let (stored_dimension, stored_metric) = engine.index_shape();
+            if stored_dimension != dimension {
+                return Err(CliError::Store(format!(
+                    "{} holds {stored_dimension}-dimensional vectors, but rmem.toml's [provider] section currently names dimension = {dimension} -- if the embedding model changed, run `rmem init --force` to rediscover the dimension, or point the config back at the model this store was built with",
+                    path.display()
+                )));
+            }
+            if stored_metric != metric {
+                return Err(CliError::Store(format!(
+                    "{} was built under metric {stored_metric:?}, but rmem.toml's [provider] section currently names metric = {metric:?} -- distances computed under the wrong metric are silently meaningless rather than merely different, so this is refused rather than reinterpreted",
+                    path.display()
+                )));
+            }
+            Ok(engine)
+        }
     }
 }
 
@@ -151,5 +178,96 @@ mod tests {
             panic!("a file that is not a store must not open");
         };
         assert!(err.to_string().contains("memory.json"), "{err}");
+    }
+
+    #[test]
+    fn a_restored_store_built_at_a_different_dimension_is_refused_naming_both() {
+        // Not a parse error -- `Engine::open` has no way to know the caller's
+        // config disagrees with what the snapshot was built for. Left
+        // unchecked here it would still be caught, but only on the first
+        // `remember` or `recall`, far from a message that names the cause.
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+        let (r, p, d, m) = engine_parts();
+        let engine = load(&path, r, p, d, m).unwrap();
+        save(&path, &engine).unwrap();
+
+        let (r, p, _, m) = engine_parts();
+        let Err(err) = load(&path, r, p, 4, m) else {
+            panic!("a dimension that disagrees with the stored index must not open silently");
+        };
+        assert!(err.to_string().contains('3'), "{err}");
+        assert!(err.to_string().contains('4'), "{err}");
+    }
+
+    #[test]
+    fn a_restored_store_built_under_a_different_metric_is_refused_naming_both() {
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+        let (r, p, d, m) = engine_parts();
+        let engine = load(&path, r, p, d, m).unwrap();
+        save(&path, &engine).unwrap();
+
+        let (r, p, d, _) = engine_parts();
+        let Err(err) = load(&path, r, p, d, Metric::L2) else {
+            panic!("a metric that disagrees with the stored index must not open silently");
+        };
+        assert!(err.to_string().contains("Cosine"), "{err}");
+        assert!(err.to_string().contains("L2"), "{err}");
+    }
+
+    #[test]
+    fn a_save_that_cannot_reach_its_temporary_file_leaves_the_original_untouched() {
+        // The literal path `save` writes its temp file to, pre-occupied by a
+        // directory so the temp write cannot succeed. A plain overwrite of
+        // `path` would pass every other test in this module -- see
+        // `saving_leaves_no_temporary_file_behind`, which a direct write also
+        // satisfies trivially, having never made a temp file to leave behind.
+        // This is the one arrangement that only the temp-file-then-rename
+        // implementation survives: it fails before `path` is ever touched,
+        // where a direct write would already have clobbered it.
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+        let (r, p, d, m) = engine_parts();
+        let mut engine = load(&path, r, p, d, m).unwrap();
+        engine
+            .remember(rm_engine::Observation {
+                kind: "person".to_string(),
+                mention: rm_engine::Record::new().with("name", "Ben Severn"),
+                attribute: "employer".to_string(),
+                value: Some("Acme".to_string()),
+                valid: rm_engine::Interval::since(1),
+                provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, 1, "test"),
+                embedding: vec![1.0, 0.0, 0.0],
+            })
+            .unwrap();
+        save(&path, &engine).unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+
+        let (r, p, d, m) = engine_parts();
+        let mut other = load(&path, r, p, d, m).unwrap();
+        other
+            .remember(rm_engine::Observation {
+                kind: "person".to_string(),
+                mention: rm_engine::Record::new().with("name", "Someone Else"),
+                attribute: "employer".to_string(),
+                value: Some("Other Co".to_string()),
+                valid: rm_engine::Interval::since(2),
+                provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, 2, "test"),
+                embedding: vec![0.0, 1.0, 0.0],
+            })
+            .unwrap();
+        assert!(
+            save(&path, &other).is_err(),
+            "the temp file has nowhere to go, so the save must fail rather than clobber path directly"
+        );
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            original, after,
+            "a save that cannot complete must not leave the original store altered"
+        );
     }
 }

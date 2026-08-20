@@ -775,6 +775,18 @@ impl Engine {
         self.index.len()
     }
 
+    /// The dimension and metric backing this engine's vector index.
+    ///
+    /// Exists so a caller restoring an engine from a snapshot can check the
+    /// restored index agrees with what its own configuration currently
+    /// expects, before a disagreement surfaces far from its cause as a
+    /// `WrongDimension` on the first `remember` or `recall` rather than at
+    /// the door where `Engine::open` already validates everything else it
+    /// can see about a snapshot on its own.
+    pub fn index_shape(&self) -> (usize, Metric) {
+        (self.index.dim(), self.index.metric())
+    }
+
     /// Stop recalling an attribute, without destroying what was true.
     ///
     /// Appends a tombstone valid from `at` and drops the attribute's vectors, so
