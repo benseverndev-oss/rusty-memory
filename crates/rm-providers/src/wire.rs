@@ -5,13 +5,10 @@
 //! encoded, what an error response means, how an empty one differs from an
 //! empty answer — are tested without a socket.
 //!
-//! Every item below is exercised by the tests at the bottom of this file, but
-//! nothing in the crate's normal build calls them yet: the transport that
-//! will is the next task. Until then rustc sees `pub(crate)` functions and
-//! response structs with no non-test caller and calls them dead. The allow
-//! below is scoped to this file and comes off the day `HttpProvider` starts
-//! calling into it.
-#![allow(dead_code)]
+//! Every item below is exercised by the tests at the bottom of this file, and
+//! also called from `HttpProvider` in the parent module: the transport joins
+//! a request body to a socket and a response body back to one of these
+//! parsers, but never builds or reads either itself.
 
 use serde::Deserialize;
 
