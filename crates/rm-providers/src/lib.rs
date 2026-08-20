@@ -37,6 +37,25 @@ use rm_extract::{Completer, CompleterError};
 
 use wire::{completion_body, embedding_body, parse_completion, parse_embedding};
 
+/// # One thing this cannot promise
+///
+/// `Api`, `Unparsable` and `Empty` carry the provider's own words, on purpose:
+/// a remote service explaining why it refused is the most useful thing this
+/// crate can pass on, and inventing a substitute would throw it away. `redact`
+/// scrubs the API key out of that text.
+///
+/// It cannot scrub `base_url`. A provider that echoes the request path back in
+/// its error body — a 404 naming the route is ordinary — would have that
+/// relayed, and `base_url` comes out of `rmem.toml`, so a credential pasted
+/// *there* could return that way. Every other route for `base_url` is closed
+/// (see `transport_failure`), and this one is not closed because the only ways
+/// to close it are to match a value we hold against a rendering someone else
+/// produced, which is what six leaks have now shown cannot be made airtight, or
+/// to stop relaying provider messages at all, which is a worse product.
+///
+/// Recorded as a limitation rather than patched. It needs a user to have pasted
+/// a key into `base_url` *and* a provider that echoes the path; `api_key_env`
+/// is the field that invites the mistake, and it no longer prints anything.
 /// Something went wrong reaching a provider, or in what it sent back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderError {
