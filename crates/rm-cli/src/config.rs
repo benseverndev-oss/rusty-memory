@@ -225,17 +225,28 @@ impl Config {
     /// The resolver this file describes.
     pub fn ruleset(&self) -> Result<Ruleset, CliError> {
         let mut rules = Vec::new();
-        for f in &self.resolution.field {
+        // Entries are numbered rather than named. `field = "name"` is itself
+        // text out of the file, so quoting it to say which rule went wrong
+        // would be the same mistake in a smaller place; a 1-based index is a
+        // location, which is what a reader needs and what nothing can hide a
+        // secret in.
+        for (n, f) in self.resolution.field.iter().enumerate() {
             rules.push(FieldRule::new(
                 f.field.clone(),
-                comparator(&f.comparator)?,
+                comparator(
+                    &f.comparator,
+                    &format!("[[resolution.field]] entry {}", n + 1),
+                )?,
                 f.m,
                 f.u,
             ));
         }
         let mut blocking = Vec::new();
-        for b in &self.resolution.blocking {
-            blocking.push(blocking_key(b)?);
+        for (n, b) in self.resolution.blocking.iter().enumerate() {
+            blocking.push(blocking_key(
+                b,
+                &format!("[[resolution.blocking]] entry {}", n + 1),
+            )?);
         }
         Ruleset::new(
             rules,
@@ -248,34 +259,20 @@ impl Config {
 
     /// The survivorship policy this file describes.
     pub fn policy_for_engine(&self) -> Result<Policy, CliError> {
-        let mut policy = Policy::new(strategy(&self.policy.default)?);
+        let mut policy = Policy::new(strategy(&self.policy.default, "[policy] default")?);
         for (attribute, name) in &self.policy.attribute {
-            // `[policy.attribute]` is an open map -- any attribute name, any
-            // strategy name -- which makes it the one table in `rmem.toml`
-            // that `deny_unknown_fields` cannot defend. It is also the last
-            // table in `TEMPLATE`, so `api_key = "sk-..."` appended to the
-            // end of the file, which is what appending to a file means, lands
-            // here as a map entry rather than as an unknown field. Driven
-            // rather than reasoned about: it put the value on the terminal
-            // verbatim, through `strategy`'s catch-all arm.
+            // Neither half of an entry here is named on refusal. In
+            // `[policy.attribute]` the attribute *and* the strategy are both
+            // text out of the file -- it is an open map, which is why
+            // `deny_unknown_fields` cannot defend it, and it is the last table
+            // in `TEMPLATE`, so `api_key = "sk-..."` appended to the end of the
+            // file lands here as an entry rather than as an unknown field.
             //
-            // So this names the attribute and not what was written against
-            // it. The attribute is the half a reader needs to find the line,
-            // and the value is the half that can be a secret -- the same
-            // split `Config::parse` makes between a location and a source
-            // line.
-            let chosen = match strategy(name) {
-                Ok(s) => s,
-                // `source_priority`'s refusal is a sentence written into this
-                // binary rather than read out of the file, so relaying it
-                // carries nothing the user typed.
-                Err(e) if name == "source_priority" => return Err(e),
-                Err(_) => {
-                    return Err(CliError::Config(format!(
-                        "the strategy for attribute {attribute:?} under [policy.attribute] is not one this build knows; use one of most_complete, longest_value, majority_vote, confidence_majority, first_non_null, unanimous_or_null, most_recent, valid_interval. What is written there is deliberately not repeated: this table accepts any name, so it is where a key pasted at the end of rmem.toml lands, and printing it would put it in your terminal and your scrollback."
-                    )))
-                }
-            };
+            // An earlier version of this named the attribute while saying in
+            // the same sentence that what was written was not repeated. That
+            // was true of one half and false of the other:
+            // `"sk-proj-..." = "nonsense"` printed the key as the attribute.
+            let chosen = strategy(name, "an entry under [policy.attribute]")?;
             policy = policy.with(attribute.clone(), chosen);
         }
         Ok(policy)
@@ -286,8 +283,8 @@ impl Config {
         match self.provider.metric.as_str() {
             "cosine" => Ok(Metric::Cosine),
             "l2" => Ok(Metric::L2),
-            other => Err(CliError::Config(format!(
-                "metric {other:?} is not one this build knows; use \"cosine\" or \"l2\". It is not defaulted because choosing wrong is a silent quality bug -- results stay plausible and get subtly worse."
+            _ => Err(CliError::Config(format!(
+                "rmem.toml's [provider] metric is not one this build knows; use \"cosine\" or \"l2\". It is not defaulted because choosing wrong is a silent quality bug -- results stay plausible and get subtly worse. {NOT_REPEATED}"
             ))),
         }
     }
@@ -367,33 +364,47 @@ fn location(text: &str, span: Option<std::ops::Range<usize>>) -> String {
     format!("line {line}, column {column}")
 }
 
-fn comparator(name: &str) -> Result<Comparator, CliError> {
+/// The sentence every refusal below ends with, in one place so it cannot drift
+/// between them.
+///
+/// Six credential leaks on this branch came out of error messages echoing a
+/// value read from the config, each closed one shape at a time while the class
+/// stayed open. The rule that replaced that: a refusal names a field, a
+/// location, or nothing — never a value out of the file. A user who wrote a
+/// value can read it back in their own editor, which is worth almost nothing
+/// to them and was the whole attack surface.
+const NOT_REPEATED: &str = "What is written there is not repeated here: any value in this file may turn out to be a pasted credential, so a refusal names the field and leaves you to read the value in your own copy.";
+
+/// `where_` names the field or the entry, in words the reader can find in the
+/// file. It is built by the caller from table names and 1-based indices, never
+/// from the file's own text.
+fn comparator(name: &str, where_: &str) -> Result<Comparator, CliError> {
     match name {
         "exact" => Ok(Comparator::Exact),
         "normalized" => Ok(Comparator::Normalized),
         "jaro_winkler" => Ok(Comparator::JaroWinkler),
         "token_jaccard" => Ok(Comparator::TokenJaccard),
-        other => Err(CliError::Config(format!(
-            "comparator {other:?} is not one this build knows; use \"exact\", \"normalized\", \"jaro_winkler\" or \"token_jaccard\""
+        _ => Err(CliError::Config(format!(
+            "{where_} in rmem.toml names a comparator this build does not know; use \"exact\", \"normalized\", \"jaro_winkler\" or \"token_jaccard\". {NOT_REPEATED}"
         ))),
     }
 }
 
-fn blocking_key(b: &BlockingConfig) -> Result<BlockingKey, CliError> {
+fn blocking_key(b: &BlockingConfig, where_: &str) -> Result<BlockingKey, CliError> {
     match b.kind.as_str() {
         "exact" => Ok(BlockingKey::Exact(b.field.clone())),
         "token" => Ok(BlockingKey::Token(b.field.clone())),
         "prefix" if b.n > 0 => Ok(BlockingKey::Prefix(b.field.clone(), b.n)),
-        "prefix" => Err(CliError::Config(
-            "a prefix blocking key needs n greater than 0; n = 0 puts every record in one block, which compares everything to everything".to_string(),
-        )),
-        other => Err(CliError::Config(format!(
-            "blocking kind {other:?} is not one this build knows; use \"exact\", \"prefix\" or \"token\""
+        "prefix" => Err(CliError::Config(format!(
+            "{where_} in rmem.toml is a prefix key and needs n greater than 0; n = 0 puts every record in one block, which compares everything to everything"
+        ))),
+        _ => Err(CliError::Config(format!(
+            "{where_} in rmem.toml names a blocking kind this build does not know; use \"exact\", \"prefix\" or \"token\". {NOT_REPEATED}"
         ))),
     }
 }
 
-fn strategy(name: &str) -> Result<Strategy, CliError> {
+fn strategy(name: &str, where_: &str) -> Result<Strategy, CliError> {
     match name {
         "most_complete" => Ok(Strategy::MostComplete),
         "longest_value" => Ok(Strategy::LongestValue),
@@ -405,11 +416,16 @@ fn strategy(name: &str) -> Result<Strategy, CliError> {
         "valid_interval" => Ok(Strategy::ValidInterval),
         // Naming it and inventing an order would be exactly the arbitrary answer
         // wearing a deterministic hat that rm-survivor refuses to give.
-        "source_priority" => Err(CliError::Config(
-            "source_priority needs an order of sources to rank, and this config format has no way to say one yet -- choose another strategy, or rank them in code".to_string(),
-        )),
-        other => Err(CliError::Config(format!(
-            "strategy {other:?} is not one this build knows; use one of most_complete, longest_value, majority_vote, confidence_majority, first_non_null, unanimous_or_null, most_recent, valid_interval"
+        //
+        // "source_priority" appears in this message as a literal written into
+        // the binary, on a branch reached only when the file already said
+        // exactly that. It is not the file's text being echoed back, so the
+        // rule above is not bent here.
+        "source_priority" => Err(CliError::Config(format!(
+            "{where_} in rmem.toml asks for source_priority, which needs an order of sources to rank, and this config format has no way to say one yet -- choose another strategy, or rank them in code"
+        ))),
+        _ => Err(CliError::Config(format!(
+            "{where_} in rmem.toml names a strategy this build does not know; use one of most_complete, longest_value, majority_vote, confidence_majority, first_non_null, unanimous_or_null, most_recent, valid_interval. {NOT_REPEATED}"
         ))),
     }
 }
@@ -642,9 +658,15 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             !err.contains("sk-PASTED-FAKE-SECRET"),
             "the pasted value reached the message: {err}"
         );
+        // The attribute is not named either, which the first version of this
+        // got wrong: it printed the map's key while saying in the same
+        // sentence that what was written was not repeated. Both halves of an
+        // entry in an open map are text out of the file, so a paste can land
+        // in either, and `"sk-proj-..." = "nonsense"` put the key in the half
+        // that was being printed.
         assert!(
-            err.contains("api_key"),
-            "the attribute has to be named so the line can be found: {err}"
+            err.contains("[policy.attribute]"),
+            "the table has to be named so the line can be found: {err}"
         );
         assert!(
             err.contains("most_recent"),
@@ -806,18 +828,36 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
     }
 
     #[test]
-    fn an_unknown_comparator_names_what_it_did_not_recognise_and_what_it_accepts() {
+    fn an_unknown_comparator_names_the_entry_and_the_choices_but_not_what_was_written() {
         let bad = TEMPLATE.replace("comparator = \"jaro_winkler\"", "comparator = \"vibes\"");
-        let err = parse(&bad).unwrap().ruleset().unwrap_err();
-        assert!(err.to_string().contains("vibes"), "{err}");
-        assert!(err.to_string().contains("jaro_winkler"), "{err}");
+        let err = parse(&bad).unwrap().ruleset().unwrap_err().to_string();
+        assert!(!err.contains("vibes"), "{err}");
+        // The entry by table and 1-based index -- a location, which is what a
+        // reader needs. Not `field = "name"`, which is text from the file too.
+        assert!(err.contains("[[resolution.field]] entry 1"), "{err}");
+        assert!(err.contains("jaro_winkler"), "{err}");
     }
 
     #[test]
-    fn an_unknown_strategy_names_what_it_did_not_recognise() {
+    fn an_unknown_blocking_kind_names_the_entry_and_the_choices_but_not_what_was_written() {
+        let bad = TEMPLATE.replace("kind = \"prefix\"", "kind = \"vibes\"");
+        let err = parse(&bad).unwrap().ruleset().unwrap_err().to_string();
+        assert!(!err.contains("vibes"), "{err}");
+        assert!(err.contains("[[resolution.blocking]] entry 1"), "{err}");
+        assert!(err.contains("token"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_strategy_names_the_field_and_the_choices_but_not_what_was_written() {
         let bad = TEMPLATE.replace("default = \"most_recent\"", "default = \"whatever\"");
-        let err = parse(&bad).unwrap().policy_for_engine().unwrap_err();
-        assert!(err.to_string().contains("whatever"), "{err}");
+        let err = parse(&bad)
+            .unwrap()
+            .policy_for_engine()
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("whatever"), "{err}");
+        assert!(err.contains("[policy] default"), "{err}");
+        assert!(err.contains("valid_interval"), "{err}");
     }
 
     #[test]
@@ -871,7 +911,69 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         // plausible and get subtly worse. rm-index refuses to default it and so
         // does this.
         let bad = TEMPLATE.replace("metric = \"cosine\"", "metric = \"euclidean-ish\"");
-        let err = parse(&bad).unwrap().metric().unwrap_err();
-        assert!(err.to_string().contains("euclidean-ish"), "{err}");
+        let err = parse(&bad).unwrap().metric().unwrap_err().to_string();
+        assert!(!err.contains("euclidean-ish"), "{err}");
+        assert!(err.contains("[provider] metric"), "{err}");
+        assert!(err.contains("cosine"), "{err}");
+    }
+
+    #[test]
+    fn no_refusal_about_a_config_value_ever_repeats_the_value() {
+        // The categorical guard, and the reason it is one test over every
+        // field rather than one test per field. Six leaks on this branch were
+        // closed one shape at a time -- verbatim echo, then masked echo, then
+        // unknown field, then the open map, then the variable name -- and each
+        // fix left the class open, so the next instance turned up in the code
+        // the last one added. This asserts the rule instead of the instances:
+        // whatever is written in a config value, a refusal about it does not
+        // contain it.
+        //
+        // Every substitution below is a *value* of an existing key, which is
+        // the case `deny_unknown_fields` cannot reach: it catches a paste that
+        // arrives as a new field, never one that arrives as the value of a
+        // field that already exists.
+        const FAKE: &str = "sk-proj-FAKE-SECRET-LEAK-CHECK-9999";
+        let substitutions = [
+            ("metric = \"cosine\"", format!("metric = \"{FAKE}\"")),
+            (
+                "comparator = \"jaro_winkler\"",
+                format!("comparator = \"{FAKE}\""),
+            ),
+            ("kind = \"prefix\"", format!("kind = \"{FAKE}\"")),
+            ("default = \"most_recent\"", format!("default = \"{FAKE}\"")),
+            // The value half of a `[policy.attribute]` entry ...
+            (
+                "employer = \"valid_interval\"",
+                format!("employer = \"{FAKE}\""),
+            ),
+            // ... and the key half, which is just as much text from the file.
+            (
+                "employer = \"valid_interval\"",
+                format!("\"{FAKE}\" = \"nonsense\""),
+            ),
+        ];
+
+        for (from, to) in substitutions {
+            let config = parse(&TEMPLATE.replace(from, &to)).expect("still valid TOML");
+            // Whichever of the three refuses first; all three are driven so no
+            // substitution can silently pass by never being read.
+            let errors = [
+                config.metric().err(),
+                config.ruleset().err(),
+                config.policy_for_engine().err(),
+            ];
+            assert!(
+                errors.iter().any(Option::is_some),
+                "{to:?} was accepted rather than refused"
+            );
+            for err in errors.into_iter().flatten() {
+                let text = err.to_string();
+                assert!(!text.contains(FAKE), "{to:?} came back out: {text}");
+                assert!(
+                    !format!("{err:?}").contains(FAKE),
+                    "{to:?} came back out through Debug"
+                );
+            }
+        }
     }
 }
