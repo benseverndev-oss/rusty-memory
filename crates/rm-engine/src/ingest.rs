@@ -193,9 +193,21 @@ impl Engine {
             )?;
         }
 
-        // Closures last, so an edge this same turn asserted is already in place
-        // and can be excluded. "I moved from Acme to Globex" must not close
-        // Globex as fast as it opened it.
+        // Closures run after relations here, but nothing below depends on
+        // that order: `spared` is read straight from `extraction.relations`,
+        // not from anything the store has been made to hold yet, so it
+        // excludes the same same-turn objects whether closures run before or
+        // after relations do -- confirmed by running the two loops in the
+        // opposite order and seeing every test in this module still pass.
+        // Running closures last only matches the reading order "assert what
+        // is now true, then retire what it superseded"; `spared`, not the
+        // sequence, is what keeps "I moved from Acme to Globex" from closing
+        // Globex as fast as it opened it. Compared by resolved entity id, not
+        // by local mention index: `extract` does not dedupe mentions, so the
+        // same person can appear at more than one index in one extraction,
+        // and a relation asserted from a different index than the closure's
+        // would otherwise be missed even though both resolved to this same
+        // subject.
         for closure in &extraction.closures {
             let subject = out.entities[closure.subject];
 
@@ -204,7 +216,7 @@ impl Engine {
             let spared: Vec<StableId> = extraction
                 .relations
                 .iter()
-                .filter(|r| r.subject == closure.subject && r.predicate == closure.predicate)
+                .filter(|r| out.entities[r.subject] == subject && r.predicate == closure.predicate)
                 .map(|r| out.entities[r.object])
                 .collect();
 
@@ -243,7 +255,8 @@ impl Engine {
 }
 
 /// Check every fact, relation and closure names a mention this extraction
-/// actually has, before `ingest` writes anything.
+/// actually has, and that no relation runs from a mention to itself, before
+/// `ingest` writes anything.
 ///
 /// `rm_extract::extract` enforces this for its own output, but `Extraction`'s
 /// fields are `pub` and `ingest` is `pub`, so a caller can build one with an
@@ -274,6 +287,17 @@ fn validate_indices(extraction: &Extraction) -> Result<(), EngineError> {
     for relation in &extraction.relations {
         in_range("relation subject", relation.subject)?;
         in_range("relation object", relation.object)?;
+        // Mirrors `extract`'s own check, by local index rather than resolved
+        // entity: `extract` refuses this for its own output, but a hand-built
+        // `Extraction` can still carry it, and letting it through would still
+        // end in an error -- `rm_store::relate` refuses a self-edge -- just
+        // after the mention and fact loops above had already written. That
+        // is the same guarantee `BadMentionIndex` exists to give a bad index:
+        // a relation that can never be created should cost nothing, not
+        // merely fail no worse than it would have anyway.
+        if relation.subject == relation.object {
+            return Err(EngineError::SelfRelation(relation.subject));
+        }
     }
     for closure in &extraction.closures {
         in_range("closure subject", closure.subject)?;

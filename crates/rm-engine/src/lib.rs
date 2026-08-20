@@ -132,6 +132,18 @@ pub enum EngineError {
         /// How many mentions the extraction actually has.
         mentions: usize,
     },
+    /// A relation named the same mention as both its subject and object.
+    ///
+    /// `rm_extract::extract` refuses this for its own output, by local index,
+    /// the same way it refuses a bad [`BadMentionIndex`]; a hand-built
+    /// `Extraction` can still carry it. Left unchecked here it would still
+    /// end in an error -- [`StoreError::SelfEdge`] -- but only after
+    /// `Engine::relate` was reached, which is after every mention and fact
+    /// this same call wrote had already landed. Checking it alongside
+    /// [`BadMentionIndex`], before the first write, gives a relation that can
+    /// never be created the same costs-nothing failure a bad index gets,
+    /// rather than one that merely fails no worse than it would have anyway.
+    SelfRelation(usize),
     CorruptSnapshot(String),
     /// The host's embedder failed. Carries its explanation.
     Embed(EmbedderError),
@@ -166,6 +178,10 @@ impl std::fmt::Display for EngineError {
             } => write!(
                 f,
                 "{what} names mention {index}, but this extraction has only {mentions} mention(s)"
+            ),
+            EngineError::SelfRelation(index) => write!(
+                f,
+                "a relation names mention {index} as both its own subject and object, which a self-edge cannot represent"
             ),
             EngineError::CorruptSnapshot(why) => {
                 write!(
@@ -3141,6 +3157,32 @@ mod tests {
     }
 
     #[test]
+    fn a_relation_from_a_mention_to_itself_is_an_error_costing_nothing_not_a_late_store_refusal() {
+        // `rm_store::relate` already refuses a self-edge, so letting this
+        // through to `Engine::relate` would still end in an error -- just
+        // after the mention loop above had already written Ben. Checked
+        // alongside the index-range checks instead, so a relation that can
+        // never be created costs nothing rather than merely failing no worse
+        // than it would have anyway.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 0,
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let err = e.ingest(&a_turn(), &extraction, &Buckets).unwrap_err();
+        assert!(matches!(err, EngineError::SelfRelation(0)), "{err:?}");
+        assert_eq!(e.entity_count(), 0, "checked before the first write");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
     fn an_ambiguous_mention_comes_back_as_a_review_rather_than_a_merge() {
         // Resolution's middle band survives ingestion. A turn naming someone
         // who might be someone already known must not quietly merge them, and
@@ -3479,6 +3521,55 @@ mod tests {
                 .iter()
                 .any(|r| r.entity == bristol),
             "where he lives has nothing to do with where he works"
+        );
+    }
+
+    #[test]
+    fn a_closure_spares_a_same_turn_edge_named_by_a_different_mention_of_its_subject() {
+        // `extract` does not dedupe mentions: the same person can appear at
+        // more than one local index in one turn. Ben is mentioned at index 0
+        // (the relation's subject) and again at index 2 (the closure's
+        // subject); both resolve to the same entity. Comparing `spared` by
+        // local index rather than resolved entity id would miss this and
+        // wrongly close the edge this same turn just asserted.
+        let mut e = closure_engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![
+                mention("person", "Ben Severn"),
+                mention("organisation", "Globex"),
+                mention("person", "Ben Severn"),
+            ],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 1,
+                valid_from: 100,
+            }],
+            closures: vec![rm_extract::Closure {
+                subject: 2,
+                predicate: "employed_by".to_string(),
+                at: 100,
+                because: "a new job ends the old one".to_string(),
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+
+        assert_eq!(
+            out.entities[0], out.entities[2],
+            "both mentions of Ben Severn must resolve to the same entity for this test to mean anything"
+        );
+        assert!(
+            out.closed.is_empty(),
+            "the edge this same turn asserted from index 0 must not be closed just because the closure named the same subject at index 2"
+        );
+        let walk = Walk::new(vec![out.entities[0]], 1, 10, 150, 300);
+        assert!(
+            e.neighborhood(&walk)
+                .reached
+                .iter()
+                .any(|r| r.entity == out.entities[1]),
+            "Globex should still be reachable"
         );
     }
 }
