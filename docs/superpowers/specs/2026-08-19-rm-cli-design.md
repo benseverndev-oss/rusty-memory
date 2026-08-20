@@ -135,9 +135,13 @@ persist the ruleset or policy; they are supplied fresh by the caller. Here the
 caller is the config file, so there is exactly one source for them and a stale
 copy inside a snapshot cannot silently override what the file says.
 
-**No lock file.** Two `rmem` processes writing at once is documented as
-unsupported rather than half-defended. A lock that is not tested under
-contention is worse than an honest limitation.
+**No lock file.** *(Resolved — see `rm_host::store`.)* Two `rmem` processes
+writing at once was documented as unsupported rather than half-defended, on the
+grounds that "a lock that is not tested under contention is worse than an honest
+limitation". The standard applies; it has now been met rather than avoided.
+There is an advisory lock spanning the whole read-modify-write, and it is tested
+under contention both across file descriptors and across two real processes,
+including that a holder killed with `SIGKILL` leaves nothing stale behind.
 
 A missing store is not an error. `recall` and `about` against a store that does
 not exist yet report that nothing has been remembered, and `remember` creates

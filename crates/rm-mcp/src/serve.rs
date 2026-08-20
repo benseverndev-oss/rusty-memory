@@ -50,7 +50,6 @@ where
     F: Fn(&Config) -> Result<P, HostError>,
 {
     config: Config,
-    engine: Engine,
     provider: F,
     /// The version a legacy `initialize` settled on.
     ///
@@ -75,16 +74,21 @@ where
     /// it, and on stdio that message may never be seen at all.
     pub fn open(config_path: &Path, provider: F) -> Result<Self, HostError> {
         let config = Config::load(config_path)?;
-        let engine = store::load(
+        // Opened and dropped. Nothing is kept: the store is re-read under a
+        // lock on every call (see `call_tool`), and a copy held here would be
+        // the stale snapshot that whole arrangement exists to prevent. What
+        // this buys is the failure *timing* -- a bad config or an
+        // unopenable store is reported now, to the person who can fix it,
+        // rather than to a model on the first tool call.
+        drop(store::load(
             &config.store.path,
             config.ruleset()?,
             config.policy_for_engine()?,
             config.provider.dimension,
             config.metric()?,
-        )?;
+        )?);
         Ok(Server {
             config,
-            engine,
             provider,
             negotiated: None,
         })
@@ -228,53 +232,118 @@ where
             Err(why) => return Ok(refused(era, &why)),
         };
 
-        let mutates = call.mutates();
-        match self.run(call, now) {
-            Ok(outcome) => {
-                if mutates {
-                    // A failed save leaves this process ahead of the file:
-                    // what was learned is in memory and not on disk. Reported
-                    // rather than hidden, and the engine is deliberately not
-                    // rolled back -- the next write that succeeds carries both
-                    // turns, which is the better of the two available
-                    // outcomes.
-                    if let Err(e) = store::save(&self.config.store.path, &self.engine) {
-                        return Ok(refused(era, &e.to_string()));
-                    }
-                }
-                Ok(answered(era, &render::render(&outcome)))
-            }
+        // One lock per call, spanning the read and the write.
+        //
+        // This module used to say the fix for two writers was "a lock file,
+        // not a reload-per-call". That was wrong, and in a way worth stating:
+        // they are not alternatives. A server holding an engine for the life
+        // of the process has a snapshot that goes stale the moment anything
+        // else writes, and a lock around `save` would faithfully serialise
+        // writing that stale snapshot over the top of the other process's
+        // work. Reloading without a lock narrows the window; locking without
+        // reloading does not close it either. Only both together do.
+        //
+        // The cost the old note named is real and is now paid deliberately: a
+        // snapshot parse and an index rebuild per tool call. It buys
+        // correctness against a second writer, and it lands on a turn that has
+        // already spent hundreds of milliseconds on an embedding API.
+        let path = self.config.store.path.clone();
+        // The shape the store has to be opened with. A failure here is a
+        // refusal rather than a JSON-RPC error: it is the config being wrong,
+        // which `open` has already reported once to whoever can fix it, and a
+        // tool result is what reaches a model that might say so out loud.
+        let shape = || -> Result<_, HostError> {
+            Ok((
+                self.config.ruleset()?,
+                self.config.policy_for_engine()?,
+                self.config.provider.dimension,
+                self.config.metric()?,
+            ))
+        };
+        let (ruleset, policy, dimension, metric) = match shape() {
+            Ok(parts) => parts,
+            Err(e) => return Ok(refused(era, &e.to_string())),
+        };
+
+        let outcome = if call.mutates() {
+            store::with_write(&path, ruleset, policy, dimension, metric, |engine| {
+                Self::write(&self.config, &self.provider, engine, call, now)
+            })
+        } else {
+            store::with_read(&path, ruleset, policy, dimension, metric, |engine| {
+                Self::read(&self.config, &self.provider, engine, call, now)
+            })
+        };
+
+        match outcome {
+            Ok(outcome) => Ok(answered(era, &render::render(&outcome))),
             // The library's own words, verbatim. Every refusal in this
             // workspace names what was missing, and that sentence is the part
-            // a model can act on.
+            // a model can act on. A lock that could not be taken arrives here
+            // too, and says so in the same voice.
             Err(e) => Ok(refused(era, &e.to_string())),
         }
     }
 
-    fn run(&mut self, call: Call, now: Timestamp) -> Result<Outcome, HostError> {
+    /// Run a call that changes the store, against the engine the exclusive
+    /// lock is holding.
+    ///
+    /// Split from [`Server::read`] along exactly the line [`Call::mutates`]
+    /// draws, so the two cannot disagree: a call routed here has an exclusive
+    /// lock and will be saved, and one routed there has a shared lock and a
+    /// `&Engine` that cannot be written through even by mistake. The
+    /// alternative — one function over `&mut Engine` for both — would have
+    /// needed a clone of the whole engine per read to satisfy the borrow, and
+    /// a type that says "read-only" is worth more than five saved lines.
+    ///
+    /// Associated rather than a method, and taking the engine as an argument,
+    /// because the engine now belongs to the lock rather than to the server.
+    fn write(
+        config: &Config,
+        provider: &F,
+        engine: &mut Engine,
+        call: Call,
+        now: Timestamp,
+    ) -> Result<Outcome, HostError> {
         match call {
             Call::Remember { text, session } => {
-                let provider = (self.provider)(&self.config)?;
-                command::remember(&mut self.engine, &text, now, &session, &provider, &provider)
+                let provider = provider(config)?;
+                command::remember(engine, &text, now, &session, &provider, &provider)
             }
+            Call::ResolveReview { id, same } => {
+                if same {
+                    command::review_confirm(engine, id)
+                } else {
+                    command::review_reject(engine, id)
+                }
+            }
+            // Guarded by `Call::mutates` at the one call site.
+            other => unreachable!("{other:?} does not write"),
+        }
+    }
+
+    /// Run a call that only reads, under the shared lock.
+    fn read(
+        config: &Config,
+        provider: &F,
+        engine: &Engine,
+        call: Call,
+        now: Timestamp,
+    ) -> Result<Outcome, HostError> {
+        let _ = now;
+        match call {
             Call::Recall { query, k } => {
-                let provider = (self.provider)(&self.config)?;
-                command::recall(&self.engine, &query, k, &provider)
+                let provider = provider(config)?;
+                command::recall(engine, &query, k, &provider)
             }
             Call::About {
                 entity,
                 attribute,
                 valid_at,
                 as_of,
-            } => command::about(&self.engine, entity, &attribute, valid_at, as_of),
-            Call::Reviews => command::review_list(&self.engine),
-            Call::ResolveReview { id, same } => {
-                if same {
-                    command::review_confirm(&mut self.engine, id)
-                } else {
-                    command::review_reject(&mut self.engine, id)
-                }
-            }
+            } => command::about(engine, entity, &attribute, valid_at, as_of),
+            Call::Reviews => command::review_list(engine),
+            other => unreachable!("{other:?} writes"),
         }
     }
 }

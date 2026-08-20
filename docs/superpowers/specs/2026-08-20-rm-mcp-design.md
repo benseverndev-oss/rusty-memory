@@ -242,18 +242,16 @@ construction rather than by sanitising afterwards.
 The server exits when stdin reaches EOF. The spec calls that the primary
 graceful-shutdown signal and the only portable one.
 
-**One writer.** The engine is held in memory for the life of the process and
-written back after any tool that changed it, through the same
-write-temp-then-rename `rm_host::store::save` the CLI uses. Two servers, or a
-server and a `rmem` invocation, against one `memory.json` will lose writes: the
-second to save overwrites what the first learned, and neither notices. `rm-cli`
-already records that there is no lock file; this makes the same limit easier to
-hit, so it is stated here and in the README rather than discovered.
-
-Reloading the store on every call would narrow it and was considered. It does
-not close it — two processes can still interleave read-modify-write — and it
-pays a full snapshot parse and index rebuild per tool call for a race it only
-makes less likely. A lock file is the fix, and it is a separate change.
+**One writer at a time.** *(Resolved after this spec was written — see
+`rm_host::store`.)* The original design held the engine in memory for the life
+of the process and named the resulting lost-update window as a limit, adding
+that "a lock file is the fix, and it is a separate change". That change has
+landed, and it found the note half wrong: a lock file alone would not have
+fixed it. A server holding an engine across calls has a snapshot that goes
+stale the moment another process writes, so locking the save would have
+serialised writing that stale snapshot over the other process's work. The fix
+is a lock held across the whole read-modify-write, which forces the reload the
+note had dismissed as insufficient. Both, or neither.
 
 **No cancellation.** `notifications/cancelled` is accepted and ignored: the loop
 handles one request at a time, so by the time a cancellation is read the request

@@ -28,7 +28,9 @@
 //! `{dimension}` and `{metric:?}` in the mismatch messages stay: they are a
 //! `usize` and a two-variant enum `Config::metric` has already validated, so
 //! neither can carry file text whatever is written in the file.
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rm_engine::{Engine, Metric, Policy, Ruleset, VectorIndex};
 
@@ -91,6 +93,181 @@ pub fn load(
     }
 }
 
+/// How long to wait for another process to finish before giving up.
+///
+/// Bounded rather than indefinite. Every holder of this lock is doing a load,
+/// an in-memory operation and a save — milliseconds — so a wait this long
+/// means the other side is wedged, not busy, and blocking forever on it turns
+/// one stuck process into two. Long enough that honest contention never
+/// surfaces to a user; short enough that a wedged holder is reported rather
+/// than waited out.
+const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// The sidecar file the lock is taken on.
+///
+/// Deliberately *not* the store file. [`save`] replaces the store through a
+/// rename, so a lock held on it is a lock on an inode that the next save
+/// unlinks: the second writer would take a lock on the new file, hold something
+/// the first writer has never heard of, and both would believe they were alone.
+/// The sidecar is created once and never renamed, so every process locks the
+/// same inode for as long as the store exists.
+/// Public because it is operationally visible: a user who lists the directory
+/// sees this file, and someone debugging a stuck store needs to know which
+/// path to look at. It holds no data and is never read.
+pub fn lock_path(store: &Path) -> PathBuf {
+    store.with_extension("json.lock")
+}
+
+/// An advisory lock over one store, released when this value is dropped.
+///
+/// # Why an OS lock and not a lock file we create and delete
+///
+/// The obvious implementation — create a file with `create_new`, delete it on
+/// the way out — is atomic enough to be tempting and has a failure mode worse
+/// than the bug it fixes: a process that is killed, panics, or loses power
+/// leaves the file behind, and every later run refuses to start against a
+/// holder that no longer exists. Recovering means telling a user to delete a
+/// file, which is both an unpleasant thing to document and an invitation to
+/// delete it while a real holder is running.
+///
+/// An OS advisory lock has no stale state to recover from. The kernel drops it
+/// when the file descriptor closes, which happens on `Drop`, on `panic`, on
+/// `SIGKILL` and on power loss alike. That property was checked rather than
+/// assumed: a holder killed with `SIGKILL`, leaving the lock file on disk,
+/// releases the lock to the next process.
+///
+/// Advisory, so it binds the processes that ask. Everything that writes this
+/// store goes through this module, and anything editing `memory.json` by hand
+/// was never going to be coordinated with.
+#[derive(Debug)]
+pub struct Lock {
+    file: File,
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // Best effort, and unimportant: closing the descriptor releases the
+        // lock whatever this returns. Explicit so the release is visible at
+        // the point it happens rather than implied by a field going away.
+        let _ = self.file.unlock();
+    }
+}
+
+impl Lock {
+    /// Take the lock, waiting up to [`LOCK_WAIT`] for a holder to finish.
+    ///
+    /// `exclusive` for anything that will write; a shared lock otherwise, so
+    /// that reading the store while another process reads it does not
+    /// serialise, and reading it *while it is being written* still waits.
+    fn acquire(store: &Path, exclusive: bool) -> Result<Self, HostError> {
+        Self::acquire_within(store, exclusive, LOCK_WAIT)
+    }
+
+    /// [`Lock::acquire`], with the wait as an argument.
+    ///
+    /// Separate so the tests can state a contention case without spending
+    /// [`LOCK_WAIT`] proving it. Private: the bound is a property of the
+    /// operation, not something a caller should be choosing per call site.
+    fn acquire_within(store: &Path, exclusive: bool, wait: Duration) -> Result<Self, HostError> {
+        let path = lock_path(store);
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| {
+                HostError::Store(format!("could not open the lock file beside {WHERE}: {e}"))
+            })?;
+
+        let deadline = Instant::now() + wait;
+        let mut backoff = Duration::from_millis(1);
+        loop {
+            let attempt = if exclusive {
+                file.try_lock()
+            } else {
+                file.try_lock_shared()
+            };
+            // `TryLockError` separates "someone holds it" from "the lock is
+            // broken" in the type, so the two cannot be confused for each
+            // other here the way an `ErrorKind` comparison could.
+            match attempt {
+                Ok(()) => return Ok(Lock { file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(HostError::Store(format!(
+                            "another process is using {WHERE} and has held it for more than {:.0?} -- rmem and rmem-mcp share one store and take turns, so this usually means the other one is wedged rather than busy. Nothing was written.",
+                            wait
+                        )));
+                    }
+                    std::thread::sleep(backoff);
+                    // Capped so a long wait is still responsive rather than
+                    // sleeping through the deadline it is measured against.
+                    backoff = (backoff * 2).min(Duration::from_millis(50));
+                }
+                // Not contention: the lock file itself is unusable, which is a
+                // different problem and must not be reported as a busy peer.
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(HostError::Store(format!("could not lock {WHERE}: {e}")))
+                }
+            }
+        }
+    }
+}
+
+/// Read the store, run `f` over it, and write it back — all under one lock.
+///
+/// # The lock has to span the read as well as the write
+///
+/// Locking [`save`] alone would look like a fix and not be one. The failure
+/// this closes is a lost update, not a torn file:
+///
+/// ```text
+/// A: load ................................ save   <- writes what it read
+/// B:        load ... change ... save              <- and this is gone
+/// ```
+///
+/// Both saves are individually fine. What is lost is B's change, because A's
+/// snapshot predates it and A never looked again. Only a lock held across the
+/// whole read-modify-write stops that, which is why this is a closure and not
+/// a pair of functions a caller is trusted to bracket.
+///
+/// It also means a caller cannot keep the [`Engine`] afterwards: the borrow
+/// ends with the lock. That is the point rather than a limitation — an engine
+/// outliving its lock is exactly the stale snapshot above.
+pub fn with_write<T>(
+    path: &Path,
+    ruleset: Ruleset,
+    policy: Policy,
+    dimension: usize,
+    metric: Metric,
+    f: impl FnOnce(&mut Engine) -> Result<T, HostError>,
+) -> Result<T, HostError> {
+    let _lock = Lock::acquire(path, true)?;
+    let mut engine = load(path, ruleset, policy, dimension, metric)?;
+    let out = f(&mut engine)?;
+    save(path, &engine)?;
+    Ok(out)
+}
+
+/// Read the store and run `f` over it, under a shared lock.
+///
+/// Shared, so several readers do not queue behind each other, and a reader
+/// still waits for a writer that is mid-save rather than reading whatever the
+/// rename left behind.
+pub fn with_read<T>(
+    path: &Path,
+    ruleset: Ruleset,
+    policy: Policy,
+    dimension: usize,
+    metric: Metric,
+    f: impl FnOnce(&Engine) -> Result<T, HostError>,
+) -> Result<T, HostError> {
+    let _lock = Lock::acquire(path, false)?;
+    let engine = load(path, ruleset, policy, dimension, metric)?;
+    f(&engine)
+}
+
 /// Write the store to `path`.
 ///
 /// Through a temporary file in the same directory, then renamed over the
@@ -103,9 +280,10 @@ pub fn load(
 /// temporary file is never fsynced, and neither is the directory, so a
 /// filesystem is free to commit the rename before the bytes it points at:
 /// after a crash the store can be an empty or truncated file where the
-/// previous snapshot used to be. Named rather than fixed, alongside "no lock
-/// file", because both are the same kind of honest limit — a CLI a person
-/// runs at a prompt loses the turn it was in the middle of either way, and
+/// previous snapshot used to be. Named rather than fixed — the lock that used
+/// to be named beside it is now [`with_write`], and this one is a different
+/// kind of limit: a CLI a person runs at a prompt loses the turn it was in the
+/// middle of either way, and
 /// paying two fsyncs on every `remember` to narrow a window that closes on
 /// the next command is not obviously the right trade. Anything that needs it
 /// should fsync the temporary file before the rename and the directory
@@ -144,6 +322,182 @@ mod tests {
         let (r, p, d, m) = engine_parts();
         let engine = load(&dir.path().join("absent.json"), r, p, d, m).unwrap();
         assert_eq!(engine.entity_count(), 0);
+    }
+
+    // ---- the lock -----------------------------------------------------------
+
+    /// Short enough that a contention test costs milliseconds rather than
+    /// [`LOCK_WAIT`], long enough that a slow machine does not fail it.
+    const BRIEF: Duration = Duration::from_millis(60);
+
+    fn observation(value: &str, at: rm_engine::Timestamp) -> rm_engine::Observation {
+        rm_engine::Observation {
+            kind: "person".to_string(),
+            mention: rm_engine::Record::new().with("name", "Ben Severn"),
+            attribute: "employer".to_string(),
+            value: Some(value.to_string()),
+            valid: rm_engine::Interval::since(at),
+            provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, at, "test"),
+            embedding: vec![1.0, 0.0, 0.0],
+        }
+    }
+
+    #[test]
+    fn an_exclusive_lock_excludes_a_second_one() {
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+
+        let held = Lock::acquire_within(&path, true, BRIEF).unwrap();
+        let second = Lock::acquire_within(&path, true, BRIEF);
+        assert!(second.is_err(), "a second exclusive lock was granted");
+
+        // And the refusal says what is happening and that nothing was lost,
+        // because this is the one message a user hits during normal use.
+        let HostError::Store(why) = second.unwrap_err() else {
+            panic!("expected a store error")
+        };
+        assert!(why.contains("another process is using"), "{why}");
+        assert!(why.contains("Nothing was written"), "{why}");
+
+        // Released on drop, so the next caller gets it.
+        drop(held);
+        assert!(Lock::acquire_within(&path, true, BRIEF).is_ok());
+    }
+
+    #[test]
+    fn readers_do_not_queue_behind_each_other_but_do_behind_a_writer() {
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+
+        let reader = Lock::acquire_within(&path, false, BRIEF).unwrap();
+        assert!(
+            Lock::acquire_within(&path, false, BRIEF).is_ok(),
+            "two readers must not serialise"
+        );
+        assert!(
+            Lock::acquire_within(&path, true, BRIEF).is_err(),
+            "a writer must wait for a reader"
+        );
+        drop(reader);
+
+        let writer = Lock::acquire_within(&path, true, BRIEF).unwrap();
+        assert!(
+            Lock::acquire_within(&path, false, BRIEF).is_err(),
+            "a reader must wait for a writer -- mid-save is exactly when the \
+             file on disk is not the store"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn the_lock_is_a_sidecar_that_save_does_not_disturb() {
+        // `save` replaces the store through a rename. A lock taken on the
+        // store file itself would be a lock on an unlinked inode afterwards,
+        // and the next process would lock the new file and believe it was
+        // alone. This is the property that stops that.
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+        let (r, p, d, m) = engine_parts();
+
+        let held = Lock::acquire_within(&path, true, BRIEF).unwrap();
+        let engine = load(&path, r, p, d, m).unwrap();
+        save(&path, &engine).unwrap();
+
+        assert!(
+            Lock::acquire_within(&path, true, BRIEF).is_err(),
+            "the lock did not survive a save"
+        );
+        drop(held);
+        assert_ne!(
+            lock_path(&path),
+            path,
+            "the lock must not be the store file"
+        );
+    }
+
+    // ---- the brackets -------------------------------------------------------
+
+    #[test]
+    fn with_write_persists_and_with_read_does_not() {
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+
+        let (r, p, d, m) = engine_parts();
+        with_write(&path, r, p, d, m, |engine| {
+            engine.remember(observation("Acme", 1)).unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        let (r, p, d, m) = engine_parts();
+        let after_write = with_read(&path, r, p, d, m, |engine| Ok(engine.snapshot())).unwrap();
+
+        // A change made inside `with_read` reaches nothing: the engine is a
+        // local value the bracket drops without saving.
+        let (r, p, d, m) = engine_parts();
+        with_read(&path, r, p, d, m, |engine| {
+            assert!(engine.snapshot().contains("Acme"));
+            Ok(())
+        })
+        .unwrap();
+
+        let (r, p, d, m) = engine_parts();
+        let unchanged = with_read(&path, r, p, d, m, |engine| Ok(engine.snapshot())).unwrap();
+        assert_eq!(after_write, unchanged);
+    }
+
+    #[test]
+    fn a_second_write_sees_the_first_rather_than_overwriting_it() {
+        // The lost update this whole arrangement exists to prevent. Both calls
+        // load inside their own lock, so the second reads what the first
+        // wrote; the API gives a caller no way to hold an engine across the
+        // boundary and save a snapshot that predates someone else's work.
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+
+        for (value, at) in [("Acme", 1), ("Globex", 2)] {
+            let (r, p, d, m) = engine_parts();
+            with_write(&path, r, p, d, m, |engine| {
+                engine.remember(observation(value, at)).unwrap();
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let (r, p, d, m) = engine_parts();
+        let snapshot = with_read(&path, r, p, d, m, |engine| Ok(engine.snapshot())).unwrap();
+        assert!(snapshot.contains("Acme"), "the first write was lost");
+        assert!(snapshot.contains("Globex"), "the second write was lost");
+    }
+
+    #[test]
+    fn a_failing_closure_writes_nothing_and_frees_the_lock() {
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+
+        let (r, p, d, m) = engine_parts();
+        let out: Result<(), HostError> = with_write(&path, r, p, d, m, |engine| {
+            engine.remember(observation("Acme", 1)).unwrap();
+            Err(HostError::Store("refused".to_string()))
+        });
+        assert!(out.is_err());
+        assert!(!path.exists(), "a refused write must not create the store");
+        assert!(
+            Lock::acquire_within(&path, true, BRIEF).is_ok(),
+            "the lock outlived the failure"
+        );
+    }
+
+    #[test]
+    fn a_bracket_over_a_store_that_does_not_exist_yet_still_works() {
+        // `load` treats a missing file as an empty store, and the lock is
+        // taken before that decision, so the very first command is not a
+        // special case either.
+        let dir = TempDir::new();
+        let path = dir.path().join("memory.json");
+        let (r, p, d, m) = engine_parts();
+        with_write(&path, r, p, d, m, |_| Ok(())).unwrap();
+        assert!(path.exists());
     }
 
     #[test]

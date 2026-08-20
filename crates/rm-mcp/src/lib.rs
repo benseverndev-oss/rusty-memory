@@ -27,17 +27,29 @@
 //! model can act on. `Believed::Unknown` is not an error at all: the store was
 //! asked and has no opinion, which is an answer.
 //!
-//! # One writer
+//! # One writer at a time
 //!
-//! The engine is held in memory for the life of the process and written back
-//! after any tool that changed it. Two servers, or a server and a `rmem`
-//! invocation, against one `memory.json` will lose writes: the second to save
-//! overwrites what the first learned and neither notices. `rm-cli` already
-//! records that there is no lock file; a long-lived process makes the same
-//! limit easier to hit, so it is said here too rather than discovered. Fixing
-//! it means a lock file, not a reload-per-call — reloading narrows the window
-//! without closing it, and pays a snapshot parse and an index rebuild on every
-//! tool call for the privilege.
+//! The store is re-read under a lock on every call and written back before the
+//! lock is released, so a `rmem` invocation and this server can share one
+//! `memory.json` without either losing what the other learned. `rm_host::store`
+//! carries the reasoning; what matters here is that the engine is *not* held
+//! across calls, and holding it was the bug rather than the optimisation it
+//! looked like.
+//!
+//! This section used to say the fix was "a lock file, not a reload-per-call".
+//! That was wrong twice over. They are not alternatives: a lock around the save
+//! alone would have faithfully serialised writing a stale snapshot over another
+//! process's work, because a server holding an engine for the life of the
+//! process has a snapshot that goes stale the moment anything else writes. Only
+//! reloading *and* locking closes it.
+//!
+//! The cost that note named is real and is now paid on purpose: a snapshot
+//! parse and an index rebuild per tool call, on a turn that has already spent
+//! hundreds of milliseconds on an embedding API.
+//!
+//! What is still true is that the wait is bounded. A call that cannot take the
+//! lock within `rm_host::store`'s deadline comes back as a refusal saying so,
+//! rather than blocking a client forever behind a wedged peer.
 
 pub mod jsonrpc;
 pub mod render;
