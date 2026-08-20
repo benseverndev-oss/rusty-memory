@@ -1,4 +1,32 @@
 //! Reading and writing the store file.
+//!
+//! # The one config value this crate still prints
+//!
+//! `config.rs` refuses to repeat a value read out of `rmem.toml` in any error
+//! message: eight credential leaks on this branch came out of doing exactly
+//! that, each closed one shape at a time until the rule was made categorical.
+//! A refusal names a field, a location, or nothing.
+//!
+//! The messages below name `[store] path`, and that is a deliberate exception
+//! rather than one the sweep missed. A filesystem path in an IO error *is* the
+//! location — it is the direct analogue of the line and column `Config::parse`
+//! reports — and it is the only config value with no substitute: the path is
+//! usually relative, so "the path named in rmem.toml could not be read" leaves
+//! a reader unable to tell which directory was tried.
+//!
+//! What makes that trade acceptable rather than merely convenient is where the
+//! exposure actually is. Every message here except `save`'s requires a file to
+//! already exist at that path; a path that is not there takes the `NotFound`
+//! branch below and is not an error at all, which is what a pasted credential
+//! would produce. Verified by driving it: a key written into `[store] path`
+//! makes `rmem review` print `no open questions` and exit 0. And unlike
+//! `api_key_env`, nothing about this field invites a key — reaching it means
+//! overwriting a meaningful value rather than adding a line, and appending to
+//! the end of `rmem.toml` lands in `[policy.attribute]`, which is closed.
+//!
+//! `{dimension}` and `{metric:?}` in the mismatch messages are a `usize` and a
+//! two-variant enum that `Config::metric` has already validated, so neither
+//! can carry file text whatever is written in the file.
 
 use std::path::Path;
 
