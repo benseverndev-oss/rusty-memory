@@ -158,7 +158,7 @@ mod tests {
         ] {
             let result = go(&config, &args);
             assert!(
-                !matches!(result, Err(CliError::MissingKey(_))),
+                !matches!(result, Err(CliError::MissingKey)),
                 "{args:?} demanded an API key it never uses: {result:?}"
             );
         }
@@ -178,7 +178,7 @@ mod tests {
         ] {
             let err = go(&config, &args).unwrap_err();
             assert!(
-                !matches!(err, CliError::MissingKey(_)),
+                !matches!(err, CliError::MissingKey),
                 "{args:?} demanded an API key it never uses: {err}"
             );
             assert!(
@@ -199,10 +199,14 @@ mod tests {
         for args in [vec!["remember", "I moved"], vec!["recall", "jobs"]] {
             let err = go(&config, &args).unwrap_err();
             assert!(
-                matches!(err, CliError::MissingKey(_)),
+                matches!(err, CliError::MissingKey),
                 "{args:?} should have asked for the key: {err}"
             );
-            assert!(err.to_string().contains(NO_SUCH_VARIABLE), "{err}");
+            // The field, not the variable it names: the name is a value out
+            // of `rmem.toml`, and the likeliest way to get that file wrong is
+            // to write the key where the name belongs.
+            assert!(err.to_string().contains("api_key_env"), "{err}");
+            assert!(!err.to_string().contains(NO_SUCH_VARIABLE), "{err}");
         }
     }
 

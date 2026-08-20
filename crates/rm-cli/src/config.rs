@@ -297,25 +297,35 @@ impl Config {
         // `api_key_env` holds the NAME of a variable, and the likeliest way to
         // get this file wrong is to put the key there instead -- the field is
         // called `api_key_env` and a key is what you have in your hand.
-        // `CliError::MissingKey` then printed it verbatim, because a name is
-        // exactly what that message exists to tell you. Driven: a key pasted
-        // there reached stderr in full.
         //
-        // Checked as a validation rather than as a secret detector, which is
-        // the distinction that makes it safe to act on. An environment
-        // variable's name is letters, digits and underscores; a value that is
-        // not one cannot be an environment variable at all, whatever else it
-        // may be, so refusing it is a statement about the field rather than a
-        // guess about the value. The message names the field and not what is
-        // in it.
+        // This check is a POSIX correctness check, not a leak defence, and the
+        // difference matters because it was once mistaken for one. It refuses
+        // a value that cannot name an environment variable: a name is
+        // `[A-Za-z_][A-Za-z0-9_]*`, so an empty string, a leading digit or any
+        // other character is refused. That is a statement about the field
+        // rather than a guess about the value, which is why it is safe to act
+        // on.
+        //
+        // What it is *not* is a filter that keeps keys out of the message
+        // below. Most real keys are legal variable names --
+        // `gsk_aBcD1234EFgh5678IJkl9012MNop3456`, `hf_QRstUVwx7890YZab1234`, a
+        // 32-character hex Azure or Mistral key -- and sail straight through.
+        // Only the hyphenated `sk-...` shape is caught, which is the one shape
+        // the first version of this guard was tested with, and that is why it
+        // was reported closed when it was closed for one format out of
+        // several. `CliError::MissingKey` no longer names the variable at all,
+        // which is what actually closes it, for every key format that exists
+        // and every one that does not exist yet.
         let name = &self.provider.api_key_env;
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        let legal = !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !legal {
             return Err(CliError::Config(
-                "rmem.toml's api_key_env must be the NAME of an environment variable -- letters, digits and underscores, like OPENAI_API_KEY -- and what is written there is not one. It is not repeated here: if what you pasted is the key itself, printing it would put it in your terminal, your scrollback and any log that catches them.".to_string(),
+                "rmem.toml's api_key_env must be the NAME of an environment variable -- letters, digits and underscores, not starting with a digit, like OPENAI_API_KEY -- and what is written there cannot be one. It is not repeated here: if what you pasted is the key itself, printing it would put it in your terminal, your scrollback and any log that catches them.".to_string(),
             ));
         }
-        let key = std::env::var(name)
-            .map_err(|_| CliError::MissingKey(self.provider.api_key_env.clone()))?;
+        let key = std::env::var(name).map_err(|_| CliError::MissingKey)?;
         Ok(HttpProvider::new(
             self.provider.base_url.clone(),
             key,
@@ -643,30 +653,86 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
     }
 
     #[test]
-    fn a_key_written_where_its_variable_name_belongs_is_refused_without_being_printed() {
-        // The likeliest way to get this file wrong: the field is called
-        // `api_key_env` and a key is what you have in your hand. The refusal
-        // then printed it, because naming the variable is exactly what that
-        // message exists to do.
+    fn a_variable_name_posix_forbids_is_refused_as_a_config_error_not_as_a_missing_key() {
+        // The POSIX check is a correctness check and nothing more. Its whole
+        // claim is that these values cannot name an environment variable, so
+        // it refuses them as a broken config rather than reporting the
+        // variable as unset -- which would be a message about the environment
+        // for a fault that is in the file.
         //
-        // Refused as a validation, not as a secret detector: an environment
-        // variable's name is letters, digits and underscores, so this value
-        // cannot be one whatever else it is.
-        let mut config = parse(TEMPLATE).unwrap();
-        config.provider.api_key_env = "sk-PASTED-FAKE-SECRET-IN-THE-ENV-FIELD".to_string();
-        let err = match config.provider() {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected a refusal"),
-        };
-        assert!(
-            !err.contains("sk-PASTED-FAKE-SECRET"),
-            "the pasted value reached the message: {err}"
-        );
-        assert!(err.contains("api_key_env"), "{err}");
-        assert!(
-            err.contains("OPENAI_API_KEY"),
-            "it has to show what a variable name looks like: {err}"
-        );
+        // Both directions, because a check that refuses everything would pass
+        // half of this and a check that refuses nothing would pass the other.
+        for illegal in ["", "9LEADING_DIGIT", "HAS-A-HYPHEN", "HAS SPACE", "H$"] {
+            let mut config = parse(TEMPLATE).unwrap();
+            config.provider.api_key_env = illegal.to_string();
+            match config.provider() {
+                Err(CliError::Config(_)) => {}
+                Err(other) => panic!("{illegal:?} should be a config error, got {other:?}"),
+                Ok(_) => panic!("{illegal:?} cannot name an environment variable"),
+            }
+        }
+        for legal in ["_UNDERSCORE_FIRST", "A9", "RMEM_TEST_DEFINITELY_UNSET"] {
+            let mut config = parse(TEMPLATE).unwrap();
+            config.provider.api_key_env = legal.to_string();
+            match config.provider() {
+                Err(CliError::MissingKey) => {}
+                Err(other) => panic!("{legal:?} is a legal name, got {other:?}"),
+                Ok(_) => panic!("{legal:?} is not a variable anything sets"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_written_where_its_variable_name_belongs_is_never_printed_in_any_format() {
+        // The likeliest way to get this file wrong: the field is called
+        // `api_key_env` and a key is what you have in your hand.
+        //
+        // The previous version of this test used one hyphenated `sk-...`
+        // fixture, and passed -- because the POSIX name check happens to
+        // refuse a hyphen. Every other key format in wide use is a legal
+        // environment-variable name and sailed through to a message that
+        // printed it. So the fixtures here are deliberately several shapes,
+        // and the assertion is on the message rather than on which branch
+        // produced it: whether a value is refused as an illegal name or
+        // accepted and then found unset, it must not come back out.
+        for key in [
+            // Groq, and the general `prefix_alnum` shape: a legal name.
+            "gsk_aBcD1234EFgh5678IJkl9012MNop3456",
+            // Hugging Face: also a legal name.
+            "hf_QRstUVwx7890YZab1234",
+            // Azure OpenAI and Mistral: 32 hex characters, a legal name.
+            "0123456789abcdef0123456789abcdef",
+            // A leading digit makes this one illegal as a name, which POSIX
+            // already says; it must still not be echoed.
+            "9sk0000FAKE1111SECRET2222LEAKCHECK",
+            // OpenAI's hyphenated shape, the only one the first guard caught.
+            "sk-proj-FAKE-SECRET-LEAK-CHECK-9999",
+            // An OpenAI project key at its real length, ~164 characters.
+            "sk-proj-FAKESECRETLEAKCHECK0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        ] {
+            let mut config = parse(TEMPLATE).unwrap();
+            config.provider.api_key_env = key.to_string();
+            // Not `.unwrap_err()`: that needs `HttpProvider: Debug` for the
+            // panic message on the `Ok` arm, and `HttpProvider` deliberately
+            // has no `Debug` impl so the key it holds can never end up in one.
+            let err = match config.provider() {
+                Err(e) => e,
+                Ok(_) => panic!("a variable named after a key cannot be set"),
+            };
+            let text = err.to_string();
+            assert!(
+                !text.contains(key),
+                "the value written in api_key_env came back out: {text}"
+            );
+            // And not through `Debug` either, which is where a payload on the
+            // error variant would have leaked whatever `Display` withheld.
+            let debug = format!("{err:?}");
+            assert!(
+                !debug.contains(key),
+                "the value reached the error's Debug: {debug}"
+            );
+            assert!(text.contains("api_key_env"), "{text}");
+        }
     }
 
     #[test]
@@ -775,7 +841,12 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
     }
 
     #[test]
-    fn an_unset_key_variable_names_which_variable_to_set() {
+    fn an_unset_key_variable_names_the_field_to_look_at_rather_than_its_contents() {
+        // It used to name the variable, which is the obviously helpful thing
+        // to do and is why it took six leaks to stop doing it: the name comes
+        // out of `rmem.toml`, so whenever someone had written the key there
+        // instead, the refusal printed the key. Naming the field sends the
+        // reader to the one line they need, and they can read their own file.
         let mut config = parse(TEMPLATE).unwrap();
         config.provider.api_key_env = "RMEM_TEST_DEFINITELY_UNSET".to_string();
         // Not `.unwrap_err()`: that needs `HttpProvider: Debug` for the panic
@@ -785,9 +856,12 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             Err(e) => e,
             Ok(_) => panic!("expected a missing-key error"),
         };
+        assert_eq!(err, CliError::MissingKey);
+        let text = err.to_string();
+        assert!(text.contains("api_key_env"), "{text}");
         assert!(
-            err.to_string().contains("RMEM_TEST_DEFINITELY_UNSET"),
-            "{err}"
+            !text.contains("RMEM_TEST_DEFINITELY_UNSET"),
+            "even an innocuous name is a value out of the file: {text}"
         );
     }
 
