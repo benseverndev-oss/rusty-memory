@@ -16,29 +16,34 @@ When the store learns the user moved from Acme to Globex, most systems have to
 pick a winner. This one does not have to:
 
 ```rust
-use rm_core::{Provenance, Source};
-use rm_survivor::{merge, Candidate, Strategy};
+use rm_engine::{Believed, Engine, Policy, Strategy};
 
-let march = Provenance::new(Source::UserAssertion, 1_710_000_000_000, "session-1");
-let july = Provenance::new(Source::UserAssertion, 1_720_000_000_000, "session-9");
+let mut engine = Engine::new(index, ruleset, Policy::new(Strategy::ValidInterval));
 
-let outcome = merge(
-    &[
-        Candidate::new(Some("Acme"), &march),
-        Candidate::new(Some("Globex"), &july),
-    ],
-    &Strategy::ValidInterval,
-)
-.unwrap();
+// March. The first thing we hear about someone is a new entity.
+engine.remember(told("Acme", MARCH))?;
 
-assert_eq!(outcome.as_of(1_715_000_000_000), Some("Acme"));   // in May
-assert_eq!(outcome.as_of(1_725_000_000_000), Some("Globex")); // in August
+// July, months later. Resolution recognises the same person.
+engine.remember(told("Globex", JULY))?;
+
+assert_eq!(engine.about(person, "employer", MAY,    NOW)?, Believed::Value("Acme".into()));
+assert_eq!(engine.about(person, "employer", AUGUST, NOW)?, Believed::Value("Globex".into()));
 ```
 
-(That example runs as a test: `crates/rm-survivor/tests/readme.rs`.)
+Neither fact was discarded and nothing was rewritten. Both are stored with
+disjoint validity, and the store answers by time — contradiction resolution is a
+query, not a lossy write. Ask the same history under `Strategy::MostRecent`
+instead and it names one winner at every instant, from the same stored versions:
 
-Both facts are kept, with disjoint validity ranges, and the store answers by
-time. Contradiction resolution is a query, not a lossy write.
+```rust
+engine.about_under(&Policy::new(Strategy::MostRecent), person, "employer", MAY, NOW)?
+// => Believed::Value("Globex")
+```
+
+(The full version of the first example runs as a test:
+`crates/rm-engine/tests/readme.rs`. `Believed` has three states, not two —
+`Value`, `Absent`, and `Unknown` — because "they have no employer" and "we have
+never discussed it" are different answers.)
 
 ## Crates
 
@@ -47,7 +52,7 @@ time. Contradiction resolution is a query, not a lossy write.
 | `rm-core` | in progress | Provenance and the bi-temporal model |
 | `rm-survivor` | in progress | Survivorship strategies |
 | `rm-store` | in progress | Bi-temporal record store with attribute history |
-| `rm-graph` | planned | Entity graph, k-hop retrieval |
+| `rm-graph` | in progress | Entity graph, k-hop retrieval |
 | `rm-resolve` | in progress | Probabilistic entity resolution, with a review band |
 | `rm-index` | in progress | Exact vector search: deletion, filtering, persistence |
 | `rm-extract` | planned | Turn → mentions/edges. The only networked crate. |

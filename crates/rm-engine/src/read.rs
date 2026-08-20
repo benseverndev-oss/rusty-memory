@@ -101,6 +101,32 @@ impl Engine {
         valid_t: Timestamp,
         tx_t: Timestamp,
     ) -> Result<Believed, EngineError> {
+        self.about_under(&self.policy, entity, attribute, valid_t, tx_t)
+    }
+
+    /// The same question, answered under a policy the engine does not hold.
+    ///
+    /// This is the crate's central claim made callable: the *same* stored
+    /// history reads as one winner under [`Strategy::MostRecent`] and as a
+    /// timeline under [`Strategy::ValidInterval`], and a caller can ask both
+    /// ways in successive lines without anything being rewritten between them.
+    ///
+    /// [`Engine::with_policy`] can express the same thing but consumes the
+    /// engine, so demonstrating the contrast means moving it there and back —
+    /// which reads as though the engine were being reconfigured, when the point
+    /// is that it is not. Nothing about the store changes here; only the
+    /// question does.
+    ///
+    /// [`Strategy::MostRecent`]: rm_survivor::Strategy::MostRecent
+    /// [`Strategy::ValidInterval`]: rm_survivor::Strategy::ValidInterval
+    pub fn about_under(
+        &self,
+        policy: &Policy,
+        entity: StableId,
+        attribute: &str,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+    ) -> Result<Believed, EngineError> {
         // Only what we had by tx_t. Later knowledge does not leak backwards.
         let versions: Vec<_> = self
             .store
@@ -132,7 +158,7 @@ impl Engine {
         // A refusal propagates rather than falling back to a looser strategy:
         // a memory chosen by a rule the caller did not ask for is exactly the
         // plausible-looking wrong answer the refusals exist to prevent.
-        let outcome = merge(&candidates, self.policy.for_attribute(attribute))?;
+        let outcome = merge(&candidates, policy.for_attribute(attribute))?;
         Ok(match outcome.held_at(valid_t) {
             // `held_at`, not `as_of`: `as_of` collapses an asserted absence
             // into `None`, the same shape as no coverage at all. `Believed`
@@ -144,10 +170,14 @@ impl Engine {
         })
     }
 
-    /// The same engine reading under a different policy.
+    /// The same engine reading under a different policy from now on.
     ///
     /// Cheap because nothing was resolved on write: changing the rule changes
     /// the answer without touching a single stored version.
+    ///
+    /// Consumes the engine, so it suits setting a default once. To ask one
+    /// history two ways without moving the engine anywhere, use
+    /// [`Engine::about_under`].
     pub fn with_policy(mut self, policy: Policy) -> Self {
         self.policy = policy;
         self

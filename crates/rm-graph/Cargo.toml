@@ -1,0 +1,13 @@
+[package]
+name = "rm-graph"
+version = "0.0.0"
+description = "Deterministic k-hop traversal over rusty-memory's bi-temporal edges"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rm-core = { workspace = true }
+rm-store = { workspace = true }

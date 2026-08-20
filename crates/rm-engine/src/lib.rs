@@ -47,18 +47,20 @@ pub use review::{PendingReview, ReviewId, Settled};
 // every one of these types appears in this crate's own signatures: `Ruleset`
 // and `VectorIndex` in `new`, `Record`/`Interval`/`Provenance` in
 // `Observation`, `StableId` in nearly everything, `Version` in the return type
-// of `store_history`. A caller could not name the last of those at all without
-// adding `rm-store` to their manifest, which makes an internal decomposition —
-// five crates instead of one — into something the caller has to know about and
-// track. `tests/readme.rs` exists to prove the public API is sufficient, and it
+// of `store_history`, `Edge` in `edges_from` and `edges_into`, and
+// `EdgeVersion` in `edge_history`. A caller could not name the last of those at
+// all without adding `rm-store` to their manifest, which makes an internal
+// decomposition — five crates instead of one — into something the caller has to
+// know about and track. `tests/readme.rs` exists to prove the public API is sufficient, and it
 // was importing four sibling crates to compile.
 //
 // Only the surface those signatures reach is re-exported. `MemoryStore`,
 // `Outcome` and the rest stay behind the engine, which owns them.
 pub use rm_core::{Interval, Provenance, Source, Timestamp};
+pub use rm_graph::{Direction, Neighborhood, Reached, Walk};
 pub use rm_index::{IndexError, Metric, VectorIndex};
 pub use rm_resolve::{BlockingKey, Comparator, FieldRule, Record, Ruleset};
-pub use rm_store::{StableId, StoreError, Version};
+pub use rm_store::{Edge, EdgeVersion, StableId, StoreError, Version};
 pub use rm_survivor::{Refused, Strategy};
 
 /// Identifies one stored assertion. Doubles as the vector index's `EntryId`, so
@@ -85,8 +87,9 @@ pub enum EngineError {
     /// A write named an entity that does not exist.
     ///
     /// The write-path error, and only the write path: naming a nonexistent
-    /// entity in [`Engine::forget`], [`Engine::erase`] or [`Engine::confirm`]
-    /// is a bug in the caller and is reported as one. Asking *about* one is
+    /// entity in [`Engine::forget`], [`Engine::erase`], [`Engine::erase_edges`],
+    /// [`Engine::relate`], [`Engine::unrelate`] or [`Engine::confirm`] is a bug
+    /// in the caller and is reported as one. Asking *about* one is
     /// not — [`Engine::about`] answers [`Believed::Unknown`], because "I have
     /// nothing on this" is a true and useful answer to a question where it
     /// would be a silent no-op if accepted as an instruction. `rm_store` draws
@@ -447,6 +450,16 @@ impl Engine {
             self.store.erase(absorbed, attribute).map_err(on_write)?;
         }
 
+        // Edges follow the merge. Left alone they name an id nothing resolves,
+        // and a walk would cross into it — the same class of defect as leaving
+        // an assertion pointing at a stale version index: a well-formed wrong
+        // answer with nothing to raise an error about. Done here, after both
+        // ids are still meaningful (the absorbed entity is not erased from the
+        // store) and before `adopt_assertions` renumbers the version logs, so
+        // repointing edges — which touches only the store's edge tables — has
+        // no way to disturb the offsets that renumbering depends on.
+        self.store.repoint_edges(absorbed, kept).map_err(on_write)?;
+
         // Ownership and position move together, after the copy: the offsets
         // were read before it, so the assertion map is only touched once the
         // log it points into is in its final shape.
@@ -709,6 +722,127 @@ impl Engine {
         Ok(removed)
     }
 
+    /// Destroy every edge touching `entity`, in both directions.
+    ///
+    /// The edge counterpart of [`Engine::erase`], and deliberately separate
+    /// from it: attributes and relationships are different halves of what an
+    /// entity carries, and a caller answering "what did you remove" has to be
+    /// able to say which. A combined "erase everything about this entity"
+    /// would leave that question unanswerable, and would also make a caller
+    /// who only wanted relationships gone pay for wiping attributes they
+    /// never asked to lose. Neither call implies the other; a caller wanting
+    /// both makes both calls.
+    ///
+    /// Nothing here touches the vector index: an edge has no text and no
+    /// embedding, exactly as [`Engine::relate`] notes, so there is nothing
+    /// for `drop_vectors` to find.
+    ///
+    /// # Errors
+    ///
+    /// [`EngineError::UnknownEntity`] if `entity` names no entity the store
+    /// holds — see `rm_store::MemoryStore::erase_edges` for why that, and not
+    /// a bare `Ok(0)`, is what an unknown id gets. Named rather than linked,
+    /// as [`Engine::erase`] names `erase`: `MemoryStore` is deliberately not
+    /// re-exported, so a link would take a reader to a type they cannot write
+    /// down without adding `rm-store` to their manifest.
+    pub fn erase_edges(&mut self, entity: StableId) -> Result<usize, EngineError> {
+        self.store.erase_edges(entity).map_err(on_write)
+    }
+
+    /// Record that a relationship held between two entities.
+    ///
+    /// Delegates to the store, which rejects an endpoint it does not hold and
+    /// a self-edge. Unlike [`Engine::remember`], nothing here is indexed: an
+    /// edge has no text and no embedding, so there is no vector to keep in
+    /// step with it.
+    pub fn relate(
+        &mut self,
+        subject: StableId,
+        predicate: impl Into<String>,
+        object: StableId,
+        valid: Interval,
+        prov: Provenance,
+    ) -> Result<(), EngineError> {
+        self.store
+            .relate(subject, predicate, object, valid, prov)
+            .map_err(on_write)
+    }
+
+    /// Record that a relationship stopped holding at `at`.
+    ///
+    /// The edge counterpart of [`Engine::forget`]: a walk stops crossing it,
+    /// and [`Engine::edge_history`] still shows that it held and who said so.
+    /// Appending a tombstone rather than deleting is only defensible because
+    /// that call exists — a record no caller can read is not a record.
+    pub fn unrelate(
+        &mut self,
+        subject: StableId,
+        predicate: &str,
+        object: StableId,
+        at: Timestamp,
+        prov: Provenance,
+    ) -> Result<(), EngineError> {
+        self.store
+            .unrelate(subject, predicate, object, at, prov)
+            .map_err(on_write)
+    }
+
+    /// Entities reachable from the walk's seeds.
+    ///
+    /// Deliberately separate from [`Engine::recall`], which stays purely
+    /// semantic. Fusing them would mean ranking a two-hop neighbour against a
+    /// 0.9-cosine hit, and there is no honest ordering between those: any
+    /// single combined score is a number this crate invented and would then
+    /// have to defend. The caller knows what each is worth in its context,
+    /// and composes them — seed with `recall`, expand with this.
+    pub fn neighborhood(&self, walk: &Walk) -> Neighborhood {
+        rm_graph::neighborhood(&self.store, walk)
+    }
+
+    /// Relationships out of `subject` in force at `valid_t`, as known by
+    /// `tx_t`.
+    ///
+    /// [`Engine::neighborhood`] answers which entities a walk reaches and how
+    /// far away they are; it deliberately hands back ids and distances and
+    /// nothing else, because a walk of any depth cannot say which edge carried
+    /// it without inventing a path when several did. This is the other
+    /// question — one hop, fully described: the predicate, the interval it
+    /// held over, and who said so. A caller rendering "where does Alice work,
+    /// and on whose word" needs that and cannot reconstruct it from a
+    /// [`Reached`].
+    ///
+    /// Both axes are required and neither is defaulted, for the same reason
+    /// [`Walk`] requires them: an edge read without a `tx_t` is a claim about
+    /// now that quietly stops being reproducible.
+    pub fn edges_from(
+        &self,
+        subject: StableId,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+    ) -> Vec<Edge<'_>> {
+        self.store.edges_from(subject, valid_t, tx_t)
+    }
+
+    /// Relationships into `object` in force at `valid_t`, as known by `tx_t`.
+    ///
+    /// The mirror of [`Engine::edges_from`], answering "who works at Acme"
+    /// rather than "where does Alice work". Both directions are exposed
+    /// because the store keeps both and [`Direction`] already lets a walk go
+    /// either way: offering only the forward half would make the reverse
+    /// question answerable by traversal but not by inspection.
+    ///
+    /// An id the store does not hold has no edges rather than being an error,
+    /// exactly as [`Engine::about`] answers [`Believed::Unknown`]. Asking is
+    /// not an instruction.
+    pub fn edges_into(
+        &self,
+        object: StableId,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+    ) -> Vec<Edge<'_>> {
+        self.store.edges_into(object, valid_t, tx_t)
+    }
+
     /// Remove every indexed vector for one attribute of one entity.
     fn drop_vectors(&mut self, entity: StableId, attribute: &str) {
         let doomed: Vec<AssertionId> = self
@@ -727,6 +861,34 @@ impl Engine {
     /// an answer.
     pub fn store_history(&self, entity: StableId, attribute: &str) -> &[rm_store::Version] {
         self.store.history(entity, attribute)
+    }
+
+    /// The raw version log for one relationship, in append order.
+    ///
+    /// The edge counterpart of [`Engine::store_history`], and the call that
+    /// makes [`Engine::unrelate`] honest. `unrelate` appends a tombstone
+    /// instead of deleting, and justifies that by saying the record still
+    /// shows the relationship held and who said so — a promise worth nothing
+    /// if the only type that can read it is one the engine keeps to itself.
+    /// This is where an audit, a "why do you think that" answer, or a
+    /// correction that has to see what it is correcting reaches it.
+    ///
+    /// No time arguments, deliberately: this is the log, not a query over it.
+    /// [`Engine::edges_from`] resolves a point on both axes; asking for the
+    /// history and then filtering it is a different job, and one whose rules
+    /// the caller should be able to see rather than inherit.
+    ///
+    /// Empty for a triple never discussed. Asking about a relationship nobody
+    /// ever asserted is a question, not a mistake, and it answers the same as
+    /// a triple whose versions were erased — [`Engine::erase_edges`] destroys
+    /// the trail, which is exactly what it is documented to do.
+    pub fn edge_history(
+        &self,
+        subject: StableId,
+        predicate: &str,
+        object: StableId,
+    ) -> &[EdgeVersion] {
+        self.store.edge_history(subject, predicate, object)
     }
 }
 
@@ -1206,6 +1368,144 @@ mod tests {
     }
 
     #[test]
+    fn a_merge_repoints_edges_in_both_directions() {
+        // The absorbed entity's relationships are the survivor's now. Left
+        // alone they would point at a dead id, and a walk would follow them.
+        let mut e = engine();
+        let Remembered::Created { entity: kept, .. } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: acme, .. } = e
+            .remember(observation("Acme Corp", "kind", "company", 2))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: boss, .. } = e
+            .remember(observation("Wei Zhang", "role", "manager", 3))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let out = e.remember(ambiguous()).unwrap();
+        let Remembered::CreatedPendingReview {
+            entity: absorbed,
+            review,
+            ..
+        } = out
+        else {
+            panic!("expected a review, got {out:?}")
+        };
+
+        let prov = Provenance::new(Source::UserAssertion, 4, "s");
+        e.relate(
+            absorbed,
+            "employed_by",
+            acme,
+            Interval::since(1),
+            prov.clone(),
+        )
+        .unwrap();
+        e.relate(boss, "manages", absorbed, Interval::since(1), prov)
+            .unwrap();
+
+        let survivor = e.confirm(review[0]).unwrap();
+        assert_eq!(survivor, kept.min(absorbed));
+
+        let out_edges = e.neighborhood(&Walk::new(vec![survivor], 1, 10, 5, 5));
+        assert!(
+            out_edges.reached.iter().any(|r| r.entity == acme),
+            "outgoing followed the merge"
+        );
+
+        let in_edges =
+            e.neighborhood(&Walk::new(vec![survivor], 1, 10, 5, 5).direction(Direction::In));
+        assert!(
+            in_edges.reached.iter().any(|r| r.entity == boss),
+            "incoming followed the merge"
+        );
+
+        let dead = e.neighborhood(&Walk::new(vec![kept.max(absorbed)], 1, 10, 5, 5));
+        assert!(
+            dead.reached.len() <= 1,
+            "nothing still hangs off the absorbed id"
+        );
+    }
+
+    #[test]
+    fn a_merge_drops_an_edge_that_would_become_a_self_edge() {
+        // The two turned out to be the same person, so "A manages B" is now
+        // "A manages A" -- which relate() refuses to create, and repoint_edges
+        // must not smuggle one in through a merge instead.
+        //
+        // A walk cannot witness this: `neighborhood` inserts a seed into its
+        // `seen` set *before* it looks at that seed's own neighbours, so a
+        // survivor -> survivor edge can never be reached a second time from
+        // the survivor itself. That is a property of breadth-first search
+        // from a single seed, not a gap in this fixture -- no choice of
+        // `Direction` or hop count makes a self-edge observable that way. So
+        // this reaches for `erase_edges`'s return count instead: it is a
+        // flat scan of every edge touching the entity, self-edges included,
+        // and a phantom survivor -> survivor edge would make it count one
+        // higher than the real edges alone.
+        let mut e = engine();
+        let Remembered::Created { entity: kept, .. } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: boss, .. } = e
+            .remember(observation("Wei Zhang", "role", "manager", 2))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let out = e.remember(ambiguous()).unwrap();
+        let Remembered::CreatedPendingReview {
+            entity: absorbed,
+            review,
+            ..
+        } = out
+        else {
+            panic!("expected a review")
+        };
+
+        // Collapses into a self-edge once the merge lands, and must not
+        // survive it.
+        e.relate(
+            kept,
+            "knows",
+            absorbed,
+            Interval::since(1),
+            Provenance::new(Source::UserAssertion, 4, "s"),
+        )
+        .unwrap();
+        // Untouched by the merge, so its presence in the count tells the two
+        // cases apart: a lingering self-edge shows up as one edge too many,
+        // not as the only edge present.
+        e.relate(
+            boss,
+            "manages",
+            kept,
+            Interval::since(1),
+            Provenance::new(Source::UserAssertion, 5, "s"),
+        )
+        .unwrap();
+
+        let survivor = e.confirm(review[0]).unwrap();
+        assert_eq!(
+            e.erase_edges(survivor).unwrap(),
+            1,
+            "only the real manages-edge should remain; a surviving self-edge \
+             would count as a second"
+        );
+    }
+
+    #[test]
     fn rejecting_a_review_stops_it_being_raised_again() {
         let mut e = engine();
         e.remember(observation("Ben Severn", "employer", "Acme", 1))
@@ -1394,6 +1694,50 @@ mod tests {
         assert!(
             open[0].score > 0.0,
             "a review pair has real evidence behind it"
+        );
+    }
+
+    #[test]
+    fn one_history_answers_two_ways_without_the_engine_moving() {
+        // The same contrast as the test below, but on a single `&engine` and in
+        // successive lines. That shape is the claim: nothing is reconfigured
+        // between the two reads, nothing is rewritten, and the engine is not
+        // consumed and rebuilt -- only the question changes.
+        let mut e = Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            test_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        );
+        let out = e
+            .remember(observation("Ben Severn", "employer", "Acme", 10))
+            .unwrap();
+        let Remembered::Created { entity, .. } = out else {
+            panic!("setup")
+        };
+        e.remember(observation("Ben Severn", "employer", "Globex", 20))
+            .unwrap();
+
+        let recent = Policy::new(Strategy::MostRecent);
+        let interval = Policy::new(Strategy::ValidInterval);
+
+        // May, under two rules, from one borrow.
+        assert_eq!(
+            e.about_under(&recent, entity, "employer", 15, 100).unwrap(),
+            Believed::Value("Globex".into()),
+            "MostRecent names one winner, whatever instant is asked about"
+        );
+        assert_eq!(
+            e.about_under(&interval, entity, "employer", 15, 100)
+                .unwrap(),
+            Believed::Value("Acme".into()),
+            "ValidInterval keeps both and answers by time"
+        );
+
+        // And the engine's own policy is untouched by either call.
+        assert_eq!(
+            e.about(entity, "employer", 15, 100).unwrap(),
+            Believed::Value("Globex".into()),
+            "about_under must not leave the engine reading under a borrowed policy"
         );
     }
 
@@ -1880,6 +2224,208 @@ mod tests {
             "drop_vectors must not run before store.erase has a chance to fail"
         );
         assert_eq!(e.index_len(), 1);
+    }
+
+    #[test]
+    fn an_engine_relates_two_entities_it_remembered() {
+        let mut e = engine();
+        let Remembered::Created { entity: alice, .. } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: acme, .. } = e
+            .remember(observation("Acme Corp", "kind", "company", 2))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+
+        e.relate(
+            alice,
+            "employed_by",
+            acme,
+            Interval::since(1),
+            Provenance::new(Source::UserAssertion, 1, "s"),
+        )
+        .unwrap();
+
+        let n = e.neighborhood(&Walk::new(vec![alice], 1, 10, 5, 5));
+        assert_eq!(n.reached.len(), 2);
+        assert!(n.reached.iter().any(|r| r.entity == acme));
+    }
+
+    #[test]
+    fn relating_to_an_entity_the_engine_never_met_is_an_error() {
+        let mut e = engine();
+        let Remembered::Created { entity: alice, .. } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        assert!(e
+            .relate(
+                alice,
+                "employed_by",
+                9999,
+                Interval::since(1),
+                Provenance::new(Source::UserAssertion, 1, "s"),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn unrelate_stops_a_walk_crossing_without_erasing_that_it_held() {
+        let mut e = engine();
+        let Remembered::Created { entity: alice, .. } = e
+            .remember(observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: acme, .. } = e
+            .remember(observation("Acme Corp", "kind", "company", 2))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let prov = Provenance::new(Source::UserAssertion, 1, "s");
+        e.relate(alice, "employed_by", acme, Interval::since(1), prov.clone())
+            .unwrap();
+        e.unrelate(
+            alice,
+            "employed_by",
+            acme,
+            5,
+            Provenance::new(Source::UserAssertion, 5, "s2"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            e.neighborhood(&Walk::new(vec![alice], 1, 10, 7, 9))
+                .reached
+                .len(),
+            1
+        );
+        assert_eq!(
+            e.neighborhood(&Walk::new(vec![alice], 1, 10, 3, 9))
+                .reached
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn erasing_edges_leaves_attributes_untouched() {
+        // Erasing relationships and erasing attributes are different
+        // requests, answered by different methods (`erase_edges` and
+        // `erase`), and neither should have a side effect that belongs to
+        // the other. This proves the edge half: after `erase_edges`, the
+        // attribute recorded on the same entity is still there, both to
+        // `about` and to `recall`.
+        let mut e = engine();
+        let Remembered::Created { entity: alice, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                10,
+                [1.0, 0.0, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: acme, .. } = e
+            .remember(observation("Acme Corp", "kind", "company", 2))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        e.relate(
+            alice,
+            "employed_by",
+            acme,
+            Interval::since(1),
+            Provenance::new(Source::UserAssertion, 1, "s"),
+        )
+        .unwrap();
+
+        assert_eq!(e.erase_edges(alice).unwrap(), 1);
+
+        assert_eq!(
+            e.neighborhood(&Walk::new(vec![alice], 1, 10, 5, 5))
+                .reached
+                .len(),
+            1,
+            "the edge is gone"
+        );
+        assert_eq!(
+            e.about(alice, "employer", 15, 30).unwrap(),
+            Believed::Value("Acme".into()),
+            "the attribute erase_edges was never asked to touch is untouched"
+        );
+        assert!(
+            !e.recall(&Query::new(vec![1.0, 0.0, 0.0], 5))
+                .unwrap()
+                .is_empty(),
+            "the attribute's vector is still searchable"
+        );
+    }
+
+    #[test]
+    fn erasing_an_attribute_leaves_edges_untouched() {
+        // The mirror of the test above: `erase` on one attribute must not
+        // disturb a relationship recorded on the same entity.
+        let mut e = engine();
+        let Remembered::Created { entity: alice, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                10,
+                [1.0, 0.0, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        let Remembered::Created { entity: acme, .. } = e
+            .remember(observation("Acme Corp", "kind", "company", 2))
+            .unwrap()
+        else {
+            panic!("setup")
+        };
+        e.relate(
+            alice,
+            "employed_by",
+            acme,
+            Interval::since(1),
+            Provenance::new(Source::UserAssertion, 1, "s"),
+        )
+        .unwrap();
+
+        assert_eq!(e.erase(alice, "employer").unwrap(), 1);
+
+        assert_eq!(
+            e.about(alice, "employer", 15, 30).unwrap(),
+            Believed::Unknown
+        );
+        let n = e.neighborhood(&Walk::new(vec![alice], 1, 10, 5, 5));
+        assert_eq!(n.reached.len(), 2, "the relationship survived the erase");
+        assert!(n.reached.iter().any(|r| r.entity == acme));
+    }
+
+    #[test]
+    fn erasing_edges_on_an_unknown_entity_is_an_error() {
+        let mut e = engine();
+        assert_eq!(
+            e.erase_edges(9999),
+            Err(EngineError::UnknownEntity(9999)),
+            "the write path names the missing entity itself, not through a wrapper"
+        );
     }
 
     #[test]

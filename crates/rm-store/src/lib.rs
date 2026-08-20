@@ -45,7 +45,7 @@
 //! state the first when it only has the second, which is how a memory store
 //! starts confabulating.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rm_core::{Interval, Provenance, Timestamp};
 use rm_survivor::{merge, Candidate, Held, Outcome, Refused, Strategy};
@@ -77,6 +77,8 @@ pub enum StoreError {
     /// draw that line with a variant of this name; drawing it differently here
     /// would make the three doors read as three unrelated designs.
     CorruptSnapshot(String),
+    /// An edge from an entity to itself.
+    SelfEdge(StableId),
 }
 
 impl std::fmt::Display for StoreError {
@@ -91,6 +93,7 @@ impl std::fmt::Display for StoreError {
                     "snapshot parsed but describes an impossible store: {why}"
                 )
             }
+            StoreError::SelfEdge(id) => write!(f, "entity {id} cannot relate to itself; a self-edge carries nothing a traversal can use, and a merge drops the ones it creates"),
         }
     }
 }
@@ -158,6 +161,41 @@ impl Version {
     }
 }
 
+/// One assertion about a relationship, positioned on both time axes.
+///
+/// The edge counterpart of [`Version`], and deliberately the same shape:
+/// `present: false` is a tombstone asserting the relationship did *not* hold
+/// over `valid`, exactly as a `Version` with `value: None` asserts an attribute
+/// had none. Keeping the two models identical is what lets edges inherit
+/// bi-temporality, provenance and the restore path without a second
+/// implementation to keep honest against the first.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeVersion {
+    pub present: bool,
+    pub valid: Interval,
+    pub provenance: Provenance,
+}
+
+impl EdgeVersion {
+    /// Transaction time: when this assertion entered the store.
+    pub fn ingested_at(&self) -> Timestamp {
+        self.provenance.observed_at
+    }
+}
+
+/// A relationship in force at the queried point on both axes.
+///
+/// Borrowed rather than owned, and carrying its endpoints, so a caller reading
+/// a neighbourhood never has to reassemble the key it asked about.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Edge<'a> {
+    pub subject: StableId,
+    pub predicate: &'a str,
+    pub object: StableId,
+    pub valid: Interval,
+    pub provenance: &'a Provenance,
+}
+
 /// An entity and everything ever asserted about it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entity {
@@ -171,14 +209,37 @@ pub struct Entity {
 
 /// The store.
 ///
-/// Append-only for every operation but one. Nothing modifies a [`Version`], and
-/// only [`MemoryStore::erase`] removes one — deliberately narrow, deliberately
-/// hard to reach for, and documented as destroying what the rest of the crate
-/// exists to preserve.
+/// Append-only but for the handful of operations that say otherwise. Nothing
+/// modifies a [`Version`] or an [`EdgeVersion`] in place; [`MemoryStore::erase`]
+/// and [`MemoryStore::erase_edges`] destroy them, and
+/// [`MemoryStore::repoint_edges`] moves them onto another entity. All three are
+/// deliberately narrow, deliberately hard to reach for, and each documented as
+/// doing something to history the rest of the crate exists to prevent.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryStore {
     entities: BTreeMap<StableId, Entity>,
     next_id: StableId,
+    /// subject -> predicate -> object -> version log.
+    ///
+    /// Nested rather than keyed on a `(subject, predicate, object)` tuple
+    /// because `serde_json` cannot use a tuple as a JSON object key — only
+    /// scalars stringify. Nesting keeps every level a `BTreeMap`, so snapshots
+    /// stay byte-stable, and makes `edges_from` one lookup rather than a scan.
+    #[serde(default)]
+    edges: BTreeMap<StableId, BTreeMap<String, BTreeMap<StableId, Vec<EdgeVersion>>>>,
+    /// object -> the `(subject, predicate)` pairs pointing at it.
+    ///
+    /// Derived from `edges`, so it is never persisted and is rebuilt inside
+    /// [`MemoryStore::open`]. This workspace has learned that rule twice the
+    /// hard way: `VectorIndex::positions` shipped persisted and let a restored
+    /// index disagree with itself, and `rm_engine`'s blocking map made a
+    /// snapshot round-trip change which mentions resolved together. Derived
+    /// state that is persisted is derived state that can lie. `#[serde(skip)]`
+    /// does not exempt this field from the derived `PartialEq` -- comparing two
+    /// stores still compares `into`, which is exactly what makes a round-trip
+    /// test a real proof that the rebuild reproduces the live map.
+    #[serde(skip)]
+    into: BTreeMap<StableId, BTreeSet<(StableId, String)>>,
 }
 
 impl MemoryStore {
@@ -372,10 +433,12 @@ impl MemoryStore {
 
     /// Remove every version of an attribute, returning how many went.
     ///
-    /// **This is the only call in the crate that mutates history, and it does
-    /// destroy it.** After it, `as_of` answers `Unknown` for every point on both
-    /// axes — not `Absent`, because the store no longer has an opinion rather
-    /// than holding that there was none.
+    /// **This destroys history rather than superseding it**, and it is the only
+    /// call that does so for attributes ([`MemoryStore::erase_edges`] is its
+    /// counterpart for edges, and neither implies the other). After it, `as_of`
+    /// answers `Unknown` for every point on both axes — not `Absent`, because
+    /// the store no longer has an opinion rather than holding that there was
+    /// none.
     ///
     /// It exists for the request that cannot be answered any other way: someone
     /// asking that a fact about them stop existing. A tombstone is the right
@@ -396,6 +459,417 @@ impl MemoryStore {
             .attributes
             .remove(attribute)
             .map_or(0, |versions| versions.len()))
+    }
+
+    /// Record that a relationship held over `valid`.
+    ///
+    /// Appends; it does not overwrite. Asserting the same triple again is a
+    /// correction, and both versions survive so the earlier belief stays
+    /// reconstructible — the same rule [`MemoryStore::assert`] follows.
+    ///
+    /// Both endpoints must exist. A dangling edge is a lie a traversal would
+    /// follow without complaint, and since ids are never reused, one that names
+    /// nothing today will never name anything.
+    pub fn relate(
+        &mut self,
+        subject: StableId,
+        predicate: impl Into<String>,
+        object: StableId,
+        valid: Interval,
+        provenance: Provenance,
+    ) -> Result<(), StoreError> {
+        self.push_edge(
+            subject,
+            predicate.into(),
+            object,
+            EdgeVersion {
+                present: true,
+                valid,
+                provenance,
+            },
+        )
+    }
+
+    /// Record that a relationship stopped holding at `at`.
+    ///
+    /// Appends a tombstone rather than editing the earlier assertion, so
+    /// [`MemoryStore::edge_history`] still shows that it held and who said so.
+    /// Ending a relationship is a fact with provenance, not an untraceable edit
+    /// — the same distinction `forget` draws for attributes.
+    pub fn unrelate(
+        &mut self,
+        subject: StableId,
+        predicate: &str,
+        object: StableId,
+        at: Timestamp,
+        provenance: Provenance,
+    ) -> Result<(), StoreError> {
+        self.push_edge(
+            subject,
+            predicate.to_string(),
+            object,
+            EdgeVersion {
+                present: false,
+                valid: Interval::since(at),
+                provenance,
+            },
+        )
+    }
+
+    /// Validate the endpoints and append one edge version, to both the forward
+    /// map and its derived reverse.
+    ///
+    /// Takes `predicate` by value and clones it once, up front, rather than
+    /// letting each map ask for its own copy: the forward map is keyed on it
+    /// and the reverse map's `(subject, predicate)` pair needs an owned copy
+    /// too, and cloning twice would be paying for the same fact twice.
+    fn push_edge(
+        &mut self,
+        subject: StableId,
+        predicate: String,
+        object: StableId,
+        version: EdgeVersion,
+    ) -> Result<(), StoreError> {
+        for id in [subject, object] {
+            if !self.entities.contains_key(&id) {
+                return Err(StoreError::UnknownEntity(id));
+            }
+        }
+        if subject == object {
+            return Err(StoreError::SelfEdge(subject));
+        }
+        let predicate_for_reverse = predicate.clone();
+        self.edges
+            .entry(subject)
+            .or_default()
+            .entry(predicate)
+            .or_default()
+            .entry(object)
+            .or_default()
+            .push(version);
+        self.into
+            .entry(object)
+            .or_default()
+            .insert((subject, predicate_for_reverse));
+        Ok(())
+    }
+
+    /// Edges out of `subject` in force at `valid_t`, as known by `tx_t`.
+    ///
+    /// Per triple, the latest-ingested version we had by `tx_t` whose validity
+    /// covers `valid_t` — the same resolution [`MemoryStore::as_of`] performs
+    /// for an attribute. Ordered by `(predicate, object)` so two runs agree.
+    pub fn edges_from(
+        &self,
+        subject: StableId,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+    ) -> Vec<Edge<'_>> {
+        let Some(by_predicate) = self.edges.get(&subject) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (predicate, by_object) in by_predicate {
+            for (&object, versions) in by_object {
+                if let Some(v) = in_force(versions, valid_t, tx_t) {
+                    out.push(Edge {
+                        subject,
+                        predicate,
+                        object,
+                        valid: v.valid,
+                        provenance: &v.provenance,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Edges into `object` in force at `valid_t`, as known by `tx_t`.
+    ///
+    /// The mirror of [`MemoryStore::edges_from`], answering "who works at Acme"
+    /// rather than "where does Alice work". Walks the derived reverse map to
+    /// find candidate subjects, then re-resolves each triple through
+    /// `edge_history` and `in_force` -- the same resolution `edges_from` uses --
+    /// rather than caching a resolved answer that could drift from it. Ordered
+    /// by `(subject, predicate)` so two runs agree.
+    pub fn edges_into(
+        &self,
+        object: StableId,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+    ) -> Vec<Edge<'_>> {
+        let Some(sources) = self.into.get(&object) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (subject, predicate) in sources {
+            let versions = self.edge_history(*subject, predicate, object);
+            if let Some(v) = in_force(versions, valid_t, tx_t) {
+                // Borrow the predicate from the forward map, not from `into`,
+                // so every `Edge` in this result borrows from the same
+                // structure with one lifetime -- matching what `edges_from`
+                // hands back.
+                let key = self
+                    .edges
+                    .get(subject)
+                    .and_then(|m| m.get_key_value(predicate.as_str()))
+                    .map(|(k, _)| k.as_str())
+                    .expect("the reverse map only ever names predicates the forward map holds");
+                out.push(Edge {
+                    subject: *subject,
+                    predicate: key,
+                    object,
+                    valid: v.valid,
+                    provenance: &v.provenance,
+                });
+            }
+        }
+        out
+    }
+
+    /// Every version ever asserted for one triple, in append order.
+    ///
+    /// Empty for a triple never discussed — asking is not an error.
+    pub fn edge_history(
+        &self,
+        subject: StableId,
+        predicate: &str,
+        object: StableId,
+    ) -> &[EdgeVersion] {
+        self.edges
+            .get(&subject)
+            .and_then(|m| m.get(predicate))
+            .and_then(|m| m.get(&object))
+            .map_or(&[], |v| v.as_slice())
+    }
+
+    /// Remove every edge touching `entity`, in both directions, returning how
+    /// many triples went.
+    ///
+    /// **Destructive, like [`MemoryStore::erase`].** It removes the history, not
+    /// just the relationship — for "they no longer work there", use
+    /// [`MemoryStore::unrelate`], which keeps the record that it once held.
+    ///
+    /// Deliberately separate from `erase`, and neither implies the other. A
+    /// caller reaching for either is usually answering a deletion request and
+    /// needs to know exactly what was removed; a convenience that quietly did
+    /// both would make that question unanswerable.
+    ///
+    /// Erasing edges on an entity that holds none is not an error — it reports
+    /// `Ok(0)`, because the caller's goal ("these must not be here") is already
+    /// true. An id the store does not hold *is* an error, exactly as it is for
+    /// [`MemoryStore::erase`]: the caller is working from an id that means
+    /// nothing, and a bare 0 would let a typo read as a completed deletion.
+    /// That distinction is the whole reason this call reports at all, so the two
+    /// deletion doors answer a mistake the same way rather than two ways.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnknownEntity`] if `entity` names no entity in this store.
+    pub fn erase_edges(&mut self, entity: StableId) -> Result<usize, StoreError> {
+        if !self.entities.contains_key(&entity) {
+            return Err(StoreError::UnknownEntity(entity));
+        }
+        let mut removed = 0;
+
+        // Outgoing: drop the whole subtree, then unhook each object from the
+        // reverse map. Dropping it first is what stops the incoming pass below
+        // from finding, and counting a second time, an edge already gone.
+        if let Some(by_predicate) = self.edges.remove(&entity) {
+            for (predicate, by_object) in by_predicate {
+                for object in by_object.into_keys() {
+                    removed += 1;
+                    self.unhook_reverse(entity, &predicate, object);
+                }
+            }
+        }
+
+        // Incoming: the reverse map names exactly who points here, so this is a
+        // handful of lookups rather than a scan of every subject in the store.
+        if let Some(sources) = self.into.remove(&entity) {
+            for (subject, predicate) in sources {
+                if let Some(by_object) = self
+                    .edges
+                    .get_mut(&subject)
+                    .and_then(|m| m.get_mut(&predicate))
+                {
+                    if by_object.remove(&entity).is_some() {
+                        removed += 1;
+                    }
+                }
+                self.prune_empty(subject, &predicate);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Move every edge touching `from` onto `to`, returning how many left
+    /// `from`.
+    ///
+    /// For a merge: two entities turned out to be one, so everything said about
+    /// the absorbed id is now said about the survivor. An edge the move would
+    /// turn into a self-edge is dropped rather than stored, because
+    /// [`MemoryStore::relate`] refuses to create one and two answers to the same
+    /// question is worse than either.
+    ///
+    /// Where both entities already held the same relationship, the version logs
+    /// are concatenated and re-sorted by ingestion — neither source's assertion
+    /// is discarded, and the latest-ingested rule still picks the same winner it
+    /// would have picked had both been asserted about one entity all along.
+    ///
+    /// The count includes the edges dropped as self-edges, because it answers
+    /// "how many relationships stopped being `from`'s", which is what a caller
+    /// reporting a merge has to say. Counting only the survivors would make
+    /// "there was nothing to move" and "everything collapsed into the survivor"
+    /// the same number.
+    ///
+    /// Merging an entity into itself is a no-op reporting `Ok(0)` rather than an
+    /// error: both ids are real and the caller's goal is already true, which is
+    /// the same reading `erase` gives an attribute nobody ever discussed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnknownEntity`] if either id names no entity in this store.
+    /// `relate` rejects an endpoint naming no entity and [`MemoryStore::open`]
+    /// rejects a snapshot holding one, so moving edges onto one would write a
+    /// store that cannot be reopened — damage found at restore, long after the
+    /// call that caused it. Reporting 0 instead would be no better: it is what
+    /// "there was nothing to move" says, so a caller could not tell a merge that
+    /// found nothing from one aimed at an id that never existed.
+    pub fn repoint_edges(&mut self, from: StableId, to: StableId) -> Result<usize, StoreError> {
+        for id in [from, to] {
+            if !self.entities.contains_key(&id) {
+                return Err(StoreError::UnknownEntity(id));
+            }
+        }
+        // Checked after the endpoints, so merging an unknown id into itself is
+        // still the error it is anywhere else. Caught here rather than left to
+        // fall through: every edge on `from` would also be an edge on `to`, so
+        // the self-edge rule below would read the whole neighbourhood as
+        // collapsing and delete it.
+        if from == to {
+            return Ok(0);
+        }
+        let mut moved = 0;
+
+        // Outgoing: take the subtree off `from` and re-file each triple under
+        // `to`, unhooking the reverse entry that named `from` as its subject.
+        if let Some(by_predicate) = self.edges.remove(&from) {
+            for (predicate, by_object) in by_predicate {
+                for (object, versions) in by_object {
+                    self.unhook_reverse(from, &predicate, object);
+                    moved += 1;
+                    if object == to {
+                        continue; // `to` -> `to`; see the self-edge note above
+                    }
+                    self.absorb_edge(to, predicate.clone(), object, versions);
+                }
+            }
+        }
+
+        // Incoming: the same move from the other side. Taking the reverse entry
+        // for `from` out of the map first means the loop cannot re-read a
+        // pairing it has already rewritten.
+        if let Some(sources) = self.into.remove(&from) {
+            for (subject, predicate) in sources {
+                let versions = self
+                    .edges
+                    .get_mut(&subject)
+                    .and_then(|m| m.get_mut(&predicate))
+                    .and_then(|m| m.remove(&from));
+                self.prune_empty(subject, &predicate);
+                // A reverse entry with no forward edge behind it is a broken
+                // invariant, not a move: skip it rather than counting it.
+                let Some(versions) = versions else { continue };
+                moved += 1;
+                if subject == to {
+                    continue; // `to` -> `to`; see the self-edge note above
+                }
+                self.absorb_edge(subject, predicate, to, versions);
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Add one triple's versions to the forward map and its reverse.
+    ///
+    /// Where the destination already holds the triple the two logs are
+    /// concatenated and re-sorted by ingestion, because "append order" across
+    /// two entities' logs is not an order anyone appended in. The sort is
+    /// *stable*, so versions sharing an ingestion time keep their relative
+    /// order and `in_force`'s latest-ingested tie-break stays deterministic.
+    ///
+    /// An empty destination takes the log exactly as it stood rather than a
+    /// sorted copy of it, so a move that collides with nothing leaves
+    /// [`MemoryStore::edge_history`] in the append order it documents. Sorting
+    /// there would be harmless to every query — the winner is the largest
+    /// `ingested_at` however the vector is ordered — but it would silently
+    /// reorder an audit trail nobody asked to merge.
+    fn absorb_edge(
+        &mut self,
+        subject: StableId,
+        predicate: String,
+        object: StableId,
+        versions: Vec<EdgeVersion>,
+    ) {
+        let log = self
+            .edges
+            .entry(subject)
+            .or_default()
+            .entry(predicate.clone())
+            .or_default()
+            .entry(object)
+            .or_default();
+        if log.is_empty() {
+            *log = versions;
+        } else {
+            log.extend(versions);
+            log.sort_by_key(|v| v.ingested_at());
+        }
+        self.into
+            .entry(object)
+            .or_default()
+            .insert((subject, predicate));
+    }
+
+    /// Take one `(subject, predicate)` pairing out of the reverse map, dropping
+    /// the entry if it was the last one pointing at `object`.
+    ///
+    /// An emptied entry is pruned rather than left: `into` is compared by the
+    /// derived `PartialEq`, and [`MemoryStore::open`] rebuilds it from the
+    /// forward map with no empty entries at all, so leaving one makes a store
+    /// unequal to its own round trip over a difference no query can see.
+    fn unhook_reverse(&mut self, subject: StableId, predicate: &str, object: StableId) {
+        if let Some(sources) = self.into.get_mut(&object) {
+            // The set owns its predicate, so removing means building the whole
+            // key. Borrowing one from the forward map instead would tie the
+            // reverse map's lifetime to the forward one, which is exactly what
+            // keeping `into` a plain owned field avoids.
+            sources.remove(&(subject, predicate.to_string()));
+            if sources.is_empty() {
+                self.into.remove(&object);
+            }
+        }
+    }
+
+    /// Drop a predicate or subject level left empty by a removal, so an empty
+    /// map never appears in a snapshot.
+    ///
+    /// Not cosmetic: an empty map is bytes in every later snapshot and a line in
+    /// every later diff, and this crate sells snapshots as diffable. It also
+    /// makes an entity that never had an edge indistinguishable from one whose
+    /// edges were all removed, which is a difference nothing downstream should
+    /// have to reason about.
+    fn prune_empty(&mut self, subject: StableId, predicate: &str) {
+        if let Some(by_predicate) = self.edges.get_mut(&subject) {
+            if by_predicate.get(predicate).is_some_and(|m| m.is_empty()) {
+                by_predicate.remove(predicate);
+            }
+            if by_predicate.is_empty() {
+                self.edges.remove(&subject);
+            }
+        }
     }
 
     /// Serialise to canonical JSON.
@@ -421,8 +895,24 @@ impl MemoryStore {
     /// everyone who restores a store. The bound is one-directional on purpose —
     /// a `next_id` *above* the highest live id wastes id space but cannot
     /// collide, and rejecting it would break any caller that reserves ranges.
+    ///
+    /// The edge map is held to everything the write path enforces: both
+    /// endpoints must exist, no edge may start and end at the same entity, no
+    /// triple may carry an empty version log, and no subject or predicate level
+    /// may be left empty. The first three are what [`MemoryStore::relate`]
+    /// refuses outright; the last is what `prune_empty` removes after every
+    /// in-process removal. Accepting here what the front door rejects would
+    /// make a snapshot a way to build a store no sequence of calls could, and
+    /// the damage would surface as a wrong answer from a later query rather
+    /// than as an error from the restore.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Parse`] if the bytes are not a store at all, and
+    /// [`StoreError::CorruptSnapshot`] if they are a store whose own invariants
+    /// contradict each other.
     pub fn open(snapshot: &str) -> Result<Self, StoreError> {
-        let store: MemoryStore =
+        let mut store: MemoryStore =
             serde_json::from_str(snapshot).map_err(|e| StoreError::Parse(e.to_string()))?;
 
         // Keyed on the map, not on `Entity::id`: `create_entity` inserts at
@@ -435,6 +925,72 @@ impl MemoryStore {
                 )));
             }
         }
+
+        // The edge map has to satisfy everything the write path enforces. An
+        // edge that parses cleanly and then breaks an invariant is worse than
+        // one that fails to parse: the store answers queries and looks healthy.
+        // The restore path is a door, and a door that accepts what the front
+        // door refuses is not a door -- so each check below names the call it
+        // is standing in for.
+        let mut reverse: BTreeMap<StableId, BTreeSet<(StableId, String)>> = BTreeMap::new();
+        for (&subject, by_predicate) in &store.edges {
+            if !store.entities.contains_key(&subject) {
+                return Err(StoreError::CorruptSnapshot(format!(
+                    "an edge starts at entity {subject}, which the snapshot does not hold"
+                )));
+            }
+            // `prune_empty` deletes a subject whose last predicate went, so a
+            // snapshot carrying one was not written by this crate's own
+            // removals. Rejecting it rather than pruning it on the way in is
+            // deliberate: silently repairing a snapshot means the store a
+            // caller restores is not the store they saved, and the difference
+            // never gets reported.
+            if by_predicate.is_empty() {
+                return Err(StoreError::CorruptSnapshot(format!(
+                    "entity {subject} holds an edge map with no predicates in it, which prune_empty removes rather than stores"
+                )));
+            }
+            for (predicate, by_object) in by_predicate {
+                if by_object.is_empty() {
+                    return Err(StoreError::CorruptSnapshot(format!(
+                        "entity {subject}'s {predicate:?} names no object, which prune_empty removes rather than stores"
+                    )));
+                }
+                for (&object, versions) in by_object {
+                    if !store.entities.contains_key(&object) {
+                        return Err(StoreError::CorruptSnapshot(format!(
+                            "an edge from entity {subject} points at entity {object}, which the snapshot does not hold"
+                        )));
+                    }
+                    // `push_edge` refuses a self-edge, so `relate` and
+                    // `unrelate` cannot make one and `confirm` drops the ones a
+                    // merge creates. Restoring one would leave `edges_from`
+                    // handing a traversal an edge no call in this crate could
+                    // have written, and every walk crossing it would arrive
+                    // back where it started.
+                    if subject == object {
+                        return Err(StoreError::CorruptSnapshot(format!(
+                            "an edge runs from entity {subject} to itself, which relate refuses to create"
+                        )));
+                    }
+                    // A triple with no versions has never been asserted, so
+                    // `edge_history` cannot distinguish it from one nobody has
+                    // discussed -- and it still earns a reverse-map entry,
+                    // which makes `edges_into` walk a triple that says nothing.
+                    if versions.is_empty() {
+                        return Err(StoreError::CorruptSnapshot(format!(
+                            "the edge from entity {subject} to entity {object} via {predicate:?} carries no versions, so nothing was ever asserted about it"
+                        )));
+                    }
+                    reverse
+                        .entry(object)
+                        .or_default()
+                        .insert((subject, predicate.clone()));
+                }
+            }
+        }
+        store.into = reverse;
+
         Ok(store)
     }
 }
@@ -448,6 +1004,22 @@ fn held_to_value(held: Held) -> Option<String> {
         Held::Value(v) => Some(v),
         Held::Absent => None,
     }
+}
+
+/// The version in force at a point on both axes, if the relationship held.
+///
+/// Latest ingested wins among versions covering `valid_t`, breaking ingestion
+/// ties toward the later append — the same rule, and the same tie-break, as
+/// `as_of` uses for attributes. A winning tombstone yields `None`: the
+/// relationship was considered and found not to hold, which is the answer.
+fn in_force(versions: &[EdgeVersion], valid_t: Timestamp, tx_t: Timestamp) -> Option<&EdgeVersion> {
+    versions
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.ingested_at() <= tx_t && v.valid.contains(valid_t))
+        .max_by_key(|(i, v)| (v.ingested_at(), *i))
+        .map(|(_, v)| v)
+        .filter(|v| v.present)
 }
 
 #[cfg(test)]
@@ -741,6 +1313,960 @@ mod tests {
             store.erase(9999, "employer"),
             Err(StoreError::UnknownEntity(9999))
         );
+    }
+
+    // ---- edges --------------------------------------------------------------
+
+    #[test]
+    fn an_edge_is_bitemporal_like_an_attribute() {
+        // Told in September that they joined in July: the edge is valid from
+        // July, but we did not know it in August.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JUL),
+                user_said(SEP),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.edges_from(user, AUG, AUG).len(),
+            0,
+            "not known in August"
+        );
+        assert_eq!(
+            store.edges_from(user, AUG, OCT).len(),
+            1,
+            "known by October, true in August"
+        );
+        assert_eq!(
+            store.edges_from(user, MAR, OCT).len(),
+            0,
+            "not true in March"
+        );
+    }
+
+    #[test]
+    fn unrelate_stops_the_edge_without_erasing_that_it_held() {
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .unrelate(user, "employed_by", acme, JUL, user_said(JUL))
+            .unwrap();
+
+        assert_eq!(
+            store.edges_from(user, MAR, OCT).len(),
+            1,
+            "it held in March"
+        );
+        assert_eq!(
+            store.edges_from(user, AUG, OCT).len(),
+            0,
+            "and not in August"
+        );
+        assert_eq!(
+            store.edge_history(user, "employed_by", acme).len(),
+            2,
+            "ending a relationship is a fact, not an erasure"
+        );
+    }
+
+    #[test]
+    fn two_employers_at_once_both_stand() {
+        // Arrival does not entail departure. Closing the first edge is an
+        // inference, and the store records what was said rather than inferring.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        let globex = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .relate(
+                user,
+                "employed_by",
+                globex,
+                Interval::since(JUL),
+                user_said(JUL),
+            )
+            .unwrap();
+
+        assert_eq!(store.edges_from(user, AUG, OCT).len(), 2);
+    }
+
+    #[test]
+    fn an_edge_naming_an_unknown_entity_is_rejected() {
+        let (mut store, user) = store_with_user();
+        assert_eq!(
+            store.relate(
+                user,
+                "employed_by",
+                9999,
+                Interval::since(JAN),
+                user_said(JAN)
+            ),
+            Err(StoreError::UnknownEntity(9999))
+        );
+        assert_eq!(
+            store.relate(
+                9999,
+                "employed_by",
+                user,
+                Interval::since(JAN),
+                user_said(JAN)
+            ),
+            Err(StoreError::UnknownEntity(9999))
+        );
+    }
+
+    #[test]
+    fn an_edge_from_an_entity_to_itself_is_rejected() {
+        // It carries nothing a walk can use, and a merge drops the self-edges it
+        // creates -- accepting one at the front door while dropping it at the
+        // back would be two answers to the same question.
+        let (mut store, user) = store_with_user();
+        assert!(store
+            .relate(user, "knows", user, Interval::since(JAN), user_said(JAN))
+            .is_err());
+    }
+
+    #[test]
+    fn a_later_assertion_about_the_same_edge_supersedes_the_earlier_one() {
+        // Same key, and both versions cover August, so the latest ingested wins
+        // -- exactly as for an attribute (see
+        // `a_tombstone_can_itself_be_superseded`). A merely *narrower* `relate`
+        // would not do this: presence is not read as an implicit end (see
+        // `two_employers_at_once_both_stand`), so for the later version to
+        // actually govern August it has to say something about August -- here,
+        // that the relationship did not hold.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .unrelate(user, "employed_by", acme, JAN, user_said(JUL))
+            .unwrap();
+
+        assert_eq!(
+            store.edges_from(user, AUG, OCT).len(),
+            0,
+            "the correction superseded it"
+        );
+        assert_eq!(
+            store.edges_from(user, AUG, MAR).len(),
+            1,
+            "but we believed otherwise in March"
+        );
+    }
+
+    // ---- the reverse edge index --------------------------------------------
+
+    #[test]
+    fn edges_into_finds_what_points_at_an_entity() {
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        let other = store.create_entity("person", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .relate(
+                other,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        let into = store.edges_into(acme, MAR, OCT);
+        assert_eq!(into.len(), 2, "who works at Acme");
+        assert!(into.iter().all(|e| e.object == acme));
+        assert_eq!(store.edges_into(user, MAR, OCT).len(), 0);
+    }
+
+    #[test]
+    fn edges_into_respects_both_time_axes_the_same_way_edges_from_does() {
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JUL),
+                user_said(SEP),
+            )
+            .unwrap();
+        assert_eq!(
+            store.edges_into(acme, AUG, AUG).len(),
+            0,
+            "not known in August"
+        );
+        assert_eq!(store.edges_into(acme, AUG, OCT).len(), 1);
+        assert_eq!(
+            store.edges_into(acme, MAR, OCT).len(),
+            0,
+            "not true in March"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_edges_and_rebuilds_the_reverse_map() {
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        let restored = MemoryStore::open(&store.snapshot()).unwrap();
+        assert_eq!(restored.edges_from(user, MAR, OCT).len(), 1);
+        assert_eq!(
+            restored.edges_into(acme, MAR, OCT).len(),
+            1,
+            "the reverse map is derived, so it has to be rebuilt to work"
+        );
+        assert_eq!(restored, store);
+    }
+
+    #[test]
+    fn a_snapshot_is_not_bloated_by_the_derived_reverse_map() {
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        assert!(
+            !store.snapshot().contains("into"),
+            "derived state that is persisted is derived state that can lie"
+        );
+    }
+
+    /// Assert a restore was refused for the reason the test is about.
+    ///
+    /// The variant alone is not enough: `open` runs its checks in a fixed
+    /// order, so a reordering could let a snapshot trip a *different* check and
+    /// still satisfy `matches!(err, CorruptSnapshot(_))` -- the test would keep
+    /// passing while no longer testing what its name says.
+    #[track_caller]
+    fn refused_because(err: &StoreError, expected: &str) {
+        let StoreError::CorruptSnapshot(why) = err else {
+            panic!("expected a CorruptSnapshot, got {err:?}");
+        };
+        assert!(
+            why.contains(expected),
+            "refused for the wrong reason
+  expected to contain: {expected}
+  actual: {why}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_whose_edge_names_an_unknown_entity_is_rejected() {
+        // Built by mutating the parsed JSON, not by a string replace on the
+        // snapshot text: entity ids are small integers, and a text replace
+        // targeting `"<id>":[` can match more than the one edge-object key it
+        // means to (or nothing at all if the id also appears elsewhere), which
+        // would make the test pass or fail for the wrong reason. Renaming the
+        // key in the parsed document is unambiguous, and asserting the removal
+        // actually found something rules out the mutation being a silent no-op.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        let mut doc: serde_json::Value = serde_json::from_str(&store.snapshot()).unwrap();
+        let by_object = doc["edges"][user.to_string()]["employed_by"]
+            .as_object_mut()
+            .expect("setup: the forward map holds subject -> predicate -> object -> versions");
+        let versions = by_object.remove(&acme.to_string());
+        assert!(
+            versions.is_some(),
+            "the mutation must actually remove a real edge-object entry, or this test is vacuous"
+        );
+        let clash = by_object.insert("4242".to_string(), versions.unwrap());
+        assert!(clash.is_none(), "setup: 4242 must not already be a key");
+
+        let err = MemoryStore::open(&doc.to_string()).unwrap_err();
+        refused_because(&err, "points at entity");
+    }
+
+    #[test]
+    fn a_snapshot_whose_edge_starts_at_an_unknown_entity_is_rejected() {
+        // The mirror of the object-side test above, and it exists because the
+        // two are separate `if` blocks rather than one shared check: an
+        // inverted condition in the subject branch would restore a store whose
+        // `edges_into` hands a walk a subject that does not exist, and the
+        // object-side test would stay green throughout. Same JSON-mutation
+        // approach and for the same reason -- renaming a key in the parsed
+        // document cannot match more or less than the one entry it means to.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        let mut doc: serde_json::Value = serde_json::from_str(&store.snapshot()).unwrap();
+        let edges = doc["edges"]
+            .as_object_mut()
+            .expect("setup: the forward map is keyed by subject");
+        let by_predicate = edges.remove(&user.to_string());
+        assert!(
+            by_predicate.is_some(),
+            "the mutation must actually remove a real subject entry, or this test is vacuous"
+        );
+        let clash = edges.insert("4242".to_string(), by_predicate.unwrap());
+        assert!(clash.is_none(), "setup: 4242 must not already be a key");
+
+        let err = MemoryStore::open(&doc.to_string()).unwrap_err();
+        refused_because(&err, "starts at entity");
+    }
+
+    #[test]
+    fn a_snapshot_carrying_a_self_edge_is_rejected_not_restored() {
+        // `push_edge` refuses one at the front door and `confirm` drops the
+        // ones a merge creates, so a restore that accepted one would be the
+        // only way into a state the rest of the crate is built to prevent.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        let mut doc: serde_json::Value = serde_json::from_str(&store.snapshot()).unwrap();
+        let by_object = doc["edges"][user.to_string()]["employed_by"]
+            .as_object_mut()
+            .expect("setup: the forward map holds subject -> predicate -> object -> versions");
+        let versions = by_object
+            .remove(&acme.to_string())
+            .expect("setup: the edge to acme is there to re-point");
+        // Re-pointed at the subject itself, which is the exact shape a merge
+        // would have produced and then dropped.
+        by_object.insert(user.to_string(), versions);
+
+        let err = MemoryStore::open(&doc.to_string()).unwrap_err();
+        refused_because(&err, "to itself");
+    }
+
+    #[test]
+    fn a_snapshot_carrying_an_edge_with_no_versions_is_rejected_not_restored() {
+        // An empty log is indistinguishable from a triple nobody ever discussed
+        // as far as `edge_history` is concerned, but it still earns a
+        // reverse-map entry -- so `edges_into` would walk a triple that says
+        // nothing, and the two maps would disagree about what exists.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        let mut doc: serde_json::Value = serde_json::from_str(&store.snapshot()).unwrap();
+        let log = &mut doc["edges"][user.to_string()]["employed_by"][acme.to_string()];
+        assert!(
+            log.as_array().is_some_and(|v| !v.is_empty()),
+            "setup: the triple starts with a version in it"
+        );
+        *log = serde_json::json!([]);
+
+        let err = MemoryStore::open(&doc.to_string()).unwrap_err();
+        refused_because(&err, "carries no versions");
+    }
+
+    #[test]
+    fn a_snapshot_carrying_an_empty_edge_level_is_rejected_not_restored() {
+        // Both levels, because `prune_empty` removes both and a snapshot is the
+        // only way either could come back. An empty level is bytes in every
+        // later snapshot and a line in every later diff, and it makes an entity
+        // that never had an edge indistinguishable from one whose edges all
+        // went -- the two differences `prune_empty` exists to prevent.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        let snapshot = store.snapshot();
+
+        let mut predicate_level: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        let level = &mut predicate_level["edges"][user.to_string()]["employed_by"];
+        assert!(
+            level.as_object().is_some_and(|m| !m.is_empty()),
+            "setup: the predicate starts with an object under it, or emptying it proves nothing"
+        );
+        *level = serde_json::json!({});
+        let err = MemoryStore::open(&predicate_level.to_string()).unwrap_err();
+        refused_because(&err, "names no object");
+
+        let mut subject_level: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        let level = &mut subject_level["edges"][user.to_string()];
+        assert!(
+            level.as_object().is_some_and(|m| !m.is_empty()),
+            "setup: the subject starts with a predicate under it, or emptying it proves nothing"
+        );
+        *level = serde_json::json!({});
+        let err = MemoryStore::open(&subject_level.to_string()).unwrap_err();
+        refused_because(&err, "no predicates in it");
+    }
+
+    // ---- wholesale edge surgery ---------------------------------------------
+
+    /// Assert the two edge maps name exactly the same triples, and that no
+    /// level of either was left empty by a removal.
+    ///
+    /// The failure this exists to catch is silent. A forward edge with no
+    /// reverse entry still answers `edges_from` and has simply stopped existing
+    /// as far as `edges_into` is concerned; a reverse entry with no forward edge
+    /// behind it trips the `expect` in `edges_into`, but only if a query happens
+    /// to walk that one entry. Both survive a round of green tests easily, so
+    /// every test that mutates edges wholesale ends here.
+    #[track_caller]
+    fn assert_maps_agree(store: &MemoryStore) {
+        let mut expected: BTreeMap<StableId, BTreeSet<(StableId, String)>> = BTreeMap::new();
+        for (subject, by_predicate) in &store.edges {
+            assert!(
+                !by_predicate.is_empty(),
+                "subject {subject} kept an empty predicate map"
+            );
+            for (predicate, by_object) in by_predicate {
+                assert!(
+                    !by_object.is_empty(),
+                    "{subject}'s {predicate:?} kept an empty object map"
+                );
+                for (object, versions) in by_object {
+                    assert!(
+                        !versions.is_empty(),
+                        "the triple ({subject}, {predicate:?}, {object}) kept an empty log"
+                    );
+                    expected
+                        .entry(*object)
+                        .or_default()
+                        .insert((*subject, predicate.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            store.into, expected,
+            "the reverse map must name exactly the forward edges that exist"
+        );
+    }
+
+    /// The ingestion timestamps of a version log, in the order the log holds
+    /// them. Names what a test means by "the order", so an assertion about it
+    /// reads as a claim about ordering rather than as a bare vector of numbers.
+    fn ingestion_order(versions: &[EdgeVersion]) -> Vec<Timestamp> {
+        versions.iter().map(|v| v.ingested_at()).collect()
+    }
+
+    #[test]
+    fn erase_edges_does_not_touch_attributes_and_erase_does_not_touch_edges() {
+        // A caller reaching for either is usually answering a deletion request
+        // and needs to know exactly what went. A call that quietly did both
+        // would make that question unanswerable.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .assert(
+                user,
+                "employer",
+                Some("Acme".into()),
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        assert_eq!(store.erase(user, "employer").unwrap(), 1);
+        assert_eq!(
+            store.edges_from(user, MAR, OCT).len(),
+            1,
+            "erase left the edge"
+        );
+
+        assert_eq!(store.erase_edges(user).unwrap(), 1);
+        assert_eq!(store.edges_from(user, MAR, OCT).len(), 0);
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn erase_edges_removes_both_directions() {
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.erase_edges(acme).unwrap(),
+            1,
+            "erasing the object clears it too"
+        );
+        assert_eq!(store.edges_from(user, MAR, OCT).len(), 0);
+        assert_eq!(store.edges_into(acme, MAR, OCT).len(), 0);
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn erasing_the_last_edge_leaves_no_empty_map_behind_in_the_snapshot() {
+        // The subject and predicate levels are removed with their last child,
+        // so the snapshot of a store whose edges are gone is the snapshot of a
+        // store that never had any -- byte-identical, and diffable against it.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        let before = store.snapshot();
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        assert_eq!(store.erase_edges(acme).unwrap(), 1);
+        assert_eq!(store.snapshot(), before);
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn repointing_moves_edges_in_both_directions() {
+        let (mut store, kept) = store_with_user();
+        let absorbed = store.create_entity("person", JAN);
+        let acme = store.create_entity("org", JAN);
+        let boss = store.create_entity("person", JAN);
+        store
+            .relate(
+                absorbed,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .relate(
+                boss,
+                "manages",
+                absorbed,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        assert_eq!(store.repoint_edges(absorbed, kept).unwrap(), 2);
+        assert_eq!(store.edges_from(kept, MAR, OCT).len(), 1);
+        assert_eq!(store.edges_into(kept, MAR, OCT).len(), 1);
+        assert_eq!(store.edges_from(absorbed, MAR, OCT).len(), 0);
+        assert_eq!(store.edges_into(absorbed, MAR, OCT).len(), 0);
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn repointing_drops_an_edge_that_would_become_a_self_edge() {
+        // The two entities turned out to be one, so "A manages B" is now "A
+        // manages A" -- which relate() refuses to create, so it must not be
+        // creatable this way either.
+        let (mut store, kept) = store_with_user();
+        let absorbed = store.create_entity("person", JAN);
+        store
+            .relate(
+                kept,
+                "manages",
+                absorbed,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        store.repoint_edges(absorbed, kept).unwrap();
+        assert_eq!(store.edges_from(kept, MAR, OCT).len(), 0);
+        assert_eq!(store.edges_into(kept, MAR, OCT).len(), 0);
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn repointing_merges_history_when_both_entities_held_the_same_edge() {
+        // Both knew about Acme. After the merge that is one relationship with
+        // two sources, not one that overwrote the other.
+        let (mut store, kept) = store_with_user();
+        let absorbed = store.create_entity("person", JAN);
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                kept,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .relate(
+                absorbed,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(MAR),
+            )
+            .unwrap();
+
+        store.repoint_edges(absorbed, kept).unwrap();
+        assert_eq!(store.edges_from(kept, MAR, OCT).len(), 1);
+        assert_eq!(
+            store.edge_history(kept, "employed_by", acme).len(),
+            2,
+            "neither source's assertion is discarded"
+        );
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn a_merged_log_still_breaks_ingestion_ties_toward_the_later_append() {
+        // Both sides heard it at the same instant, so the merged log has two
+        // versions the ingestion order cannot separate. The stable sort keeps
+        // them in the order they were concatenated, which is what makes
+        // `in_force`'s index tie-break answer the same way on every run.
+        let (mut store, kept) = store_with_user();
+        let absorbed = store.create_entity("person", JAN);
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                kept,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .relate(
+                absorbed,
+                "employed_by",
+                acme,
+                Interval::since(JUL),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        store.repoint_edges(absorbed, kept).unwrap();
+        let history = store.edge_history(kept, "employed_by", acme);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].valid, Interval::since(JAN), "the survivor's own");
+        assert_eq!(history[1].valid, Interval::since(JUL), "then the absorbed");
+        assert_eq!(
+            store.edges_from(kept, OCT, OCT)[0].valid,
+            Interval::since(JUL),
+            "the later append wins the tie, as it does without a merge"
+        );
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn a_move_into_an_empty_destination_keeps_the_log_in_the_order_it_was_appended() {
+        // `edge_history` documents itself as append order, and `push_edge`
+        // appends in call order, so a log can legitimately run backwards along
+        // the ingestion axis: asserted in March, then corrected by something
+        // only heard about in January. A move onto an entity holding no such
+        // triple has merged nothing, so it has nothing to reorder and must hand
+        // the log over exactly as it stood. Sorting it anyway would be invisible
+        // to every query -- `in_force` takes the maximum ingestion however the
+        // vector is ordered -- which is precisely why nothing else would catch
+        // it silently rewriting an audit trail nobody asked to merge.
+        let (mut store, kept) = store_with_user();
+        let absorbed = store.create_entity("person", JAN);
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                absorbed,
+                "employed_by",
+                acme,
+                Interval::since(JUL),
+                user_said(MAR),
+            )
+            .unwrap();
+        store
+            .relate(
+                absorbed,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        assert_eq!(
+            ingestion_order(store.edge_history(absorbed, "employed_by", acme)),
+            vec![MAR, JAN],
+            "setup: the source log has to run backwards, or this proves nothing"
+        );
+
+        assert_eq!(store.repoint_edges(absorbed, kept).unwrap(), 1);
+        assert_eq!(
+            ingestion_order(store.edge_history(kept, "employed_by", acme)),
+            vec![MAR, JAN],
+            "an empty destination merged nothing, so nothing was reordered"
+        );
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn a_merged_log_keeps_versions_sharing_an_ingestion_time_in_their_relative_order() {
+        // `in_force` breaks an ingestion tie on position, so where versions
+        // share an ingestion time the merge's own ordering is what decides
+        // which one answers. Only a stable sort makes that ordering a property
+        // of the inputs rather than of whatever the sort happened to do.
+        //
+        // Twelve versions a side, not three: an unstable sort falls back to
+        // insertion sort on short slices and preserves order there by accident,
+        // so a handful of versions would pin nothing. Each is identified by its
+        // valid start, which is the only thing separating versions that share a
+        // provenance.
+        let (mut store, kept) = store_with_user();
+        let absorbed = store.create_entity("person", JAN);
+        let acme = store.create_entity("org", JAN);
+        for start in 200..212 {
+            store
+                .relate(
+                    kept,
+                    "employed_by",
+                    acme,
+                    Interval::since(start),
+                    user_said(SEP),
+                )
+                .unwrap();
+        }
+        for start in 100..112 {
+            store
+                .relate(
+                    absorbed,
+                    "employed_by",
+                    acme,
+                    Interval::since(start),
+                    user_said(JAN),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.repoint_edges(absorbed, kept).unwrap(), 1);
+        let expected: Vec<Interval> = (100..112).chain(200..212).map(Interval::since).collect();
+        assert_eq!(
+            store
+                .edge_history(kept, "employed_by", acme)
+                .iter()
+                .map(|v| v.valid)
+                .collect::<Vec<_>>(),
+            expected,
+            "the absorbed log sorts ahead by ingestion, and neither group is shuffled inside itself"
+        );
+        assert_eq!(
+            store.edges_from(kept, 250, 250)[0].valid,
+            Interval::since(211),
+            "so the tie-break still names the last version appended before the merge"
+        );
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn repointing_an_entity_onto_itself_changes_nothing() {
+        // A caller resolving two references that turn out to be one id. Every
+        // edge on the entity is also an edge on the survivor, so a naive move
+        // reads the whole neighbourhood as collapsing into self-edges and
+        // deletes it.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        let boss = store.create_entity("person", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+        store
+            .relate(boss, "manages", user, Interval::since(JAN), user_said(JAN))
+            .unwrap();
+
+        assert_eq!(store.repoint_edges(user, user).unwrap(), 0);
+        assert_eq!(store.edges_from(user, MAR, OCT).len(), 1);
+        assert_eq!(store.edges_into(user, MAR, OCT).len(), 1);
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn erasing_edges_on_an_unknown_entity_is_an_error() {
+        // The same answer `erase` gives the same mistake, and for the same
+        // reason: the caller is working from an id that means nothing, and a
+        // bare 0 would let a typo read as a completed deletion. An entity that
+        // exists and simply has no edges still reports Ok(0) -- what the caller
+        // wanted is already true there.
+        let (mut store, user) = store_with_user();
+        assert_eq!(
+            store.erase_edges(9999),
+            Err(StoreError::UnknownEntity(9999))
+        );
+        assert_eq!(store.erase_edges(user).unwrap(), 0);
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn repointing_either_end_of_a_merge_onto_an_unknown_id_is_an_error() {
+        // `relate` rejects an endpoint naming no entity and `open` rejects a
+        // snapshot holding one, so moving edges onto one would write a store
+        // that cannot be reopened -- damage found at restore, long after this
+        // call. Reporting 0 would not be enough either: that is what "there was
+        // nothing to move" says, so the caller could not tell the two apart.
+        // The edges stay where they are, findable, and the store still opens.
+        let (mut store, user) = store_with_user();
+        let acme = store.create_entity("org", JAN);
+        store
+            .relate(
+                user,
+                "employed_by",
+                acme,
+                Interval::since(JAN),
+                user_said(JAN),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.repoint_edges(user, 9999),
+            Err(StoreError::UnknownEntity(9999))
+        );
+        assert_eq!(
+            store.repoint_edges(9999, user),
+            Err(StoreError::UnknownEntity(9999)),
+            "the absorbed id is checked too, not just the survivor"
+        );
+        assert_eq!(
+            store.repoint_edges(9999, 9999),
+            Err(StoreError::UnknownEntity(9999)),
+            "an unknown id merged into itself is still unknown, not a no-op"
+        );
+
+        assert_eq!(store.edges_from(user, MAR, OCT).len(), 1);
+        assert!(MemoryStore::open(&store.snapshot()).is_ok());
+        assert_maps_agree(&store);
+    }
+
+    #[test]
+    fn a_repointed_store_equals_its_own_round_trip() {
+        // `open` rebuilds the reverse map from the forward one, so a restored
+        // store carries the reverse map the forward edges imply. Comparing it
+        // to the live one is the strongest available statement that the move
+        // left the two in step -- including the empty entries a removal can
+        // leave, which the rebuild never produces.
+        let (mut store, kept) = store_with_user();
+        let absorbed = store.create_entity("person", JAN);
+        let acme = store.create_entity("org", JAN);
+        let boss = store.create_entity("person", JAN);
+        for (subject, predicate, object) in [
+            (absorbed, "employed_by", acme),
+            (boss, "manages", absorbed),
+            (kept, "manages", absorbed),
+        ] {
+            store
+                .relate(
+                    subject,
+                    predicate,
+                    object,
+                    Interval::since(JAN),
+                    user_said(JAN),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(store.repoint_edges(absorbed, kept).unwrap(), 3);
+        assert_eq!(MemoryStore::open(&store.snapshot()).unwrap(), store);
+        assert_maps_agree(&store);
     }
 
     // ---- persistence -------------------------------------------------------
