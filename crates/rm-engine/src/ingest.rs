@@ -5,7 +5,7 @@
 //! to a `StableId` lives here because here is where the ids are born — inside
 //! `remember`, which resolves the mention against everything already known.
 
-use rm_core::{Interval, Provenance, Source};
+use rm_core::{Interval, Provenance, Source, Timestamp};
 use rm_extract::{Extraction, Turn};
 use rm_store::StableId;
 
@@ -81,6 +81,15 @@ impl Engine {
         extraction: &Extraction,
         embedder: &impl Embedder,
     ) -> Result<Ingested, EngineError> {
+        // Every mention index checked before anything else, embeddings
+        // included: `extract` refuses these for its own output, but
+        // `Extraction`'s fields are `pub` and this function is `pub`, so a
+        // hand-built extraction with an out-of-range index is not a
+        // hypothetical -- it is how every test in this crate exercises
+        // `ingest`. Checked this early so a bad index costs nothing, the same
+        // guarantee the embedder check just below gives a failing embedder.
+        validate_indices(extraction)?;
+
         // Every vector first, and every vector checked, before the first write.
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(extraction.mentions.len());
         for mention in &extraction.mentions {
@@ -126,12 +135,12 @@ impl Engine {
         // different search targets: sharing an embedding would make "where does
         // he work" reachable only by first reaching Ben.
         for (fact, embedding) in extraction.facts.iter().zip(fact_vectors) {
-            // `fact.subject` cannot be out of bounds: `rm_extract::extract`
-            // refuses any fact naming a mention index `>= mentions.len()`
-            // before an `Extraction` is ever produced. `out.entities` has one
-            // entry per mention, filled by the loop above in mention order, so
-            // `out.entities[fact.subject]` is the entity that mention already
-            // resolved to.
+            // `fact.subject` is in range: `validate_indices` checked every
+            // fact, relation and closure subject/object against
+            // `extraction.mentions.len()` before the first write above.
+            // `out.entities` has one entry per mention, filled by the loop
+            // above in mention order, so `out.entities[fact.subject]` is the
+            // entity that mention already resolved to.
             //
             // Writing straight to that entity rather than calling `remember`
             // again is deliberate, not an optimisation: `remember` resolves by
@@ -149,6 +158,7 @@ impl Engine {
             // to the same entity its mention already did") actually hold
             // rather than usually hold.
             let entity = out.entities[fact.subject];
+            let subject_mention = &extraction.mentions[fact.subject];
             // `write` only reads `attribute`, `value`, `valid`, `provenance`
             // and `embedding` -- `kind` and `mention` exist because
             // `Observation` is the one shape both `remember` and `write` take,
@@ -156,9 +166,8 @@ impl Engine {
             let assertion = self.write(
                 entity,
                 &Observation {
-                    kind: extraction.mentions[fact.subject].kind.clone(),
-                    mention: Record::new()
-                        .with("name", extraction.mentions[fact.subject].name.clone()),
+                    kind: subject_mention.kind.clone(),
+                    mention: Record::new().with("name", subject_mention.name.clone()),
                     attribute: fact.attribute.clone(),
                     value: fact.value.clone(),
                     valid: Interval::since(fact.valid_from),
@@ -170,10 +179,11 @@ impl Engine {
         }
 
         for relation in &extraction.relations {
-            // `relation.subject` and `relation.object` cannot be out of bounds
-            // for the same reason as `fact.subject` above, and `out.entities`
-            // has exactly one entry per mention -- built by the loop just
-            // above, in the same order `extract` assigned local indices.
+            // `relation.subject` and `relation.object` are in range for the
+            // same reason as `fact.subject` above -- `validate_indices`
+            // already checked them -- and `out.entities` has exactly one
+            // entry per mention, built by the loop just above in the same
+            // order `extract` assigned local indices.
             self.relate(
                 out.entities[relation.subject],
                 relation.predicate.clone(),
@@ -183,8 +193,92 @@ impl Engine {
             )?;
         }
 
+        // Closures last, so an edge this same turn asserted is already in place
+        // and can be excluded. "I moved from Acme to Globex" must not close
+        // Globex as fast as it opened it.
+        for closure in &extraction.closures {
+            let subject = out.entities[closure.subject];
+
+            // Edges this extraction asserted for the same subject and
+            // predicate. Anything else in force is what the closure ends.
+            let spared: Vec<StableId> = extraction
+                .relations
+                .iter()
+                .filter(|r| r.subject == closure.subject && r.predicate == closure.predicate)
+                .map(|r| out.entities[r.object])
+                .collect();
+
+            // `Timestamp::MAX` on the transaction axis: the question is which
+            // edges the store holds *now*, not what it believed earlier. The
+            // engine has no clock, and reusing `closure.at` -- a valid-time
+            // value -- would hide any edge learned after the moment the closure
+            // speaks about, leaving it open forever.
+            let doomed: Vec<(String, StableId)> = self
+                .edges_from(subject, closure.at, Timestamp::MAX)
+                .into_iter()
+                .filter(|e| e.predicate == closure.predicate && !spared.contains(&e.object))
+                .map(|e| (e.predicate.to_string(), e.object))
+                .collect();
+
+            // `AgentInference`, which `rm_core` documents as the weakest source: "inferences are derived from the others and re-deriving one does not make it more true". That is what makes this safe to do at all -- the closure is traceable in `edge_history`, it can never be mistaken for something the user said, and `Strategy::SourcePriority` can rank it below a user assertion so a later correction wins with no special handling.
+            let inferred = Provenance::new(
+                Source::AgentInference,
+                turn.observed_at,
+                turn.session.clone(),
+            );
+
+            for (predicate, object) in doomed {
+                self.unrelate(subject, &predicate, object, closure.at, inferred.clone())?;
+                out.closed.push(Closed {
+                    subject,
+                    predicate,
+                    object,
+                    because: closure.because.clone(),
+                });
+            }
+        }
+
         Ok(out)
     }
+}
+
+/// Check every fact, relation and closure names a mention this extraction
+/// actually has, before `ingest` writes anything.
+///
+/// `rm_extract::extract` enforces this for its own output, but `Extraction`'s
+/// fields are `pub` and `ingest` is `pub`, so a caller can build one with an
+/// out-of-range index directly -- every test in this crate does, to exercise
+/// `ingest` without going through `extract` at all. Indexing straight into
+/// `out.entities` on a bad index would panic on input the type system allows,
+/// which is not how any other door in this workspace treats a caller's
+/// mistake: `MemoryStore::open` validates its snapshot, `Engine::relate`
+/// validates its endpoints, and `extract` validates these same indices for
+/// the extractions it builds itself. `ingest` owes its own callers the same
+/// treatment rather than trusting a guarantee it cannot see enforced.
+fn validate_indices(extraction: &Extraction) -> Result<(), EngineError> {
+    let mentions = extraction.mentions.len();
+    let in_range = |what: &'static str, index: usize| -> Result<(), EngineError> {
+        if index < mentions {
+            Ok(())
+        } else {
+            Err(EngineError::BadMentionIndex {
+                what,
+                index,
+                mentions,
+            })
+        }
+    };
+    for fact in &extraction.facts {
+        in_range("fact subject", fact.subject)?;
+    }
+    for relation in &extraction.relations {
+        in_range("relation subject", relation.subject)?;
+        in_range("relation object", relation.object)?;
+    }
+    for closure in &extraction.closures {
+        in_range("closure subject", closure.subject)?;
+    }
+    Ok(())
 }
 
 /// Fold one `remember` result into the running record.
