@@ -89,9 +89,11 @@ employer = "valid_interval"
 /// ran, exited 0, and the user believed a key they had just written into a
 /// committed file was in use when it never was.
 ///
-/// It earns its place a second way, on ordinary typos. `embeding_model` used
-/// to fall through and surface later as a missing-field error naming
-/// `embedding_model`, which is the one field the file appears to have.
+/// It earns its place a second way, on ordinary mistakes. A field written
+/// `embedding_model_name` -- reasonable, if you think the field is named for
+/// the model's name -- used to fall through and surface later as a
+/// missing-field error naming `embedding_model`, which is the one field the
+/// file appears to already have.
 ///
 /// The message names the field and never its value. That is the whole point:
 /// the value is the part that may be a key.
@@ -499,24 +501,24 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
     }
 
     #[test]
-    fn a_misspelled_field_is_refused_naming_the_word_that_was_written() {
+    fn a_field_that_is_not_one_is_refused_naming_the_word_that_was_written() {
         use crate::testing::TempDir;
 
-        // The ordinary-typo half of the same guard. `embeding_model` used to
-        // fall through and reappear later as "missing field
-        // `embedding_model`" -- a message naming the one field the file
-        // appears to have, which sends the reader looking in the wrong
-        // place.
+        // The ordinary-mistake half of the same guard. A field written
+        // `embedding_model_name` used to fall through and reappear later as
+        // "missing field `embedding_model`" -- a message naming the one field
+        // the file appears to already have, which sends the reader looking in
+        // the wrong place.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
         std::fs::write(
             &path,
-            TEMPLATE.replace("embedding_model =", "embeding_model ="),
+            TEMPLATE.replace("embedding_model =", "embedding_model_name ="),
         )
         .unwrap();
 
         let err = Config::load(&path).unwrap_err().to_string();
-        assert!(err.contains("embeding_model"), "{err}");
+        assert!(err.contains("embedding_model_name"), "{err}");
     }
 
     #[test]
