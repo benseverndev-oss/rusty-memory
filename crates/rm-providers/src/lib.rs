@@ -147,29 +147,117 @@ impl HttpProvider {
         Ok(self.redact(&text))
     }
 
-    /// Replace every exact, case-sensitive occurrence of the API key in
-    /// `text` with `[REDACTED]`.
+    /// Replace every occurrence of the API key in `text` with `[REDACTED]`,
+    /// whether it is echoed verbatim or in a masked rendering.
     ///
-    /// Covers the leak this crate found: a provider echoing the whole key
-    /// back verbatim in an error body ("invalid api key: sk-..."), which
-    /// `wire::api_error` would otherwise relay word-for-word like every other
-    /// provider message. It does not catch a masked or partial echo
-    /// (`sk-abc***`, a truncated prefix or suffix), nor a re-cased,
-    /// URL-encoded, JSON-escaped, or line-split rendering of the key — a
-    /// matcher that started guessing at those would trade one class of leak
-    /// for a class of false positives. For the `sk-`-style keys this crate
-    /// targets, the verbatim echo is the realistic case, and it is the one
-    /// this function is for.
+    /// Two shapes, because two shapes are what providers actually send.
+    ///
+    /// **Verbatim.** Self-hosted OpenAI-compatible servers -- vLLM, LiteLLM,
+    /// LM Studio -- echo the offending credential in full in a 401 body
+    /// ("invalid api key: sk-..."), and `wire::api_error` relays a provider's
+    /// message word-for-word by design. A plain substring replacement covers
+    /// that.
+    ///
+    /// **Masked.** OpenAI itself -- the provider `rm-cli`'s own `TEMPLATE`
+    /// ships with, so the default configuration -- does not echo the key
+    /// whole. It sends the first 8 characters, asterisks padded out to the
+    /// key's length, then the last 4:
+    ///
+    /// ```text
+    /// Incorrect API key provided: sk-FAKE-********************6789. You can
+    /// find your API key at https://platform.openai.com/account/api-keys
+    /// ```
+    ///
+    /// No substring of that equals the key, so the verbatim pass alone is a
+    /// no-op against the provider this crate is most likely to be pointed at.
+    /// [`Self::redact_masked`] closes it, keyed entirely on the key already
+    /// held rather than on anything that merely looks like a credential.
+    ///
+    /// **Still uncaught, and named rather than implied:** a rendering showing
+    /// only a suffix (`...6789`) or only a prefix (`sk-FAKE-...`), a re-cased,
+    /// URL-encoded, JSON-escaped or line-split rendering, and any mask whose
+    /// visible head and tail are shorter than 8 and 4 characters. Chasing
+    /// those would mean guessing at what looks like a secret, which trades a
+    /// known false negative for a class of false positives -- mangled provider
+    /// messages, and a redactor nobody can predict. Every rule here is still
+    /// "match against the key we hold".
     fn redact(&self, text: &str) -> String {
         if self.api_key.is_empty() {
             // `str::replace` with an empty pattern inserts the replacement
             // between every character instead of doing nothing, so an empty
-            // key — invalid in practice, but not a type error — must be
+            // key -- invalid in practice, but not a type error -- must be
             // handled separately rather than falling into the branch below.
-            text.to_string()
-        } else {
-            text.replace(self.api_key.as_str(), "[REDACTED]")
+            return text.to_string();
         }
+        let verbatim = text.replace(self.api_key.as_str(), "[REDACTED]");
+        self.redact_masked(&verbatim)
+    }
+
+    /// Replace `<first 8 chars of the key> <anything> <last 4 chars of the
+    /// key>` with `[REDACTED]`, where `<anything>` is short enough to be a
+    /// mask of this key rather than unrelated prose.
+    ///
+    /// The window is the key's own length plus a little slack, so a mask that
+    /// pads to a slightly different width still matches while a prefix
+    /// appearing in one sentence and a suffix in the next does not join up
+    /// into one enormous redaction that swallows the provider's message.
+    fn redact_masked(&self, text: &str) -> String {
+        // Below 16 bytes the head and the tail would overlap, and a 12-of-16
+        // character match is loose enough to start hitting ordinary text.
+        // Short keys keep the verbatim pass only.
+        const HEAD: usize = 8;
+        const TAIL: usize = 4;
+        const SLACK: usize = 8;
+
+        if self.api_key.len() < 16 {
+            return text.to_string();
+        }
+        // On character boundaries: an API key is ASCII in practice, but
+        // `api_key` is a `String` a config file supplies and slicing it
+        // mid-character would panic.
+        let head_end = self
+            .api_key
+            .char_indices()
+            .nth(HEAD)
+            .map_or(self.api_key.len(), |(i, _)| i);
+        let tail_start = self
+            .api_key
+            .char_indices()
+            .nth_back(TAIL - 1)
+            .map_or(0, |(i, _)| i);
+        if head_end >= tail_start {
+            // Fewer than 12 characters despite 16-plus bytes: multibyte, so
+            // not a key shape this handles.
+            return text.to_string();
+        }
+        let head = &self.api_key[..head_end];
+        let tail = &self.api_key[tail_start..];
+
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find(head) {
+            // Past the head either way, so `rest` always shrinks by at least
+            // `head.len()` -- which is non-empty -- and this cannot spin on a
+            // zero-width or overlapping match.
+            let after = at + head.len();
+            let mut window = (after + self.api_key.len() + SLACK).min(rest.len());
+            while !rest.is_char_boundary(window) {
+                window -= 1;
+            }
+            match rest[after..window].find(tail) {
+                Some(found) => {
+                    out.push_str(&rest[..at]);
+                    out.push_str("[REDACTED]");
+                    rest = &rest[after + found + tail.len()..];
+                }
+                None => {
+                    out.push_str(&rest[..after]);
+                    rest = &rest[after..];
+                }
+            }
+        }
+        out.push_str(rest);
+        out
     }
 
     /// The length of a vector this provider's embedding model produces.
@@ -313,6 +401,87 @@ mod tests {
         assert!(
             !err.to_string().contains(key),
             "an error must never carry the key: {err}"
+        );
+    }
+
+    #[test]
+    fn the_masked_key_openai_echoes_back_is_scrubbed_before_it_reaches_the_caller() {
+        // The fixture is the shape the default provider actually sends, not
+        // one invented to suit the implementation. `TEMPLATE` ships
+        // `base_url = "https://api.openai.com/v1"`, and OpenAI does not echo
+        // a rejected key whole: it sends the first 8 characters, asterisks
+        // padded out to the key's length, then the last 4. Nothing in that is
+        // a substring of the key, so the verbatim replacement `redact`
+        // started as was a no-op against the one provider this crate is
+        // configured for out of the box -- 12 characters of a live
+        // credential reaching stderr, scrollback and CI logs.
+        let key = "sk-FAKE-0123456789abcdefghij6789";
+        let masked = "sk-FAKE-********************6789";
+        assert_eq!(key.len(), masked.len(), "the mask pads to the key's length");
+
+        let body = format!(
+            r#"{{"error":{{"message":"Incorrect API key provided: {masked}. You can find your API key at https://platform.openai.com/account/api-keys","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}}}"#
+        );
+        let provider = HttpProvider::new(
+            "https://api.openai.com/v1".into(),
+            key.into(),
+            "gpt-4o-mini".into(),
+            "text-embedding-3-small".into(),
+        );
+        let response = ureq::Response::new(401, "Unauthorized", &body).unwrap();
+        let text = provider
+            .handle_response(Err(ureq::Error::Status(401, response)))
+            .expect("a readable body is not a transport failure");
+        let err = parse_completion(&text).unwrap_err().to_string();
+
+        assert!(
+            !err.contains("sk-FAKE-"),
+            "the visible head of the key leaked: {err}"
+        );
+        assert!(
+            !err.contains(masked),
+            "the masked rendering leaked whole: {err}"
+        );
+        assert!(err.contains("[REDACTED]"), "{err}");
+        assert!(
+            err.contains("You can find your API key at"),
+            "the rest of the provider's message has to survive: {err}"
+        );
+    }
+
+    #[test]
+    fn a_head_and_a_tail_too_far_apart_to_be_one_mask_are_left_alone() {
+        // The masked match is bounded so a message that happens to open with
+        // the key's first characters and close with its last does not
+        // collapse into one redaction that swallows everything between. The
+        // bound is the key's own length plus a little slack, which is what a
+        // real mask fits inside and ordinary prose does not.
+        let key = "sk-FAKE-0123456789abcdefghij6789";
+        let provider = HttpProvider::new(
+            "https://api.openai.com/v1".into(),
+            key.into(),
+            "c".into(),
+            "e".into(),
+        );
+        let text = "sk-FAKE- appears here, and then a long stretch of the provider explaining itself at length before anything ends in 6789";
+        assert_eq!(provider.redact(text), text);
+    }
+
+    #[test]
+    fn a_key_too_short_for_a_head_and_a_tail_still_gets_the_verbatim_pass() {
+        // Below 16 bytes the 8-character head and the 4-character tail would
+        // overlap, so the masked rule is off and exact matching is all there
+        // is. That still has to work.
+        let provider =
+            HttpProvider::new("http://h".into(), "sk-short".into(), "c".into(), "e".into());
+        assert_eq!(
+            provider.redact("refused: sk-short is not a key"),
+            "refused: [REDACTED] is not a key"
+        );
+        assert_eq!(
+            provider.redact("refused: sk-sh***rt"),
+            "refused: sk-sh***rt",
+            "a short key must not start matching loosely instead"
         );
     }
 
