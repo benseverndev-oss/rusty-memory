@@ -16,11 +16,11 @@
 //! # Why almost all of it is testable offline
 //!
 //! `wire`, private to this crate and so deliberately not linked here, holds
-//! the request bodies and the response parsing as pure
-//! functions, and those carry the behaviour worth testing: what a prompt with
-//! quotes and newlines in it becomes, what an error response means, what an
-//! empty one means. What is left in this module is a few lines of transport per
-//! method. The tests below pin its two observable properties — a trailing
+//! the request bodies and the response parsing as pure functions, and those
+//! carry the behaviour worth testing: what a prompt with quotes and newlines
+//! in it becomes, what an error response means, what an empty one means. What
+//! is left in this module is a few lines of transport per method. The tests
+//! below pin its two observable properties — a trailing
 //! slash on the base URL doesn't double up, and a failure to connect never
 //! carries the API key — by dialing a port nothing listens on, which is a
 //! transport failure without a socket that leaves the machine.
@@ -424,6 +424,11 @@ mod tests {
         let body = format!(
             r#"{{"error":{{"message":"Incorrect API key provided: {masked}. You can find your API key at https://platform.openai.com/account/api-keys","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}}}"#
         );
+        // `TEMPLATE`'s own defaults, so the fixture says out loud which
+        // provider this is about. Nothing here dials them: this test calls
+        // `handle_response` with a `Response` built in memory, and no method
+        // that reaches `ureq::post` is invoked. No socket, as everywhere else
+        // in this suite.
         let provider = HttpProvider::new(
             "https://api.openai.com/v1".into(),
             key.into(),
@@ -459,6 +464,7 @@ mod tests {
         // bound is the key's own length plus a little slack, which is what a
         // real mask fits inside and ordinary prose does not.
         let key = "sk-FAKE-0123456789abcdefghij6789";
+        // Only `redact` is called; nothing here opens a connection.
         let provider = HttpProvider::new(
             "https://api.openai.com/v1".into(),
             key.into(),
