@@ -113,7 +113,17 @@ impl HttpProvider {
         self.handle_response(response)
     }
 
-    /// Turn a `ureq` result into body text, with the key scrubbed either way.
+    /// Turn a `ureq` result into body text.
+    ///
+    /// The `Ok` body and the `Status` arm's body both reach `redact` below
+    /// before this returns: those are response content, which is where a
+    /// provider could echo the key back. The `Transport` arm and both
+    /// `into_string()` failure arms return via `?` first and never reach it —
+    /// their strings come from the transport and IO layers (a refused
+    /// connection, a body that failed to decode as UTF-8), not from response
+    /// content or the `Authorization` header, so there is nothing in them for
+    /// `redact` to catch. `a_transport_failure_never_carries_the_api_key`
+    /// pins the `Transport` arm specifically, end to end.
     ///
     /// Split out from `post` so the `Status` arm — reached only when a real
     /// server answers with a non-2xx — can be driven in a test with a
@@ -137,14 +147,19 @@ impl HttpProvider {
         Ok(self.redact(&text))
     }
 
-    /// Scrub every occurrence of the API key out of `text`.
+    /// Replace every exact, case-sensitive occurrence of the API key in
+    /// `text` with `[REDACTED]`.
     ///
-    /// Some providers echo the offending credential back in an error body —
-    /// "invalid api key: sk-...". `wire::api_error` deliberately relays a
-    /// provider's own words verbatim for every other message, which would
-    /// relay the key too on an account this crate does not control. This is
-    /// the one point every response body passes through before becoming a
-    /// `ProviderError`, so it is the one place that has to catch that.
+    /// Covers the leak this crate found: a provider echoing the whole key
+    /// back verbatim in an error body ("invalid api key: sk-..."), which
+    /// `wire::api_error` would otherwise relay word-for-word like every other
+    /// provider message. It does not catch a masked or partial echo
+    /// (`sk-abc***`, a truncated prefix or suffix), nor a re-cased,
+    /// URL-encoded, JSON-escaped, or line-split rendering of the key — a
+    /// matcher that started guessing at those would trade one class of leak
+    /// for a class of false positives. For the `sk-`-style keys this crate
+    /// targets, the verbatim echo is the realistic case, and it is the one
+    /// this function is for.
     fn redact(&self, text: &str) -> String {
         if self.api_key.is_empty() {
             // `str::replace` with an empty pattern inserts the replacement
@@ -299,5 +314,23 @@ mod tests {
             !err.to_string().contains(key),
             "an error must never carry the key: {err}"
         );
+    }
+
+    #[test]
+    fn an_empty_key_leaves_the_response_text_unchanged_rather_than_corrupting_it() {
+        // `str::replace` with an empty pattern does not no-op: it inserts the
+        // replacement between every character, since an empty string matches
+        // at every position. `redact` guards against that explicitly, and
+        // this pins the reason the guard exists rather than just its
+        // presence — see the mutation check in the task report, which
+        // removed the guard and watched this test catch the corruption.
+        let provider = HttpProvider::new(
+            "http://127.0.0.1:1".into(),
+            String::new(),
+            "c".into(),
+            "e".into(),
+        );
+        let text = r#"{"error":{"message":"no key was supplied"}}"#;
+        assert_eq!(provider.redact(text), text);
     }
 }
