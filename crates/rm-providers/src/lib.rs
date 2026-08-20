@@ -107,12 +107,35 @@ impl HttpProvider {
     /// possibly an issue tracker, and a key that reaches any of those has to be
     /// rotated.
     fn post(&self, path: &str, body: String) -> Result<String, ProviderError> {
-        let response = ureq::post(&self.url(path))
+        let url = self.url(path);
+        let response = ureq::post(&url)
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .set("Content-Type", "application/json")
             .send_string(&body);
 
-        self.handle_response(response)
+        self.handle_response(response, &url, path)
+    }
+
+    /// `message` with the request URL replaced by the field it came from.
+    ///
+    /// `ureq` opens a transport error with the URL it was given, and that URL
+    /// is `base_url` — a value out of `rmem.toml`. `rm-cli` refuses to repeat
+    /// a config value in an error for the reason six leaks on that side
+    /// established, and a URL is a config value like any other: nothing stops
+    /// a key being pasted into `base_url`, and it came straight back out.
+    ///
+    /// Substituted rather than filtered: this replaces the exact string this
+    /// method built, and then the exact `base_url` it holds, so it can never
+    /// remove anything it did not put there. The endpoint stays, because
+    /// `embeddings` and `chat/completions` are this crate's own words and are
+    /// the half of the URL a reader actually needs — "the base_url in your
+    /// config, plus /embeddings" says where it went without saying what is
+    /// written there.
+    fn without_the_configured_url(&self, message: &str, url: &str, path: &str) -> String {
+        let named = format!("<base_url from rmem.toml>/{path}");
+        message
+            .replace(url, &named)
+            .replace(self.base_url.as_str(), "<base_url from rmem.toml>")
     }
 
     /// Turn a `ureq` result into body text.
@@ -127,23 +150,28 @@ impl HttpProvider {
     /// `redact` to catch. `a_transport_failure_never_carries_the_api_key`
     /// pins the `Transport` arm specifically, end to end.
     ///
+    /// They do carry the other thing an error here must not carry, which is
+    /// the request URL: `ureq` opens its message with it, and it is built from
+    /// `base_url` out of `rmem.toml`. Every arm goes through
+    /// [`Self::without_the_configured_url`] on the way out.
+    ///
     /// Split out from `post` so the `Status` arm — reached only when a real
     /// server answers with a non-2xx — can be driven in a test with a
     /// response built in-process by `ureq::Response::new`, without a socket.
     fn handle_response(
         &self,
         response: Result<ureq::Response, ureq::Error>,
+        url: &str,
+        path: &str,
     ) -> Result<String, ProviderError> {
+        let transport =
+            |e: String| ProviderError::Transport(self.without_the_configured_url(&e, url, path));
         let text = match response {
-            Ok(r) => r
-                .into_string()
-                .map_err(|e| ProviderError::Transport(e.to_string())),
+            Ok(r) => r.into_string().map_err(|e| transport(e.to_string())),
             // A non-2xx with a body is the provider explaining itself, and the
             // body says more than the status line does.
-            Err(ureq::Error::Status(_, r)) => r
-                .into_string()
-                .map_err(|e| ProviderError::Transport(e.to_string())),
-            Err(ureq::Error::Transport(t)) => Err(ProviderError::Transport(t.to_string())),
+            Err(ureq::Error::Status(_, r)) => r.into_string().map_err(|e| transport(e.to_string())),
+            Err(ureq::Error::Transport(t)) => Err(transport(t.to_string())),
         }?;
 
         Ok(self.redact(&text))
@@ -387,6 +415,37 @@ mod tests {
     }
 
     #[test]
+    fn a_transport_failure_never_carries_the_configured_base_url_either() {
+        // `base_url` is a value out of `rmem.toml`, and `ureq` opens its
+        // transport message with the URL it was handed. So a key pasted into
+        // `base_url` came back out of a connection error verbatim -- the same
+        // class as the six key leaks on the `rm-cli` side, arriving through a
+        // dependency's message rather than through one of ours.
+        //
+        // Still offline: port 1 on loopback has nothing listening, so the
+        // local kernel refuses the connection and no packet leaves the
+        // machine.
+        let leak = "sk-proj-FAKE-SECRET-IN-THE-BASE-URL-9999";
+        let provider = HttpProvider::new(
+            format!("http://127.0.0.1:1/{leak}"),
+            "sk-key-not-under-test".into(),
+            "c".into(),
+            "e".into(),
+        );
+        let err = provider.embed("anything").unwrap_err().0;
+
+        assert!(!err.contains(leak), "base_url came back out: {err}");
+        assert!(
+            err.contains("<base_url from rmem.toml>/embeddings"),
+            "the endpoint is this crate's own word and has to survive: {err}"
+        );
+        assert!(
+            err.contains("could not reach the provider"),
+            "and so does the reason: {err}"
+        );
+    }
+
+    #[test]
     fn a_completer_transport_failure_also_says_it_could_not_reach_the_provider() {
         // `complete` and `embed` share `post`; only `embed` was exercised
         // above. This pins the same conversion through the other port so a
@@ -419,7 +478,11 @@ mod tests {
         // production. The `ProviderError` the reviewer asked about is the
         // one `parse_completion` produces from it.
         let text = provider()
-            .handle_response(Err(ureq::Error::Status(401, response)))
+            .handle_response(
+                Err(ureq::Error::Status(401, response)),
+                "https://h/v1/chat/completions",
+                "chat/completions",
+            )
             .expect("a readable body is not a transport failure");
         let err = parse_completion(&text).unwrap_err();
 
@@ -460,7 +523,11 @@ mod tests {
         );
         let response = ureq::Response::new(401, "Unauthorized", &body).unwrap();
         let text = provider
-            .handle_response(Err(ureq::Error::Status(401, response)))
+            .handle_response(
+                Err(ureq::Error::Status(401, response)),
+                "https://h/v1/chat/completions",
+                "chat/completions",
+            )
             .expect("a readable body is not a transport failure");
         let err = parse_completion(&text).unwrap_err().to_string();
 
