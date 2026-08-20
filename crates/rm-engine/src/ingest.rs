@@ -88,7 +88,7 @@ impl Engine {
         // hypothetical -- it is how every test in this crate exercises
         // `ingest`. Checked this early so a bad index costs nothing, the same
         // guarantee the embedder check just below gives a failing embedder.
-        validate_indices(extraction)?;
+        validate_extraction(extraction)?;
 
         // Every vector first, and every vector checked, before the first write.
         let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(extraction.mentions.len());
@@ -135,7 +135,7 @@ impl Engine {
         // different search targets: sharing an embedding would make "where does
         // he work" reachable only by first reaching Ben.
         for (fact, embedding) in extraction.facts.iter().zip(fact_vectors) {
-            // `fact.subject` is in range: `validate_indices` checked every
+            // `fact.subject` is in range: `validate_extraction` checked every
             // fact, relation and closure subject/object against
             // `extraction.mentions.len()` before the first write above.
             // `out.entities` has one entry per mention, filled by the loop
@@ -180,7 +180,7 @@ impl Engine {
 
         for relation in &extraction.relations {
             // `relation.subject` and `relation.object` are in range for the
-            // same reason as `fact.subject` above -- `validate_indices`
+            // same reason as `fact.subject` above -- `validate_extraction`
             // already checked them -- and `out.entities` has exactly one
             // entry per mention, built by the loop just above in the same
             // order `extract` assigned local indices.
@@ -254,9 +254,20 @@ impl Engine {
     }
 }
 
-/// Check every fact, relation and closure names a mention this extraction
-/// actually has, and that no relation runs from a mention to itself, before
-/// `ingest` writes anything.
+/// Check every mention has a name, that every fact, relation and closure names
+/// a mention this extraction actually has, and that no relation runs from a
+/// mention to itself, before `ingest` writes anything.
+///
+/// All three of `extract`'s refusals, not two of them. The nameless-mention
+/// check matters more here than it does there: `ingest` resolves a mention on a
+/// `Record` carrying only `name`, and a ruleset blocking on
+/// `BlockingKey::Prefix("name", 3)` turns an empty name into the key `name~`.
+/// Every nameless mention therefore lands in one block, and inside it each
+/// scores against every other on the one field they share, blank on both sides
+/// and so in agreement. A ruleset that trusts a name match then merges distinct
+/// things into one entity; a stricter one files a review for every pair. Both
+/// are wrong and neither is an error, which is why this is refused here rather
+/// than left to be noticed.
 ///
 /// `rm_extract::extract` enforces this for its own output, but `Extraction`'s
 /// fields are `pub` and `ingest` is `pub`, so a caller can build one with an
@@ -268,7 +279,16 @@ impl Engine {
 /// validates its endpoints, and `extract` validates these same indices for
 /// the extractions it builds itself. `ingest` owes its own callers the same
 /// treatment rather than trusting a guarantee it cannot see enforced.
-fn validate_indices(extraction: &Extraction) -> Result<(), EngineError> {
+fn validate_extraction(extraction: &Extraction) -> Result<(), EngineError> {
+    // Names first, in `extract`'s own order, so the two refuse the same
+    // extraction with the same complaint rather than with whichever check
+    // happened to run first.
+    for (index, mention) in extraction.mentions.iter().enumerate() {
+        if mention.name.trim().is_empty() {
+            return Err(EngineError::NamelessMention(index));
+        }
+    }
+
     let mentions = extraction.mentions.len();
     let in_range = |what: &'static str, index: usize| -> Result<(), EngineError> {
         if index < mentions {

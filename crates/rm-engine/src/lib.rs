@@ -144,6 +144,24 @@ pub enum EngineError {
     /// never be created the same costs-nothing failure a bad index gets,
     /// rather than one that merely fails no worse than it would have anyway.
     SelfRelation(usize),
+    /// A mention carried no name, and resolution has nothing else to match on.
+    ///
+    /// The third of the three refusals `rm_extract::extract` applies, and the
+    /// one that costs most if it is skipped. [`Engine::ingest`] resolves a
+    /// mention on a `Record` holding only `name`, and the blocking key that
+    /// finds its candidates is a prefix of that field -- so an empty name
+    /// yields the *same* key for every nameless mention, putting all of them in
+    /// one block, where each scores against every other on the one field they
+    /// share and finds it blank on both sides, which agrees.
+    ///
+    /// What that agreement buys depends on the ruleset, and both answers are
+    /// wrong. A ruleset that trusts a name match on its own merges distinct
+    /// things into one entity; a stricter one files a review for every pair.
+    /// Neither is an error, so neither is reported. Refusing the mention is the
+    /// only outcome that does not depend on how a host tuned its thresholds --
+    /// and an entity with no name could never be matched again anyway, so every
+    /// later turn about it would create another.
+    NamelessMention(usize),
     CorruptSnapshot(String),
     /// The host's embedder failed. Carries its explanation.
     Embed(EmbedderError),
@@ -182,6 +200,10 @@ impl std::fmt::Display for EngineError {
             EngineError::SelfRelation(index) => write!(
                 f,
                 "a relation names mention {index} as both its own subject and object, which a self-edge cannot represent"
+            ),
+            EngineError::NamelessMention(index) => write!(
+                f,
+                "mention {index} has no name, and resolution matches on the name -- every nameless mention blocks together and scores identically, so distinct things would merge into one entity with nothing reporting it"
             ),
             EngineError::CorruptSnapshot(why) => {
                 write!(
@@ -3154,6 +3176,73 @@ mod tests {
         );
         assert_eq!(e.entity_count(), 0, "checked before the first write");
         assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn a_mention_with_no_name_is_refused_before_it_can_be_resolved_against_anything() {
+        // The third of `extract`'s three refusals, and the one `ingest` was
+        // missing. It matters more here than it does there: `ingest` resolves a
+        // mention on a `Record` carrying nothing but `name`, so an empty name
+        // leaves resolution with no evidence at all -- and it does not report
+        // that, it just scores what it was given.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "  ")],
+            ..Default::default()
+        };
+
+        let err = e.ingest(&a_turn(), &extraction, &Buckets).unwrap_err();
+        assert!(matches!(err, EngineError::NamelessMention(0)), "{err:?}");
+        assert_eq!(e.entity_count(), 0, "checked before the first write");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn two_nameless_mentions_would_have_landed_on_one_entity_which_is_why_ingest_refuses_them() {
+        // The reason for the check above, demonstrated rather than asserted in
+        // a comment. `BlockingKey::Prefix("name", 3)` on an empty name yields
+        // the key `name~`, so every nameless mention lands in the same block,
+        // and inside it each scores against every other on the one field they
+        // share -- which is blank on both sides and therefore agrees.
+        //
+        // What that agreement then buys depends on the ruleset. This one trusts
+        // a name match on its own, so the second nameless thing merges into the
+        // first: two distinct things, one entity, and nothing anywhere says the
+        // match was made on nothing. `test_ruleset` is stricter and files a
+        // review instead -- also wrong, and also not an error, just louder.
+        // Refusing the mention is the only outcome that does not depend on how
+        // a host happened to tune its thresholds.
+        let mut e = Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            Ruleset::new(
+                vec![FieldRule::new("name", Comparator::JaroWinkler, 0.9, 0.01)],
+                vec![BlockingKey::Prefix("name".to_string(), 3)],
+                2.0,
+                4.0,
+            )
+            .unwrap(),
+            Policy::new(Strategy::MostRecent),
+        );
+        let nameless = |at: Timestamp| Observation {
+            kind: "person".to_string(),
+            mention: Record::new().with("name", ""),
+            attribute: "kind".to_string(),
+            value: Some("person".to_string()),
+            valid: Interval::since(at),
+            provenance: Provenance::new(Source::ToolOutput, at, "session-1"),
+            embedding: vec![1.0, 0.0, 0.0],
+        };
+
+        assert!(matches!(
+            e.remember(nameless(1)).unwrap(),
+            Remembered::Created { .. }
+        ));
+        let second = e.remember(nameless(2)).unwrap();
+        assert!(
+            matches!(second, Remembered::Merged { .. }),
+            "a blank name matching a blank name is what `ingest` has to refuse: {second:?}"
+        );
+        assert_eq!(e.entity_count(), 1, "two things became one, silently");
     }
 
     #[test]
