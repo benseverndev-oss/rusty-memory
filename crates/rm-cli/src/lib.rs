@@ -7,6 +7,9 @@
 //! provider — no process to spawn, no output to scrape, and no network.
 
 pub mod config;
+pub mod store;
+#[cfg(test)]
+pub mod testing;
 
 /// Something the user has to fix.
 #[derive(Clone, Debug, PartialEq, Eq)]
