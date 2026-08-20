@@ -142,19 +142,44 @@ impl Config {
                 path.display()
             ))
         })?;
-        toml::from_str(&text)
+        Self::parse(path, &text)
+    }
+
+    /// A config to probe a provider with before `rmem init` has written one.
+    ///
+    /// Falls back to [`TEMPLATE`]'s defaults, but only when there is no file
+    /// at `path` at all -- `init` needs a working provider to discover the
+    /// embedding dimension, and on a first run there is nothing else to build
+    /// one from. A file that exists and fails to parse is a different
+    /// problem and is refused exactly as [`Config::load`] refuses it
+    /// everywhere else: silently falling back to the template's OpenAI
+    /// defaults for a file that names a different provider would leave
+    /// whoever wrote that file with no way to learn it never took effect,
+    /// and the `--force` overwrite that follows a successful probe would
+    /// then throw the broken file away without them ever seeing why.
+    pub fn load_or_template(path: &Path) -> Result<Config, CliError> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => Self::parse(path, &text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::from_template()),
+            Err(e) => Err(CliError::Config(format!(
+                "could not read {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    fn parse(path: &Path, text: &str) -> Result<Config, CliError> {
+        toml::from_str(text)
             .map_err(|e| CliError::Config(format!("{} is not valid: {e}", path.display())))
     }
 
     /// A config built from [`TEMPLATE`] rather than a file.
     ///
-    /// `main` falls back to this for `rmem init` when `rmem.toml` does not
-    /// exist yet, so a first run can still read `base_url`, `api_key_env` and
-    /// the model names to build a provider and probe it -- `init` needs a
-    /// provider before it can write the file that would otherwise supply one.
-    /// Infallible: `the_template_this_crate_writes_is_one_it_can_read_back`
-    /// already pins that `TEMPLATE` parses, so this cannot fail in a way that
-    /// test does not already catch.
+    /// The fallback value [`Config::load_or_template`] returns when there is
+    /// no config file yet. Infallible:
+    /// `the_template_this_crate_writes_is_one_it_can_read_back` already pins
+    /// that `TEMPLATE` parses, so this cannot fail in a way that test does
+    /// not already catch.
     pub fn from_template() -> Config {
         toml::from_str(TEMPLATE).expect("TEMPLATE is tested to parse")
     }
@@ -297,6 +322,57 @@ mod tests {
     }
 
     #[test]
+    fn load_or_template_falls_back_to_the_template_only_when_no_file_exists() {
+        use crate::testing::TempDir;
+
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        // Nothing has been written yet: the template's defaults, so a first
+        // `rmem init` can still reach a provider to probe with.
+        let config = Config::load_or_template(&path).unwrap();
+        assert_eq!(
+            config.provider.base_url,
+            Config::from_template().provider.base_url
+        );
+    }
+
+    #[test]
+    fn load_or_template_reads_an_existing_file_rather_than_the_template() {
+        use crate::testing::TempDir;
+
+        // The reviewer's repro: a file naming a different provider must
+        // survive `rmem init` reaching this fallback, not be silently
+        // replaced by the template's OpenAI defaults.
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        let custom = TEMPLATE.replace(
+            "base_url = \"https://api.openai.com/v1\"",
+            "base_url = \"https://internal.example/v1\"",
+        );
+        std::fs::write(&path, &custom).unwrap();
+
+        let config = Config::load_or_template(&path).unwrap();
+        assert_eq!(config.provider.base_url, "https://internal.example/v1");
+    }
+
+    #[test]
+    fn load_or_template_refuses_a_file_that_exists_but_does_not_parse() {
+        use crate::testing::TempDir;
+
+        // The bug this guards: a file that exists and is broken is not "no
+        // file yet". Treating it that way would silently probe the
+        // template's OpenAI defaults instead of whatever the file named, and
+        // never tell whoever wrote it that the file never took effect.
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        std::fs::write(&path, "this is not valid toml {{{").unwrap();
+
+        let err = Config::load_or_template(&path).unwrap_err();
+        assert!(err.to_string().contains("rmem.toml"), "{err}");
+        assert!(err.to_string().contains("not valid"), "{err}");
+    }
+
+    #[test]
     fn the_template_never_contains_anything_that_looks_like_a_key() {
         // It holds the NAME of an environment variable. A config file is a
         // thing people commit.
@@ -316,8 +392,14 @@ mod tests {
         // `!ruleset.blocking().is_empty()`, which the name promised to check
         // but the body never did, and which `Ruleset::new` already guarantees
         // on its own by rejecting an empty rule list.
-        use rm_engine::Record;
-        use rm_resolve::Decision;
+        //
+        // This does not, on its own, catch a swap of review_at and match_at:
+        // for this file's actual numbers a swap always makes review_at >
+        // match_at, which `Ruleset::new` rejects outright, so no assertion
+        // downstream of a successful `ruleset()` call could ever observe one.
+        // `a_swapped_review_at_and_match_at_is_refused_naming_both` pins that
+        // rejection directly, since this test cannot.
+        use rm_engine::{Decision, Record};
 
         let config = parse(TEMPLATE).unwrap();
         let ruleset = config.ruleset().unwrap();
@@ -344,6 +426,20 @@ mod tests {
             (got - expected).abs() < 1e-9,
             "score = {got}, expected {expected}"
         );
+    }
+
+    #[test]
+    fn a_swapped_review_at_and_match_at_is_refused_naming_both() {
+        // What actually pins the review_at/match_at swap: not the test above,
+        // which cannot reach it (see its comment), but `Ruleset::new`'s own
+        // validation, exercised directly here with the file's own numbers
+        // swapped -- review_at above match_at leaves no review band at all.
+        let swapped = TEMPLATE
+            .replace("review_at = 4.0", "review_at = 6.0")
+            .replace("match_at = 6.0", "match_at = 4.0");
+        let err = parse(&swapped).unwrap().ruleset().unwrap_err();
+        assert!(err.to_string().contains('6'), "{err}");
+        assert!(err.to_string().contains('4'), "{err}");
     }
 
     #[test]

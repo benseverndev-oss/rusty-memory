@@ -33,7 +33,6 @@ mod review;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
-use rm_resolve::Decision;
 use rm_store::MemoryStore;
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +72,7 @@ pub use rm_extract::{
 };
 pub use rm_graph::{Direction, Neighborhood, Reached, Walk};
 pub use rm_index::{IndexError, Metric, VectorIndex};
-pub use rm_resolve::{BlockingKey, Comparator, FieldRule, Record, Ruleset};
+pub use rm_resolve::{BlockingKey, Comparator, Decision, FieldRule, Record, Ruleset};
 pub use rm_store::{Edge, EdgeVersion, StableId, StoreError, Version};
 pub use rm_survivor::{Refused, Strategy};
 

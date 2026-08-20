@@ -38,7 +38,10 @@ fn run() -> Result<Outcome, CliError> {
         // Loaded here rather than by `init`, because init is what a user runs
         // when there is no config -- so only the provider block has to be
         // readable, and it comes from the template if the file is absent.
-        let config = Config::load(path).unwrap_or_else(|_| Config::from_template());
+        // `?` here matters: a file that exists and fails to parse must
+        // surface that, not be treated as if it were absent and silently
+        // replaced by the template's defaults.
+        let config = Config::load_or_template(path)?;
         let provider = config.provider()?;
         return command::init(path, force, &|| {
             provider.probe_dimension().map_err(|e| e.to_string())
