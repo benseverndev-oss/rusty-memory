@@ -19,7 +19,7 @@ use rm_engine::{BlockingKey, Comparator, FieldRule, Metric, Policy, Ruleset, Str
 use rm_providers::HttpProvider;
 use serde::Deserialize;
 
-use crate::CliError;
+use crate::HostError;
 
 /// The file `rmem init` writes.
 ///
@@ -160,9 +160,9 @@ pub struct PolicyConfig {
 
 impl Config {
     /// Read a config file.
-    pub fn load(path: &Path) -> Result<Config, CliError> {
+    pub fn load(path: &Path) -> Result<Config, HostError> {
         let text = std::fs::read_to_string(path).map_err(|e| {
-            CliError::Config(format!(
+            HostError::Config(format!(
                 "could not read {}: {e} -- run `rmem init` to write one",
                 path.display()
             ))
@@ -182,11 +182,11 @@ impl Config {
     /// whoever wrote that file with no way to learn it never took effect,
     /// and the `--force` overwrite that follows a successful probe would
     /// then throw the broken file away without them ever seeing why.
-    pub fn load_or_template(path: &Path) -> Result<Config, CliError> {
+    pub fn load_or_template(path: &Path) -> Result<Config, HostError> {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::parse(path, &text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::from_template()),
-            Err(e) => Err(CliError::Config(format!(
+            Err(e) => Err(HostError::Config(format!(
                 "could not read {}: {e}",
                 path.display()
             ))),
@@ -212,10 +212,10 @@ impl Config {
     /// selects one of [`our_reason`]'s literals; and [`SCHEMA`], which supplies
     /// the fields legal in whichever table the fault fell inside. Between them
     /// they say where, why, and what would have been valid.
-    fn parse(path: &Path, text: &str) -> Result<Config, CliError> {
+    fn parse(path: &Path, text: &str) -> Result<Config, HostError> {
         toml::from_str(text).map_err(|e| {
             let span = e.span();
-            CliError::Config(format!(
+            HostError::Config(format!(
                 "{} is not valid: {} ({}){}",
                 path.display(),
                 our_reason(e.message()),
@@ -258,7 +258,7 @@ impl Config {
     /// file through this path. The cost, stated: such a rule would arrive here
     /// as the last message below, which says where to look and not what is
     /// wrong.
-    pub fn ruleset(&self) -> Result<Ruleset, CliError> {
+    pub fn ruleset(&self) -> Result<Ruleset, HostError> {
         let mut rules = Vec::new();
         // Entries are numbered rather than named. `field = "name"` is itself
         // text out of the file, so quoting it to say which rule went wrong
@@ -269,13 +269,13 @@ impl Config {
             let where_ = format!("[[resolution.field]] entry {}", n + 1);
             for (name, p) in [("m", f.m), ("u", f.u)] {
                 if !(p > 0.0 && p < 1.0) {
-                    return Err(CliError::Config(format!(
+                    return Err(HostError::Config(format!(
                         "{where_} in rmem.toml gives {name} = {p}, but it is a probability and must be strictly between 0 and 1 -- 0 or 1 would make this one field's agreement decide every comparison on its own, whatever the other evidence says"
                     )));
                 }
             }
             if f.m <= f.u {
-                return Err(CliError::Config(format!(
+                return Err(HostError::Config(format!(
                     "{where_} in rmem.toml gives m = {} and u = {}, but m must be greater than u -- otherwise agreement on this field is evidence *against* a match. Either the two are swapped, or the field does not discriminate and should be left out.",
                     f.m, f.u
                 )));
@@ -288,7 +288,7 @@ impl Config {
             ));
         }
         if rules.is_empty() {
-            return Err(CliError::Config(
+            return Err(HostError::Config(
                 "rmem.toml has no [[resolution.field]] entries, so every pair scores 0 and the thresholds decide everything uniformly. Add at least one field to compare.".to_string(),
             ));
         }
@@ -302,25 +302,25 @@ impl Config {
 
         let (review_at, match_at) = (self.resolution.review_at, self.resolution.match_at);
         if !(review_at.is_finite() && match_at.is_finite()) {
-            return Err(CliError::Config(
+            return Err(HostError::Config(
                 "rmem.toml's [resolution] review_at and match_at must both be finite numbers of bits".to_string(),
             ));
         }
         if review_at > match_at {
-            return Err(CliError::Config(format!(
+            return Err(HostError::Config(format!(
                 "rmem.toml's [resolution] gives review_at = {review_at}, which is above match_at = {match_at}. That leaves no review band and makes some matches unreachable; review_at must be at or below match_at."
             )));
         }
 
         Ruleset::new(rules, blocking, review_at, match_at).map_err(|_| {
-            CliError::Config(
+            HostError::Config(
                 "rmem.toml's [resolution] section is not one this build can turn into a resolver, for a reason the checks above did not anticipate. Its own words are not repeated here: they name the fields they were given, and a field name comes out of the file.".to_string(),
             )
         })
     }
 
     /// The survivorship policy this file describes.
-    pub fn policy_for_engine(&self) -> Result<Policy, CliError> {
+    pub fn policy_for_engine(&self) -> Result<Policy, HostError> {
         let mut policy = Policy::new(strategy(&self.policy.default, "[policy] default")?);
         for (attribute, name) in &self.policy.attribute {
             // Neither half of an entry here is named on refusal. In
@@ -341,18 +341,18 @@ impl Config {
     }
 
     /// The distance metric this file names.
-    pub fn metric(&self) -> Result<Metric, CliError> {
+    pub fn metric(&self) -> Result<Metric, HostError> {
         match self.provider.metric.as_str() {
             "cosine" => Ok(Metric::Cosine),
             "l2" => Ok(Metric::L2),
-            _ => Err(CliError::Config(format!(
+            _ => Err(HostError::Config(format!(
                 "rmem.toml's [provider] metric is not one this build knows; use \"cosine\" or \"l2\". It is not defaulted because choosing wrong is a silent quality bug -- results stay plausible and get subtly worse. {NOT_REPEATED}"
             ))),
         }
     }
 
     /// A provider built from this file and the environment.
-    pub fn provider(&self) -> Result<HttpProvider, CliError> {
+    pub fn provider(&self) -> Result<HttpProvider, HostError> {
         // `api_key_env` holds the NAME of a variable, and the likeliest way to
         // get this file wrong is to put the key there instead -- the field is
         // called `api_key_env` and a key is what you have in your hand.
@@ -372,7 +372,7 @@ impl Config {
         // Only the hyphenated `sk-...` shape is caught, which is the one shape
         // the first version of this guard was tested with, and that is why it
         // was reported closed when it was closed for one format out of
-        // several. `CliError::MissingKey` no longer names the variable at all,
+        // several. `HostError::MissingKey` no longer names the variable at all,
         // which is what actually closes it, for every key format that exists
         // and every one that does not exist yet.
         let name = &self.provider.api_key_env;
@@ -380,11 +380,11 @@ impl Config {
             && !name.starts_with(|c: char| c.is_ascii_digit())
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
         if !legal {
-            return Err(CliError::Config(
+            return Err(HostError::Config(
                 "rmem.toml's api_key_env must be the NAME of an environment variable -- letters, digits and underscores, not starting with a digit, like OPENAI_API_KEY -- and what is written there cannot be one. It is not repeated here: if what you pasted is the key itself, printing it would put it in your terminal, your scrollback and any log that catches them.".to_string(),
             ));
         }
-        let key = std::env::var(name).map_err(|_| CliError::MissingKey)?;
+        let key = std::env::var(name).map_err(|_| HostError::MissingKey)?;
         Ok(HttpProvider::new(
             self.provider.base_url.clone(),
             key,
@@ -669,33 +669,33 @@ const NOT_REPEATED: &str = "What is written there is not repeated here: any valu
 /// `where_` names the field or the entry, in words the reader can find in the
 /// file. It is built by the caller from table names and 1-based indices, never
 /// from the file's own text.
-fn comparator(name: &str, where_: &str) -> Result<Comparator, CliError> {
+fn comparator(name: &str, where_: &str) -> Result<Comparator, HostError> {
     match name {
         "exact" => Ok(Comparator::Exact),
         "normalized" => Ok(Comparator::Normalized),
         "jaro_winkler" => Ok(Comparator::JaroWinkler),
         "token_jaccard" => Ok(Comparator::TokenJaccard),
-        _ => Err(CliError::Config(format!(
+        _ => Err(HostError::Config(format!(
             "{where_} in rmem.toml names a comparator this build does not know; use \"exact\", \"normalized\", \"jaro_winkler\" or \"token_jaccard\". {NOT_REPEATED}"
         ))),
     }
 }
 
-fn blocking_key(b: &BlockingConfig, where_: &str) -> Result<BlockingKey, CliError> {
+fn blocking_key(b: &BlockingConfig, where_: &str) -> Result<BlockingKey, HostError> {
     match b.kind.as_str() {
         "exact" => Ok(BlockingKey::Exact(b.field.clone())),
         "token" => Ok(BlockingKey::Token(b.field.clone())),
         "prefix" if b.n > 0 => Ok(BlockingKey::Prefix(b.field.clone(), b.n)),
-        "prefix" => Err(CliError::Config(format!(
+        "prefix" => Err(HostError::Config(format!(
             "{where_} in rmem.toml is a prefix key and needs n greater than 0; n = 0 puts every record in one block, which compares everything to everything"
         ))),
-        _ => Err(CliError::Config(format!(
+        _ => Err(HostError::Config(format!(
             "{where_} in rmem.toml names a blocking kind this build does not know; use \"exact\", \"prefix\" or \"token\". {NOT_REPEATED}"
         ))),
     }
 }
 
-fn strategy(name: &str, where_: &str) -> Result<Strategy, CliError> {
+fn strategy(name: &str, where_: &str) -> Result<Strategy, HostError> {
     match name {
         "most_complete" => Ok(Strategy::MostComplete),
         "longest_value" => Ok(Strategy::LongestValue),
@@ -712,10 +712,10 @@ fn strategy(name: &str, where_: &str) -> Result<Strategy, CliError> {
         // the binary, on a branch reached only when the file already said
         // exactly that. It is not the file's text being echoed back, so the
         // rule above is not bent here.
-        "source_priority" => Err(CliError::Config(format!(
+        "source_priority" => Err(HostError::Config(format!(
             "{where_} in rmem.toml asks for source_priority, which needs an order of sources to rank, and this config format has no way to say one yet -- choose another strategy, or rank them in code"
         ))),
-        _ => Err(CliError::Config(format!(
+        _ => Err(HostError::Config(format!(
             "{where_} in rmem.toml names a strategy this build does not know; use one of most_complete, longest_value, majority_vote, confidence_majority, first_non_null, unanimous_or_null, most_recent, valid_interval. {NOT_REPEATED}"
         ))),
     }
@@ -725,8 +725,8 @@ fn strategy(name: &str, where_: &str) -> Result<Strategy, CliError> {
 mod tests {
     use super::*;
 
-    fn parse(s: &str) -> Result<Config, CliError> {
-        toml::from_str(s).map_err(|e| CliError::Config(e.to_string()))
+    fn parse(s: &str) -> Result<Config, HostError> {
+        toml::from_str(s).map_err(|e| HostError::Config(e.to_string()))
     }
 
     #[test]
@@ -1305,7 +1305,7 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             let mut config = parse(TEMPLATE).unwrap();
             config.provider.api_key_env = illegal.to_string();
             match config.provider() {
-                Err(CliError::Config(_)) => {}
+                Err(HostError::Config(_)) => {}
                 Err(other) => panic!("{illegal:?} should be a config error, got {other:?}"),
                 Ok(_) => panic!("{illegal:?} cannot name an environment variable"),
             }
@@ -1314,7 +1314,7 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             let mut config = parse(TEMPLATE).unwrap();
             config.provider.api_key_env = legal.to_string();
             match config.provider() {
-                Err(CliError::MissingKey) => {}
+                Err(HostError::MissingKey) => {}
                 Err(other) => panic!("{legal:?} is a legal name, got {other:?}"),
                 Ok(_) => panic!("{legal:?} is not a variable anything sets"),
             }
@@ -1579,7 +1579,7 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             Err(e) => e,
             Ok(_) => panic!("expected a missing-key error"),
         };
-        assert_eq!(err, CliError::MissingKey);
+        assert_eq!(err, HostError::MissingKey);
         let text = err.to_string();
         assert!(text.contains("api_key_env"), "{text}");
         assert!(

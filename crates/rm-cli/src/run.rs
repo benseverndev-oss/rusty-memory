@@ -12,9 +12,11 @@ use std::path::Path;
 use rm_engine::Timestamp;
 
 use crate::args::{parse, Command};
-use crate::command::{self, Outcome};
-use crate::config::Config;
-use crate::{store, CliError};
+use rm_host::command::{self, Outcome};
+use rm_host::config::Config;
+use rm_host::store;
+
+use crate::CliError;
 
 /// The process exit code a result becomes.
 ///
@@ -66,14 +68,17 @@ pub fn run(
         // the key is only demanded when it is about to be used.
         //
         // `map_err(|e| e.to_string())` collapses the variant into
-        // `CliError::Refused`, which is what `command::init`'s probe signature
+        // `HostError::Refused`, which is what `command::init`'s probe signature
         // takes -- a closure over a `String`, so it can be tested without a
         // socket. The words survive verbatim, and they are the part that took
         // effort to write.
-        return command::init(config_path, force, &|| {
+        // `Ok(..?)` rather than a bare `return`: `?` is what applies
+        // `From<HostError>`, and a `return` of the inner result would not
+        // compile now that the two error types differ.
+        return Ok(command::init(config_path, force, &|| {
             let provider = config.provider().map_err(|e| e.to_string())?;
             provider.probe_dimension().map_err(|e| e.to_string())
-        });
+        })?);
     }
 
     let config = Config::load(config_path)?;
@@ -123,9 +128,10 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::TEMPLATE;
-    use crate::testing::TempDir;
     use rm_engine::Believed;
+    use rm_host::config::TEMPLATE;
+    use rm_host::testing::TempDir;
+    use rm_host::HostError;
 
     /// The name of an environment variable nothing sets.
     ///
@@ -174,7 +180,7 @@ mod tests {
         ] {
             let result = go(&config, &args);
             assert!(
-                !matches!(result, Err(CliError::MissingKey)),
+                !matches!(result, Err(CliError::Host(HostError::MissingKey))),
                 "{args:?} demanded an API key it never uses: {result:?}"
             );
         }
@@ -194,7 +200,7 @@ mod tests {
         ] {
             let err = go(&config, &args).unwrap_err();
             assert!(
-                !matches!(err, CliError::MissingKey),
+                !matches!(err, CliError::Host(HostError::MissingKey)),
                 "{args:?} demanded an API key it never uses: {err}"
             );
             assert!(
@@ -215,7 +221,7 @@ mod tests {
         for args in [vec!["remember", "I moved"], vec!["recall", "jobs"]] {
             let err = go(&config, &args).unwrap_err();
             assert!(
-                matches!(err, CliError::MissingKey),
+                matches!(err, CliError::Host(HostError::MissingKey)),
                 "{args:?} should have asked for the key: {err}"
             );
             // The field, not the variable it names: the name is a value out
@@ -282,7 +288,7 @@ mod tests {
 
         let err = go(&config, &["init"]).unwrap_err();
         assert!(
-            !matches!(err, CliError::MissingKey),
+            !matches!(err, CliError::Host(HostError::MissingKey)),
             "the file is what is in the way, not the key: {err}"
         );
         assert!(err.to_string().contains("--force"), "{err}");
@@ -313,7 +319,10 @@ mod tests {
         // first would send them somewhere the problem is not.
         let dir = TempDir::new();
         let err = go(&dir.path().join("rmem.toml"), &["review"]).unwrap_err();
-        assert!(matches!(err, CliError::Config(_)), "{err:?}");
+        assert!(
+            matches!(err, CliError::Host(HostError::Config(_))),
+            "{err:?}"
+        );
         assert!(err.to_string().contains("rmem init"), "{err}");
     }
 }
