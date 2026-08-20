@@ -74,6 +74,18 @@ pub fn load(
 /// a truncated one — this store's whole value is that it stays reconstructible,
 /// and a half-written file is the one way to lose that outright. Same directory
 /// because a rename across filesystems is a copy, which is not atomic.
+///
+/// That guarantee covers an interrupted *process* and not a power cut. The
+/// temporary file is never fsynced, and neither is the directory, so a
+/// filesystem is free to commit the rename before the bytes it points at:
+/// after a crash the store can be an empty or truncated file where the
+/// previous snapshot used to be. Named rather than fixed, alongside "no lock
+/// file", because both are the same kind of honest limit — a CLI a person
+/// runs at a prompt loses the turn it was in the middle of either way, and
+/// paying two fsyncs on every `remember` to narrow a window that closes on
+/// the next command is not obviously the right trade. Anything that needs it
+/// should fsync the temporary file before the rename and the directory
+/// after.
 pub fn save(path: &Path, engine: &Engine) -> Result<(), CliError> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, engine.snapshot())

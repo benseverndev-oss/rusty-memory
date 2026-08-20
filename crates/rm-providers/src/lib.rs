@@ -2,8 +2,9 @@
 //!
 //! # The only crate here that opens a socket
 //!
-//! Every library crate in this workspace depends on `serde` and nothing else,
-//! and none of them can reach the network. That is deliberate: `Completer` and
+//! Every library crate in this workspace draws its third-party dependencies
+//! from `serde` and `serde_json` alone — `rm-graph` takes neither — and none
+//! of them can reach the network. That is deliberate: `Completer` and
 //! `Embedder` are ports, so the thing that needs a remote service asks for one
 //! rather than reaching for it.
 //!
@@ -14,7 +15,8 @@
 //!
 //! # Why almost all of it is testable offline
 //!
-//! [`wire`] holds the request bodies and the response parsing as pure
+//! `wire`, private to this crate and so deliberately not linked here, holds
+//! the request bodies and the response parsing as pure
 //! functions, and those carry the behaviour worth testing: what a prompt with
 //! quotes and newlines in it becomes, what an error response means, what an
 //! empty one means. What is left in this module is a few lines of transport per

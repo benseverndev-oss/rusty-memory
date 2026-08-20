@@ -23,8 +23,9 @@ than the place three unsolved problems land together.
 
 ## The dependency line moves, deliberately and once
 
-Every library crate depends on `serde` and nothing else. That has held for eight
-crates and is worth keeping.
+Every library crate draws its third-party dependencies from `serde` and
+`serde_json` alone — `rm-graph` takes neither. That has held for eight crates
+and is worth keeping.
 
 It cannot hold here. `Observation.embedding` is required, so a binary that
 cannot embed cannot record a memory — which is most of what a binary is for.
