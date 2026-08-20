@@ -1,38 +1,42 @@
 //! Reading and writing the store file.
 //!
-//! # The one config value this crate still prints
+//! # The path is named as a field, not printed
 //!
-//! `config.rs` refuses to repeat a value read out of `rmem.toml` in any error
-//! message: eight credential leaks on this branch came out of doing exactly
-//! that, each closed one shape at a time until the rule was made categorical.
-//! A refusal names a field, a location, or nothing.
+//! Every message here says "the store at the path named by `[store] path` in
+//! rmem.toml" rather than the path itself, because the path is a value read
+//! out of the config and this workspace prints none of those. Eight credential
+//! leaks came out of doing otherwise, each closed one shape at a time until the
+//! rule was made categorical.
 //!
-//! The messages below name `[store] path`, and that is a deliberate exception
-//! rather than one the sweep missed. A filesystem path in an IO error *is* the
-//! location — it is the direct analogue of the line and column `Config::parse`
-//! reports — and it is the only config value with no substitute: the path is
-//! usually relative, so "the path named in rmem.toml could not be read" leaves
-//! a reader unable to tell which directory was tried.
+//! This module carried an exception for a while, on the argument that a path in
+//! an IO error *is* the location and that a pasted credential could not reach
+//! one anyway: every message but `save`'s needs a file to already exist at that
+//! path, so a nonsense path takes the `NotFound` branch and is not an error at
+//! all. The first half is still a fair argument. The second half is false on
+//! Windows: `ERROR_INVALID_NAME` gives `InvalidFilename` for any path
+//! containing `* ? | " < >` — and an Azure SAS token begins with `?` — while a
+//! path naming a directory gives `PermissionDenied`. Both reach the read below
+//! with nothing at that path at all.
 //!
-//! What makes that trade acceptable rather than merely convenient is where the
-//! exposure actually is. Every message here except `save`'s requires a file to
-//! already exist at that path; a path that is not there takes the `NotFound`
-//! branch below and is not an error at all, which is what a pasted credential
-//! would produce. Verified by driving it: a key written into `[store] path`
-//! makes `rmem review` print `no open questions` and exit 0. And unlike
-//! `api_key_env`, nothing about this field invites a key — reaching it means
-//! overwriting a meaningful value rather than adding a line, and appending to
-//! the end of `rmem.toml` lands in `[policy.attribute]`, which is closed.
+//! The trade was defensible on its premise and the premise was wrong, so the
+//! exception is gone. What is lost is real: for a relative path a reader can no
+//! longer tell from the message which directory was tried. What is kept is the
+//! OS error, which says *why* — not found, permission denied, invalid name —
+//! and the name of the one field to look at. That is simpler to defend than an
+//! exception carrying a caveat.
 //!
-//! `{dimension}` and `{metric:?}` in the mismatch messages are a `usize` and a
-//! two-variant enum that `Config::metric` has already validated, so neither
-//! can carry file text whatever is written in the file.
-
+//! `{dimension}` and `{metric:?}` in the mismatch messages stay: they are a
+//! `usize` and a two-variant enum `Config::metric` has already validated, so
+//! neither can carry file text whatever is written in the file.
 use std::path::Path;
 
 use rm_engine::{Engine, Metric, Policy, Ruleset, VectorIndex};
 
 use crate::CliError;
+
+/// How the six messages below refer to the store, since none of them prints
+/// the path itself. One constant so they cannot drift apart.
+const WHERE: &str = "the store at the path named by [store] path in rmem.toml";
 
 /// Open the store at `path`, or an empty one if it is not there yet.
 ///
@@ -66,28 +70,20 @@ pub fn load(
             ruleset,
             policy,
         )),
-        Err(e) => Err(CliError::Store(format!(
-            "could not read {}: {e}",
-            path.display()
-        ))),
+        Err(e) => Err(CliError::Store(format!("could not read {WHERE}: {e}"))),
         Ok(text) => {
             let engine = Engine::open(&text, ruleset, policy).map_err(|e| {
-                CliError::Store(format!(
-                    "{} is not a store this build can open: {e}",
-                    path.display()
-                ))
+                CliError::Store(format!("{WHERE} is not a store this build can open: {e}"))
             })?;
             let (stored_dimension, stored_metric) = engine.index_shape();
             if stored_dimension != dimension {
                 return Err(CliError::Store(format!(
-                    "{} holds {stored_dimension}-dimensional vectors, but rmem.toml's [provider] section currently names dimension = {dimension} -- if the embedding model changed, run `rmem init --force` to rediscover the dimension, or point the config back at the model this store was built with",
-                    path.display()
+                    "{WHERE} holds {stored_dimension}-dimensional vectors, but rmem.toml's [provider] section currently names dimension = {dimension} -- if the embedding model changed, run `rmem init --force` to rediscover the dimension, or point the config back at the model this store was built with"
                 )));
             }
             if stored_metric != metric {
                 return Err(CliError::Store(format!(
-                    "{} was built under metric {stored_metric:?}, but rmem.toml's [provider] section currently names metric = {metric:?} -- distances computed under the wrong metric are silently meaningless rather than merely different, so this is refused rather than reinterpreted",
-                    path.display()
+                    "{WHERE} was built under metric {stored_metric:?}, but rmem.toml's [provider] section currently names metric = {metric:?} -- distances computed under the wrong metric are silently meaningless rather than merely different, so this is refused rather than reinterpreted"
                 )));
             }
             Ok(engine)
@@ -117,11 +113,11 @@ pub fn load(
 pub fn save(path: &Path, engine: &Engine) -> Result<(), CliError> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, engine.snapshot())
-        .map_err(|e| CliError::Store(format!("could not write {}: {e}", tmp.display())))?;
+        .map_err(|e| CliError::Store(format!("could not write beside {WHERE}: {e}")))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         // Leave nothing behind on the failing path either.
         let _ = std::fs::remove_file(&tmp);
-        CliError::Store(format!("could not replace {}: {e}", path.display()))
+        CliError::Store(format!("could not replace {WHERE}: {e}"))
     })
 }
 
@@ -206,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn a_store_that_is_not_a_store_says_so_and_names_the_file() {
+    fn a_store_that_is_not_a_store_says_so_and_names_the_field_that_points_at_it() {
         let dir = TempDir::new();
         let path = dir.path().join("memory.json");
         std::fs::write(&path, "{ not json").unwrap();
@@ -217,7 +213,60 @@ mod tests {
         let Err(err) = load(&path, r, p, d, m) else {
             panic!("a file that is not a store must not open");
         };
-        assert!(err.to_string().contains("memory.json"), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("[store] path"), "{text}");
+        assert!(
+            !text.contains("memory.json"),
+            "the path is a value out of rmem.toml, so it is named and not printed: {text}"
+        );
+    }
+
+    #[test]
+    fn no_store_message_prints_the_path_it_was_given() {
+        // The rule this module used to hold an exception to. The exception's
+        // argument was that a pasted credential could not reach these messages
+        // because a nonsense path takes the `NotFound` branch -- true on Unix,
+        // false on Windows, where `ERROR_INVALID_NAME` gives `InvalidFilename`
+        // for a path containing `* ? | " < >` (an Azure SAS token begins with
+        // `?`) and a directory gives `PermissionDenied`.
+        //
+        // So the fixtures are the shapes that argument missed: a path that is
+        // a directory, one with characters Windows refuses outright, and a
+        // temp file whose contents are not a store. Between them they reach
+        // the read arm, the parse arm and the save arm on either platform.
+        const CANARY: &str = "REALSECRETabc123DEF456";
+        let dir = TempDir::new();
+
+        let a_directory = dir.path().join(CANARY);
+        std::fs::create_dir_all(&a_directory).unwrap();
+        let illegal = dir.path().join(format!("?{CANARY}*"));
+        let not_a_store = dir.path().join(format!("{CANARY}.json"));
+        std::fs::write(&not_a_store, "{ not json").unwrap();
+
+        let mut refused = 0;
+        for path in [&a_directory, &illegal, &not_a_store] {
+            let (r, p, d, m) = engine_parts();
+            if let Err(err) = load(path, r, p, d, m) {
+                refused += 1;
+                let text = err.to_string();
+                assert!(text.contains("[store] path"), "{text}");
+                assert!(!text.contains(CANARY), "the path came back out: {text}");
+            }
+
+            // And the write side, which the exception's argument never covered
+            // at all: `save` names the path whether or not anything is there.
+            let (r, p, d, m) = engine_parts();
+            let engine = Engine::new(VectorIndex::new(d, m), r, p);
+            if let Err(err) = save(&a_directory, &engine) {
+                refused += 1;
+                let text = err.to_string();
+                assert!(!text.contains(CANARY), "the path came back out: {text}");
+            }
+        }
+        assert!(
+            refused >= 2,
+            "the fixtures stopped being refused, so this stopped testing anything"
+        );
     }
 
     #[test]
