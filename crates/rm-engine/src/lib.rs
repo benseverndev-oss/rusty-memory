@@ -218,7 +218,7 @@ impl std::fmt::Display for EngineError {
             ),
             EngineError::NamelessMention(index) => write!(
                 f,
-                "mention {index} has no name, and resolution matches on the name -- every nameless mention blocks together and scores identically, so distinct things would merge into one entity with nothing reporting it"
+                "mention {index} has no name, and resolution matches on the name -- every nameless mention blocks together and scores identically, so depending on the ruleset distinct things either merge into one entity or file a review for every pair, and neither is reported as an error"
             ),
             EngineError::CorruptSnapshot(why) => {
                 write!(

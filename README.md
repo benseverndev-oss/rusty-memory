@@ -61,9 +61,10 @@ never discussed it" are different answers.)
 
 No crate touches the network. The two things that need a remote service —
 completion and embedding — are ports (`rm_extract::Completer`,
-`rm_engine::Embedder`) the host implements, so the whole workspace builds, tests
-and audits with no third-party dependencies at all, and every test runs offline
-and deterministically against a canned implementation.
+`rm_engine::Embedder`) the host implements, so nothing here pulls in an HTTP
+client, TLS or an async runtime, and every test runs offline and
+deterministically against a canned implementation. `serde` and `serde_json` are
+the only third-party crates in the workspace.
 
 The target is a single static binary and an embeddable library: no Python
 runtime, no CMake, no compose file.
