@@ -312,6 +312,15 @@ impl Engine {
         self.identity.len()
     }
 
+    /// Every entity this engine knows, in ascending id order.
+    ///
+    /// For callers that need to tell a newly created entity from a recognised
+    /// one. `entity_count()` cannot answer that: it says how many exist, not
+    /// which of several mentions was the new one.
+    pub fn entity_ids(&self) -> Vec<StableId> {
+        self.identity.keys().copied().collect()
+    }
+
     /// Record one observation.
     ///
     /// The embedding is validated before anything is written. A rejected vector
