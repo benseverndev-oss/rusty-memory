@@ -135,13 +135,14 @@ pub enum EngineError {
     /// A relation named the same mention as both its subject and object.
     ///
     /// `rm_extract::extract` refuses this for its own output, by local index,
-    /// the same way it refuses a bad [`BadMentionIndex`]; a hand-built
-    /// `Extraction` can still carry it. Left unchecked here it would still
-    /// end in an error -- [`StoreError::SelfEdge`] -- but only after
-    /// `Engine::relate` was reached, which is after every mention and fact
+    /// the same way it refuses a bad [`EngineError::BadMentionIndex`]; a
+    /// hand-built `Extraction` can still carry it. Left unchecked here it would
+    /// still end in an error -- [`StoreError::SelfEdge`] -- but only after
+    /// [`Engine::relate`] was reached, which is after every mention and fact
     /// this same call wrote had already landed. Checking it alongside
-    /// [`BadMentionIndex`], before the first write, gives a relation naming
-    /// one index twice the same costs-nothing failure a bad index gets.
+    /// [`EngineError::BadMentionIndex`], before the first write, gives a
+    /// relation naming one index twice the same costs-nothing failure a bad
+    /// index gets.
     ///
     /// **That guarantee covers the index case only.** A relation can also name
     /// two *different* mentions that resolution then lands on the same entity
