@@ -15,5 +15,6 @@ rm-store = { workspace = true }
 rm-resolve = { workspace = true }
 rm-index = { workspace = true }
 rm-graph = { workspace = true }
+rm-extract = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

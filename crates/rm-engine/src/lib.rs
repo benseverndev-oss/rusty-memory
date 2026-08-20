@@ -24,6 +24,7 @@
 //! agent that fuses two people because they scored in the middle has corrupted
 //! its memory permanently and silently.
 
+mod ingest;
 mod persist;
 mod policy;
 mod read;
@@ -36,6 +37,7 @@ use rm_resolve::Decision;
 use rm_store::MemoryStore;
 use serde::{Deserialize, Serialize};
 
+pub use ingest::{Closed, Embedder, EmbedderError, Ingested};
 pub use policy::Policy;
 pub use read::{Believed, Query, Recalled};
 pub use review::{PendingReview, ReviewId, Settled};
@@ -56,7 +58,19 @@ pub use review::{PendingReview, ReviewId, Settled};
 //
 // Only the surface those signatures reach is re-exported. `MemoryStore`,
 // `Outcome` and the rest stay behind the engine, which owns them.
+//
+// `extract` and `prompt` are re-exported alongside the types they build and
+// consume, for the same reason: a caller who has to reach into `rm-extract`
+// for the function while naming its types through `rm-engine` has the worst
+// of both, and `tests/extract.rs` calls `rm_engine::extract` to prove it does
+// not have to. A caller ingesting a turn needs to name every type in
+// `extract`'s signature and in `ingest`'s, which is why the full list below
+// goes past what `Extraction` alone would require.
 pub use rm_core::{Interval, Provenance, Source, Timestamp};
+pub use rm_extract::{
+    extract, prompt, Closure, Completer, CompleterError, ExtractError, Extraction, Fact, Mention,
+    Relation, Turn,
+};
 pub use rm_graph::{Direction, Neighborhood, Reached, Walk};
 pub use rm_index::{IndexError, Metric, VectorIndex};
 pub use rm_resolve::{BlockingKey, Comparator, FieldRule, Record, Ruleset};
@@ -99,7 +113,73 @@ pub enum EngineError {
     /// thing the wrapper exists to tell them.
     UnknownEntity(StableId),
     UnknownReview(ReviewId),
+    /// A fact, relation or closure named a mention index its own `Extraction`
+    /// does not have.
+    ///
+    /// `rm_extract::extract` refuses this before an `Extraction` is ever
+    /// produced, but `Extraction`'s fields are `pub` and `Engine::ingest` is
+    /// `pub`, so nothing stops a caller building one directly with a bad
+    /// index -- every test in this crate does exactly that to exercise
+    /// `ingest`. A public function that panics on input its own type lets a
+    /// caller construct contradicts what every other door in this workspace
+    /// does (`MemoryStore::open` validates its snapshot, `relate` validates
+    /// its endpoints), so `ingest` checks its own indices rather than trust a
+    /// guarantee only `extract` enforces.
+    BadMentionIndex {
+        /// What named the index, e.g. `"fact subject"` or `"closure subject"`.
+        what: &'static str,
+        index: usize,
+        /// How many mentions the extraction actually has.
+        mentions: usize,
+    },
+    /// A relation named the same mention as both its subject and object.
+    ///
+    /// `rm_extract::extract` refuses this for its own output, by local index,
+    /// the same way it refuses a bad [`EngineError::BadMentionIndex`]; a
+    /// hand-built `Extraction` can still carry it. Left unchecked here it would
+    /// still end in an error -- [`StoreError::SelfEdge`] -- but only after
+    /// [`Engine::relate`] was reached, which is after every mention and fact
+    /// this same call wrote had already landed. Checking it alongside
+    /// [`EngineError::BadMentionIndex`], before the first write, gives a
+    /// relation naming one index twice the same costs-nothing failure a bad
+    /// index gets.
+    ///
+    /// **That guarantee covers the index case only.** A relation can also name
+    /// two *different* mentions that resolution then lands on the same entity
+    /// -- the same person said twice in one turn, which `extract` does not
+    /// dedupe. Nothing here can catch that, because the check runs before the
+    /// first write and the entity ids do not exist until the mention loop has
+    /// run. It is [`Engine::relate`] that refuses it, by which point this
+    /// call's mentions and facts are already in the store and the `Ingested`
+    /// naming them is dropped with the error. The writes stand; the caller
+    /// cannot learn which ones.
+    ///
+    /// Moving the check later would not fix that -- it would only move which
+    /// writes had already happened -- so the honest statement is that `ingest`
+    /// is atomic against a malformed extraction and not against a coincidence
+    /// of resolution.
+    SelfRelation(usize),
+    /// A mention carried no name, and resolution has nothing else to match on.
+    ///
+    /// The third of the three refusals `rm_extract::extract` applies, and the
+    /// one that costs most if it is skipped. [`Engine::ingest`] resolves a
+    /// mention on a `Record` holding only `name`, and the blocking key that
+    /// finds its candidates is a prefix of that field -- so an empty name
+    /// yields the *same* key for every nameless mention, putting all of them in
+    /// one block, where each scores against every other on the one field they
+    /// share and finds it blank on both sides, which agrees.
+    ///
+    /// What that agreement buys depends on the ruleset, and both answers are
+    /// wrong. A ruleset that trusts a name match on its own merges distinct
+    /// things into one entity; a stricter one files a review for every pair.
+    /// Neither is an error, so neither is reported. Refusing the mention is the
+    /// only outcome that does not depend on how a host tuned its thresholds --
+    /// and an entity with no name could never be matched again anyway, so every
+    /// later turn about it would create another.
+    NamelessMention(usize),
     CorruptSnapshot(String),
+    /// The host's embedder failed. Carries its explanation.
+    Embed(EmbedderError),
 }
 
 /// Relabel the store's "no such entity" as the engine's own on a write.
@@ -124,12 +204,29 @@ impl std::fmt::Display for EngineError {
             EngineError::Refused(e) => write!(f, "{e}"),
             EngineError::UnknownEntity(id) => write!(f, "no entity with id {id}"),
             EngineError::UnknownReview(id) => write!(f, "no open review with id {id}"),
+            EngineError::BadMentionIndex {
+                what,
+                index,
+                mentions,
+            } => write!(
+                f,
+                "{what} names mention {index}, but this extraction has only {mentions} mention(s)"
+            ),
+            EngineError::SelfRelation(index) => write!(
+                f,
+                "a relation names mention {index} as both its own subject and object, which a self-edge cannot represent"
+            ),
+            EngineError::NamelessMention(index) => write!(
+                f,
+                "mention {index} has no name, and resolution matches on the name -- every nameless mention blocks together and scores identically, so depending on the ruleset distinct things either merge into one entity or file a review for every pair, and neither is reported as an error"
+            ),
             EngineError::CorruptSnapshot(why) => {
                 write!(
                     f,
                     "snapshot parsed but describes an impossible engine: {why}"
                 )
             }
+            EngineError::Embed(e) => write!(f, "{e}"),
         }
     }
 }
@@ -151,6 +248,12 @@ impl From<StoreError> for EngineError {
 impl From<Refused> for EngineError {
     fn from(e: Refused) -> Self {
         EngineError::Refused(e)
+    }
+}
+
+impl From<EmbedderError> for EngineError {
+    fn from(e: EmbedderError) -> Self {
+        EngineError::Embed(e)
     }
 }
 
@@ -2832,5 +2935,794 @@ mod tests {
             Policy::new(Strategy::MostRecent)
         )
         .is_err());
+    }
+
+    /// An embedder that maps text to a vector by hashing its bytes into three
+    /// buckets. Deterministic, offline, and different texts get different
+    /// vectors -- which is all any test here needs.
+    struct Buckets;
+
+    impl Embedder for Buckets {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+            let mut v = [0.0f32; 3];
+            for (i, b) in text.bytes().enumerate() {
+                v[i % 3] += f32::from(b);
+            }
+            // A zero vector is refused under cosine, and an empty string would
+            // produce one.
+            if v.iter().all(|x| *x == 0.0) {
+                v[0] = 1.0;
+            }
+            Ok(v.to_vec())
+        }
+    }
+
+    struct NoEmbedder;
+
+    impl Embedder for NoEmbedder {
+        fn embed(&self, _text: &str) -> Result<Vec<f32>, EmbedderError> {
+            Err(EmbedderError("the embedding service is down".to_string()))
+        }
+    }
+
+    /// Like `Buckets`, except for one text it fails on. Selective rather than
+    /// blanket-failing, so a test can put the failure anywhere in an
+    /// extraction -- a second mention, or a fact rather than its subject --
+    /// and prove nothing written before it survives.
+    struct FailsOn(&'static str);
+
+    impl Embedder for FailsOn {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+            if text == self.0 {
+                return Err(EmbedderError("the embedding service is down".to_string()));
+            }
+            Buckets.embed(text)
+        }
+    }
+
+    fn mention(kind: &str, name: &str) -> rm_extract::Mention {
+        rm_extract::Mention {
+            kind: kind.to_string(),
+            name: name.to_string(),
+            text: name.to_string(),
+        }
+    }
+
+    fn a_turn() -> rm_extract::Turn {
+        rm_extract::Turn {
+            text: "Ben works at Globex in Bristol".to_string(),
+            speaker: Some("Ben Severn".to_string()),
+            observed_at: 100,
+            session: "session-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn every_mention_becomes_an_entity_even_with_no_facts_about_it() {
+        // A place named only as the object of an edge still has to exist, or
+        // the edge could not name it.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn"), mention("place", "Bristol")],
+            ..Default::default()
+        };
+
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        assert_eq!(out.entities.len(), 2);
+        assert_eq!(e.entity_count(), 2);
+        assert_ne!(out.entities[0], out.entities[1]);
+    }
+
+    #[test]
+    fn a_mention_is_recorded_with_its_kind_so_it_can_be_recalled_at_all() {
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("place", "Bristol")],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        assert_eq!(
+            e.about(out.entities[0], "kind", 100, 100).unwrap(),
+            Believed::Value("place".into())
+        );
+    }
+
+    #[test]
+    fn a_failing_embedder_leaves_the_store_and_the_index_untouched() {
+        // The same guarantee `remember` makes: a write that cannot complete
+        // must cost nothing, because a fact with no vector to find it is
+        // undetectable from outside.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            ..Default::default()
+        };
+
+        let err = e.ingest(&a_turn(), &extraction, &NoEmbedder).unwrap_err();
+        assert!(matches!(err, EngineError::Embed(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("embedding service is down"),
+            "the host's own explanation must survive: {err}"
+        );
+        assert_eq!(e.entity_count(), 0);
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn a_failing_embedder_on_a_later_mention_leaves_no_earlier_write_behind() {
+        // A single-mention extraction cannot tell "embed everything, then
+        // write everything" apart from "embed one, write one, embed the
+        // next" -- `remember` already validates a lone vector before writing
+        // it, so that case passes either way. Two mentions, failing on the
+        // second, is what actually exercises the outer pass: an interleaved
+        // implementation would have written the first mention before ever
+        // reaching the second's embedding.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn"), mention("place", "Bristol")],
+            ..Default::default()
+        };
+
+        let err = e
+            .ingest(&a_turn(), &extraction, &FailsOn("Bristol"))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Embed(_)), "{err:?}");
+        assert_eq!(e.entity_count(), 0, "the first mention must not survive");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn a_failing_embedder_on_a_fact_also_leaves_the_store_and_the_index_untouched() {
+        // The trap the two-phase pass exists to close: embedding a fact's
+        // text inside the fact loop would let the mention above it land
+        // first, and the mention-only tests above cannot show that -- this is
+        // the case that would catch it.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben works at Globex".to_string(),
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let err = e
+            .ingest(&a_turn(), &extraction, &FailsOn("Ben works at Globex"))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Embed(_)), "{err:?}");
+        assert_eq!(e.entity_count(), 0, "the mention must not survive either");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn a_fact_naming_a_mention_that_does_not_exist_is_an_error_not_a_panic() {
+        // `Extraction`'s fields are `pub` and `ingest` is `pub`, so a
+        // hand-built extraction with an out-of-range subject is a caller
+        // mistake `ingest` has to report, not a guarantee only `extract`
+        // enforces -- this is exactly how every test in this crate builds one.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 1,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben works at Globex".to_string(),
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let err = e.ingest(&a_turn(), &extraction, &Buckets).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::BadMentionIndex {
+                    what: "fact subject",
+                    index: 1,
+                    mentions: 1,
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(e.entity_count(), 0, "checked before the first write");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn a_relation_naming_a_mention_that_does_not_exist_is_an_error_not_a_panic() {
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 1,
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let err = e.ingest(&a_turn(), &extraction, &Buckets).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::BadMentionIndex {
+                    what: "relation object",
+                    index: 1,
+                    mentions: 1,
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(e.entity_count(), 0, "checked before the first write");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn a_closure_naming_a_mention_that_does_not_exist_is_an_error_not_a_panic() {
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            closures: vec![rm_extract::Closure {
+                subject: 1,
+                predicate: "employed_by".to_string(),
+                at: 100,
+                because: "a new job".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let err = e.ingest(&a_turn(), &extraction, &Buckets).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EngineError::BadMentionIndex {
+                    what: "closure subject",
+                    index: 1,
+                    mentions: 1,
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(e.entity_count(), 0, "checked before the first write");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn the_assertions_come_back_in_write_order_so_a_caller_can_tell_what_produced_each() {
+        // Mentions first, in the extraction's mention order, then facts in the
+        // extraction's fact order. An `AssertionId` carries nothing about its
+        // origin, and a mention's `kind` assertion has the same shape as a
+        // fact's, so this ordering is the only route from an id back to the
+        // sentence it came from. Pinned here because it is documented on
+        // `Ingested::assertions` as a promise, and a promise nothing checks is
+        // one a later refactor can quietly break.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn"), mention("place", "Bristol")],
+            facts: vec![
+                rm_extract::Fact {
+                    subject: 0,
+                    attribute: "employer".to_string(),
+                    value: Some("Globex".to_string()),
+                    text: "Ben works at Globex".to_string(),
+                    valid_from: 100,
+                },
+                rm_extract::Fact {
+                    subject: 1,
+                    attribute: "country".to_string(),
+                    value: Some("England".to_string()),
+                    text: "Bristol is in England".to_string(),
+                    valid_from: 100,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        assert_eq!(
+            out.assertions.len(),
+            4,
+            "one per mention, then one per fact"
+        );
+
+        let at = |i: usize| e.assertion(out.assertions[i]).unwrap().clone();
+        assert_eq!(at(0).attribute, "kind");
+        assert_eq!(at(0).entity, out.entities[0]);
+        assert_eq!(at(1).attribute, "kind");
+        assert_eq!(at(1).entity, out.entities[1]);
+        assert_eq!(at(2).attribute, "employer");
+        assert_eq!(at(2).entity, out.entities[0]);
+        assert_eq!(at(3).attribute, "country");
+        assert_eq!(at(3).entity, out.entities[1]);
+    }
+
+    #[test]
+    fn a_mention_with_no_name_is_refused_before_it_can_be_resolved_against_anything() {
+        // The third of `extract`'s three refusals, and the one `ingest` was
+        // missing. It matters more here than it does there: `ingest` resolves a
+        // mention on a `Record` carrying nothing but `name`, so an empty name
+        // leaves resolution with no evidence at all -- and it does not report
+        // that, it just scores what it was given.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "  ")],
+            ..Default::default()
+        };
+
+        let err = e.ingest(&a_turn(), &extraction, &Buckets).unwrap_err();
+        assert!(matches!(err, EngineError::NamelessMention(0)), "{err:?}");
+        assert_eq!(e.entity_count(), 0, "checked before the first write");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn two_nameless_mentions_would_have_landed_on_one_entity_which_is_why_ingest_refuses_them() {
+        // The reason for the check above, demonstrated rather than asserted in
+        // a comment. `BlockingKey::Prefix("name", 3)` on an empty name yields
+        // the key `name~`, so every nameless mention lands in the same block,
+        // and inside it each scores against every other on the one field they
+        // share -- which is blank on both sides and therefore agrees.
+        //
+        // What that agreement then buys depends on the ruleset. This one trusts
+        // a name match on its own, so the second nameless thing merges into the
+        // first: two distinct things, one entity, and nothing anywhere says the
+        // match was made on nothing. `test_ruleset` is stricter and files a
+        // review instead -- also wrong, and also not an error, just louder.
+        // Refusing the mention is the only outcome that does not depend on how
+        // a host happened to tune its thresholds.
+        let mut e = Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            Ruleset::new(
+                vec![FieldRule::new("name", Comparator::JaroWinkler, 0.9, 0.01)],
+                vec![BlockingKey::Prefix("name".to_string(), 3)],
+                2.0,
+                4.0,
+            )
+            .unwrap(),
+            Policy::new(Strategy::MostRecent),
+        );
+        let nameless = |at: Timestamp| Observation {
+            kind: "person".to_string(),
+            mention: Record::new().with("name", ""),
+            attribute: "kind".to_string(),
+            value: Some("person".to_string()),
+            valid: Interval::since(at),
+            provenance: Provenance::new(Source::ToolOutput, at, "session-1"),
+            embedding: vec![1.0, 0.0, 0.0],
+        };
+
+        assert!(matches!(
+            e.remember(nameless(1)).unwrap(),
+            Remembered::Created { .. }
+        ));
+        let second = e.remember(nameless(2)).unwrap();
+        assert!(
+            matches!(second, Remembered::Merged { .. }),
+            "a blank name matching a blank name is what `ingest` has to refuse: {second:?}"
+        );
+        assert_eq!(e.entity_count(), 1, "two things became one, silently");
+    }
+
+    #[test]
+    fn a_relation_from_a_mention_to_itself_is_an_error_costing_nothing_not_a_late_store_refusal() {
+        // `rm_store::relate` already refuses a self-edge, so letting this
+        // through to `Engine::relate` would still end in an error -- just
+        // after the mention loop above had already written Ben. Checked
+        // alongside the index-range checks instead, so a relation that can
+        // never be created costs nothing rather than merely failing no worse
+        // than it would have anyway.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 0,
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let err = e.ingest(&a_turn(), &extraction, &Buckets).unwrap_err();
+        assert!(matches!(err, EngineError::SelfRelation(0)), "{err:?}");
+        assert_eq!(e.entity_count(), 0, "checked before the first write");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn an_ambiguous_mention_comes_back_as_a_review_rather_than_a_merge() {
+        // Resolution's middle band survives ingestion. A turn naming someone
+        // who might be someone already known must not quietly merge them, and
+        // the question has to reach the caller -- a review nobody can see is
+        // the same as no review.
+        let mut e = engine();
+        let first = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            ..Default::default()
+        };
+        e.ingest(&a_turn(), &first, &Buckets).unwrap();
+
+        let second = rm_extract::Extraction {
+            mentions: vec![rm_extract::Mention {
+                kind: "person".to_string(),
+                name: "Ben Severne".to_string(),
+                text: "Ben Severne".to_string(),
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &second, &Buckets).unwrap();
+
+        assert_eq!(out.reviews.len(), 1, "the near-miss has to be asked about");
+        assert_eq!(
+            e.entity_count(),
+            2,
+            "and they stay apart until someone answers"
+        );
+        assert_eq!(e.pending_review().len(), 1);
+    }
+
+    #[test]
+    fn ingesting_nothing_writes_nothing_and_is_not_an_error() {
+        let mut e = engine();
+        let out = e
+            .ingest(&a_turn(), &rm_extract::Extraction::default(), &Buckets)
+            .unwrap();
+        assert!(out.entities.is_empty());
+        assert_eq!(e.entity_count(), 0);
+    }
+
+    #[test]
+    fn a_fact_lands_on_the_entity_its_mention_resolved_to() {
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben works at Globex".to_string(),
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        assert_eq!(
+            e.about(out.entities[0], "employer", 100, 100).unwrap(),
+            Believed::Value("Globex".into())
+        );
+    }
+
+    #[test]
+    fn a_fact_is_embedded_by_its_own_text_not_its_subject_s() {
+        // "Where does he work" has to be able to reach the assertion without
+        // first reaching Ben. Sharing the mention's embedding would make the
+        // fact unreachable except through its subject.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben works at Globex".to_string(),
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+        e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+
+        let by_fact = Buckets.embed("Ben works at Globex").unwrap();
+        let hits = e.recall(&Query::new(by_fact, 1)).unwrap();
+        assert_eq!(
+            hits[0].value.as_deref(),
+            Some("Globex"),
+            "the nearest thing to the fact's own text must be the fact"
+        );
+    }
+
+    #[test]
+    fn a_relation_lands_between_the_entities_its_mentions_resolved_to() {
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![
+                mention("person", "Ben Severn"),
+                mention("organisation", "Globex"),
+            ],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 1,
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        let walk = Walk::new(vec![out.entities[0]], 1, 10, 100, 200);
+        let reached = e.neighborhood(&walk);
+        assert!(
+            reached.reached.iter().any(|r| r.entity == out.entities[1]),
+            "the walk should reach Globex from Ben"
+        );
+    }
+
+    #[test]
+    fn everything_a_turn_produced_carries_that_turn_s_session_and_moment() {
+        // Provenance is what lets a later reader ask where a memory came from,
+        // and an extraction that stamped its own writes with a placeholder
+        // would make every one of them untraceable.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben works at Globex".to_string(),
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+
+        let history = e.store_history(out.entities[0], "employer");
+        assert_eq!(history[0].provenance.source_ref, "session-1");
+        assert_eq!(history[0].provenance.observed_at, 100);
+        assert_eq!(history[0].provenance.source, Source::ToolOutput);
+    }
+
+    #[test]
+    fn a_fact_keeps_the_valid_time_the_extraction_gave_it() {
+        // "I joined sixty days ago", said now, is valid from sixty days ago --
+        // not from the moment the turn was heard.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben joined Globex".to_string(),
+                valid_from: 40,
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        assert_eq!(
+            e.about(out.entities[0], "employer", 50, 200).unwrap(),
+            Believed::Value("Globex".into()),
+            "it was already true at 50, before the turn was heard at 100"
+        );
+    }
+
+    /// `test_ruleset`'s `match_at` is 8.0, but two identical name-only records
+    /// score at most `log2(0.9/0.01) ~= 6.49` bits under its "name" rule --
+    /// `city` never enters the comparison because `ingest` never puts one in
+    /// a mention's `Record`. So under `test_ruleset` a second turn's mention
+    /// of someone already known can only ever land in the review band and
+    /// create a new entity, never merge back onto the one the first turn
+    /// created. The closure tests below need exactly that merge, to prove a
+    /// closure sees an edge a *prior* turn wrote, so they get their own
+    /// ruleset with a `match_at` a repeated name can actually clear -- 6.0,
+    /// the same value `tests/readme.rs` uses for the identical reason. This
+    /// is a property of the fixture, not of `ingest`: a caller supplying a
+    /// ruleset whose `match_at` a name can reach merges fine, which is what
+    /// `tests/readme.rs` demonstrates end to end.
+    fn closure_ruleset() -> Ruleset {
+        Ruleset::new(
+            vec![FieldRule::new("name", Comparator::JaroWinkler, 0.9, 0.01)],
+            vec![BlockingKey::Prefix("name".to_string(), 3)],
+            4.0,
+            6.0,
+        )
+        .unwrap()
+    }
+
+    fn closure_engine() -> Engine {
+        Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            closure_ruleset(),
+            Policy::new(Strategy::MostRecent),
+        )
+    }
+
+    #[test]
+    fn a_closure_ends_the_prior_edge_and_records_that_an_agent_inferred_it() {
+        // "I started at Globex" does not say Ben left Acme. Closing that edge
+        // is an inference, and it is recorded as one -- traceable in
+        // edge_history, and outrankable by anything the user says directly.
+        let mut e = closure_engine();
+        let first = rm_extract::Extraction {
+            mentions: vec![
+                mention("person", "Ben Severn"),
+                mention("organisation", "Acme"),
+            ],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 1,
+                valid_from: 10,
+            }],
+            ..Default::default()
+        };
+        let first_out = e.ingest(&a_turn(), &first, &Buckets).unwrap();
+        let (ben, acme) = (first_out.entities[0], first_out.entities[1]);
+
+        let second = rm_extract::Extraction {
+            mentions: vec![
+                mention("person", "Ben Severn"),
+                mention("organisation", "Globex"),
+            ],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 1,
+                valid_from: 100,
+            }],
+            closures: vec![rm_extract::Closure {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                at: 100,
+                because: "starting a new job ends the previous one".to_string(),
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &second, &Buckets).unwrap();
+
+        assert_eq!(out.closed.len(), 1);
+        assert_eq!(out.closed[0].object, acme);
+        assert_eq!(
+            out.closed[0].because,
+            "starting a new job ends the previous one"
+        );
+
+        // The walk no longer crosses to Acme, but does reach Globex.
+        let now = Walk::new(vec![ben], 1, 10, 150, 300);
+        let reached: Vec<_> = e
+            .neighborhood(&now)
+            .reached
+            .iter()
+            .map(|r| r.entity)
+            .collect();
+        assert!(!reached.contains(&acme), "Acme should be behind us");
+        assert!(reached.contains(&out.entities[1]), "Globex should not be");
+
+        // And the tombstone says who concluded it.
+        let history = e.edge_history(ben, "employed_by", acme);
+        assert_eq!(
+            history.last().unwrap().provenance.source,
+            Source::AgentInference
+        );
+        assert!(!history.last().unwrap().present);
+    }
+
+    #[test]
+    fn a_closure_does_not_end_an_edge_asserted_in_the_same_turn() {
+        // Otherwise "I moved from Acme to Globex" would close Globex as fast as
+        // it opened it.
+        let mut e = closure_engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![
+                mention("person", "Ben Severn"),
+                mention("organisation", "Globex"),
+            ],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 1,
+                valid_from: 100,
+            }],
+            closures: vec![rm_extract::Closure {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                at: 100,
+                because: "a new job ends the old one".to_string(),
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+
+        assert!(out.closed.is_empty(), "there was nothing prior to close");
+        let walk = Walk::new(vec![out.entities[0]], 1, 10, 150, 300);
+        assert!(e
+            .neighborhood(&walk)
+            .reached
+            .iter()
+            .any(|r| r.entity == out.entities[1]));
+    }
+
+    #[test]
+    fn a_closure_leaves_other_predicates_alone() {
+        let mut e = closure_engine();
+        let first = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn"), mention("place", "Bristol")],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "lives_in".to_string(),
+                object: 1,
+                valid_from: 10,
+            }],
+            ..Default::default()
+        };
+        let first_out = e.ingest(&a_turn(), &first, &Buckets).unwrap();
+        let bristol = first_out.entities[1];
+
+        let second = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            closures: vec![rm_extract::Closure {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                at: 100,
+                because: "a new job".to_string(),
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &second, &Buckets).unwrap();
+
+        assert!(out.closed.is_empty());
+        let walk = Walk::new(vec![out.entities[0]], 1, 10, 150, 300);
+        assert!(
+            e.neighborhood(&walk)
+                .reached
+                .iter()
+                .any(|r| r.entity == bristol),
+            "where he lives has nothing to do with where he works"
+        );
+    }
+
+    #[test]
+    fn a_closure_spares_a_same_turn_edge_named_by_a_different_mention_of_its_subject() {
+        // `extract` does not dedupe mentions: the same person can appear at
+        // more than one local index in one turn. Ben is mentioned at index 0
+        // (the relation's subject) and again at index 2 (the closure's
+        // subject); both resolve to the same entity. Comparing `spared` by
+        // local index rather than resolved entity id would miss this and
+        // wrongly close the edge this same turn just asserted.
+        let mut e = closure_engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![
+                mention("person", "Ben Severn"),
+                mention("organisation", "Globex"),
+                mention("person", "Ben Severn"),
+            ],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 1,
+                valid_from: 100,
+            }],
+            closures: vec![rm_extract::Closure {
+                subject: 2,
+                predicate: "employed_by".to_string(),
+                at: 100,
+                because: "a new job ends the old one".to_string(),
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+
+        assert_eq!(
+            out.entities[0], out.entities[2],
+            "both mentions of Ben Severn must resolve to the same entity for this test to mean anything"
+        );
+        assert!(
+            out.closed.is_empty(),
+            "the edge this same turn asserted from index 0 must not be closed just because the closure named the same subject at index 2"
+        );
+        let walk = Walk::new(vec![out.entities[0]], 1, 10, 150, 300);
+        assert!(
+            e.neighborhood(&walk)
+                .reached
+                .iter()
+                .any(|r| r.entity == out.entities[1]),
+            "Globex should still be reachable"
+        );
     }
 }

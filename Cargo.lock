@@ -44,11 +44,21 @@ name = "rm-engine"
 version = "0.0.0"
 dependencies = [
  "rm-core",
+ "rm-extract",
  "rm-graph",
  "rm-index",
  "rm-resolve",
  "rm-store",
  "rm-survivor",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rm-extract"
+version = "0.0.0"
+dependencies = [
+ "rm-core",
  "serde",
  "serde_json",
 ]
