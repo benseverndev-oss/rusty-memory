@@ -198,14 +198,19 @@ impl Config {
             // Not `{e}`: `Error`'s `Display` reproduces the offending source
             // line verbatim, and a config file is the one place `api_key_env`
             // makes it plausible someone pasted a real key into `api_key` by
-            // mistake. `message()` and `span()` give the reason and the
-            // location without echoing what triggered it -- everything a
-            // reader needs to find and fix the line, and the one thing that
-            // could ever leak stays out.
+            // mistake. `span()` gives the location without the line.
+            //
+            // `message()` is not safe on its own either, which is what the
+            // sweep for this rule turned up: it quotes whatever it did not
+            // like, and what it did not like came out of the file. Both
+            // positions leak -- `unknown field \u{60}sk-proj-...\u{60}` for a key
+            // pasted in key position, `invalid type: string "sk-proj-...",
+            // expected usize` for one pasted in value position. Removing the
+            // source line closed the bigger hole and left these two.
             CliError::Config(format!(
                 "{} is not valid: {} ({})",
                 path.display(),
-                e.message(),
+                without_quoted_file_text(e.message()),
                 location(text, e.span())
             ))
         })
@@ -330,6 +335,101 @@ impl Config {
             self.provider.embedding_model.clone(),
         ))
     }
+}
+
+/// Every word this crate is willing to see quoted back out of a parser
+/// message: the config's own field names, plus the handful of literal tokens
+/// `toml` quotes when it is describing syntax rather than content.
+///
+/// An allowlist of our own vocabulary rather than a filter for things that
+/// look like secrets, which is the distinction the rest of this file turns on.
+/// A span not on this list came out of the user's file, and the whole rule
+/// here is that a message never repeats one of those.
+const KNOWN_WORDS: &[&str] = &[
+    // Tables and the keys inside them, in TEMPLATE's order.
+    "store",
+    "path",
+    "provider",
+    "base_url",
+    "api_key_env",
+    "completion_model",
+    "embedding_model",
+    "dimension",
+    "metric",
+    "resolution",
+    "review_at",
+    "match_at",
+    "field",
+    "comparator",
+    "m",
+    "u",
+    "blocking",
+    "kind",
+    "n",
+    "policy",
+    "default",
+    "attribute",
+    // Tokens `toml` quotes when it is talking about syntax: "expected
+    // newline, `#`" and friends. Punctuation, not content.
+    "#",
+    "=",
+    ".",
+    ",",
+    "[",
+    "]",
+    "\"",
+    "'",
+];
+
+/// `message` with every quoted span that did not come from this crate removed.
+///
+/// `toml::de::Error::message()` quotes what it did not like, and what it did
+/// not like came out of the file. Both key and value positions leak:
+/// `sk-proj-... = "x"` under `[provider]` produces ``unknown field
+/// `sk-proj-...` ``, and `dimension = "sk-proj-..."` produces `invalid type:
+/// string "sk-proj-...", expected usize`.
+///
+/// So each backtick- or quote-delimited span is checked against
+/// [`KNOWN_WORDS`] and dropped unless this crate put it there. What survives
+/// is the parser's own prose -- "unknown field", "invalid type: string,
+/// expected usize" -- and its list of the fields that *would* have been
+/// valid, which comes from the struct definitions rather than from the file.
+/// Together with the line and column, that is everything a reader needs.
+fn without_quoted_file_text(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.char_indices();
+    while let Some((start, c)) = chars.next() {
+        if c != '`' && c != '"' {
+            out.push(c);
+            continue;
+        }
+        // Find the closing delimiter, honouring backslash escapes: a TOML
+        // basic string containing a quote arrives here as `\"`, and ending the
+        // span at it would leave the rest of the value in the message.
+        let mut end = None;
+        while let Some((i, d)) = chars.next() {
+            if d == '\\' {
+                chars.next();
+            } else if d == c {
+                end = Some(i);
+                break;
+            }
+        }
+        match end {
+            Some(end) if KNOWN_WORDS.contains(&&message[start + c.len_utf8()..end]) => {
+                out.push_str(&message[start..=end]);
+            }
+            // Unclosed as well as unrecognised: if the shape is not one this
+            // understands, the rest of the message is dropped rather than
+            // relayed on the chance that it is harmless.
+            Some(_) => out.push('…'),
+            None => {
+                out.push('…');
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Where a byte offset into `text` falls, as a 1-based line and *character*
@@ -552,9 +652,13 @@ mod tests {
         // field silently: `rmem review` printed "no open questions" and
         // exited 0, and nothing anywhere ever said the key was not in use.
         //
-        // The error names the field and must never name its value -- the
-        // value is the part that is a secret, which is the same reason
-        // `Config::parse` reports a location instead of the source line.
+        // What it asserts changed once field *names* stopped being quoted
+        // back: `assert!(err.contains("api_key"))` now passes for a reason
+        // that has nothing to do with this fixture, because the list of legal
+        // fields contains `api_key_env`. That is the substring-that-happens-
+        // to-match trap this branch has already been caught by twice, so it
+        // asserts the shape of the refusal and the location instead -- the
+        // parts that actually depend on the paste being refused.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
         let pasted = TEMPLATE.replace(
@@ -565,7 +669,14 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         std::fs::write(&path, pasted).unwrap();
 
         let err = Config::load(&path).unwrap_err().to_string();
-        assert!(err.contains("api_key"), "the field has to be named: {err}");
+        assert!(
+            err.contains("unknown field"),
+            "the paste has to be refused, not dropped: {err}"
+        );
+        assert!(
+            err.contains("line 15"),
+            "and located, since the name is no longer quoted: {err}"
+        );
         assert!(
             !err.contains("sk-PASTED-FAKE-SECRET"),
             "the value must never be echoed: {err}"
@@ -573,7 +684,7 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
     }
 
     #[test]
-    fn a_field_that_is_not_one_is_refused_naming_the_word_that_was_written() {
+    fn a_field_that_is_not_one_is_refused_rather_than_ignored() {
         use crate::testing::TempDir;
 
         // The ordinary-mistake half of the same guard. A field written
@@ -581,6 +692,13 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         // "missing field `embedding_model`" -- a message naming the one field
         // the file appears to already have, which sends the reader looking in
         // the wrong place.
+        //
+        // This used to assert that the refusal named `embedding_model_name`
+        // back. It no longer does, and should not: a field name is text out of
+        // the file, and `sk-proj-... = "x"` puts a credential in exactly that
+        // position. The line and column say where, and
+        // `a_parse_error_still_names_the_fields_that_would_have_been_valid`
+        // pins the part of the message that is genuinely ours.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
         std::fs::write(
@@ -590,7 +708,8 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         .unwrap();
 
         let err = Config::load(&path).unwrap_err().to_string();
-        assert!(err.contains("embedding_model_name"), "{err}");
+        assert!(err.contains("unknown field"), "{err}");
+        assert!(err.contains("line"), "{err}");
     }
 
     #[test]
@@ -638,6 +757,150 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             let _ = location(text, Some(start..text.len()));
         }
         assert_eq!(location(text, Some(2..3)), "line 1, column 1");
+    }
+
+    #[test]
+    fn a_parse_error_never_quotes_the_file_back_in_either_key_or_value_position() {
+        use crate::testing::TempDir;
+
+        // The seventh leak, found by sweeping for the rule rather than by
+        // waiting for someone to drive it. `9cb29a2` stopped `Display`
+        // echoing the source *line* and left `message()` quoting the same
+        // text: `toml` names what it did not like, and what it did not like is
+        // the file's.
+        //
+        // Both positions, because they are different mechanisms and the first
+        // fix for either would have missed the other -- a key in key position
+        // is an unknown field, a key in value position is a type error.
+        const FAKE: &str = "sk-proj-FAKE-SECRET-LEAK-CHECK-9999";
+        let cases = [
+            // Key position: pasted as a field name under [provider].
+            TEMPLATE.replace(
+                "completion_model =",
+                &format!("{FAKE} = \"x\"\ncompletion_model ="),
+            ),
+            // Value position: pasted where an integer belongs.
+            TEMPLATE.replace("dimension = 1536", &format!("dimension = \"{FAKE}\"")),
+            // Value position again, on a float, which is a different serde
+            // message with the same shape.
+            TEMPLATE.replace("review_at = 4.0", &format!("review_at = \"{FAKE}\"")),
+            // And in a table whose keys are open, where it parses as data
+            // rather than failing here at all.
+            format!("{TEMPLATE}\"{FAKE}\" = \"nonsense\"\n"),
+        ];
+
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        for case in cases {
+            std::fs::write(&path, &case).unwrap();
+            match Config::load(&path) {
+                Err(e) => {
+                    let text = e.to_string();
+                    assert!(!text.contains(FAKE), "the file came back out: {text}");
+                    // A parse failure keeps its location, which is what does
+                    // the work once the quoted text is gone.
+                    assert!(text.contains("line"), "the location has to survive: {text}");
+                }
+                // The open-map case is valid TOML and valid for the struct, so
+                // it parses; the refusal comes later, and the rule holds there
+                // too. There is no span to report by then.
+                Ok(config) => {
+                    // A `match` rather than `expect_err`, which needs
+                    // `Policy: Debug` -- the same reason every other refusal
+                    // test in this crate destructures instead of unwrapping.
+                    let Err(e) = config.policy_for_engine() else {
+                        panic!("expected a refusal");
+                    };
+                    let text = e.to_string();
+                    assert!(!text.contains(FAKE), "the file came back out: {text}");
+                    assert!(text.contains("[policy.attribute]"), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_parse_error_still_names_the_fields_that_would_have_been_valid() {
+        use crate::testing::TempDir;
+
+        // The other half: stripping quoted spans must not strip the parser's
+        // list of legal field names, which comes from the struct definitions
+        // rather than from the file and is the most useful thing in the
+        // message. This is what the allowlist is for -- without it the honest
+        // fix would have been to drop every quoted span and leave "unknown
+        // field ..., expected one of ..., ..., ...".
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        std::fs::write(
+            &path,
+            TEMPLATE.replace("embedding_model =", "embedding_model_name ="),
+        )
+        .unwrap();
+
+        let text = Config::load(&path).unwrap_err().to_string();
+        assert!(text.contains("unknown field"), "{text}");
+        assert!(
+            !text.contains("embedding_model_name"),
+            "a field name is file text too: {text}"
+        );
+        assert!(
+            text.contains("`embedding_model`") && text.contains("`base_url`"),
+            "the legal names are ours, not the file's, and have to survive: {text}"
+        );
+    }
+
+    #[test]
+    fn every_key_the_template_uses_is_one_the_message_filter_knows() {
+        // `KNOWN_WORDS` is written by hand, so it drifts the moment a field is
+        // added. Drift is quiet in the safe direction -- a new field name
+        // would be stripped from messages rather than leaked -- which is
+        // exactly why nothing else would ever catch it.
+        let mut table = "";
+        for line in TEMPLATE.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                table = line;
+                continue;
+            }
+            // TEMPLATE's comments explain `m` and `u` with prose containing an
+            // `=`, so a comment is not a key.
+            if line.starts_with('#') {
+                continue;
+            }
+            let Some((key, _)) = line.split_once(" = ") else {
+                continue;
+            };
+            if table == "[policy.attribute]" {
+                // The other direction, and the more important one. Keys in
+                // this table are attribute names a user invents, so they are
+                // data, not vocabulary -- `employer` happens to be in
+                // TEMPLATE, and `"sk-proj-..."` could be in someone's. Listing
+                // one here would make every key in that table quotable.
+                assert!(
+                    !KNOWN_WORDS.contains(&key),
+                    "{key:?} is a [policy.attribute] key, which is the user's text, not ours"
+                );
+                continue;
+            }
+            assert!(
+                KNOWN_WORDS.contains(&key),
+                "TEMPLATE uses {key:?}, which KNOWN_WORDS does not list"
+            );
+        }
+    }
+
+    #[test]
+    fn a_quoted_span_containing_an_escaped_quote_is_removed_whole() {
+        // A TOML basic string may contain `\"`, and a scan that ended the span
+        // at the first unescaped-looking quote would leave the rest of the
+        // value in the message -- the tail of a secret rather than all of it,
+        // which is not better.
+        let message = r#"invalid type: string "sk-FAKE\"STILL-SECRET", expected usize"#;
+        let out = without_quoted_file_text(message);
+        assert!(!out.contains("sk-FAKE"), "{out}");
+        assert!(!out.contains("STILL-SECRET"), "{out}");
+        assert!(out.starts_with("invalid type: string "), "{out}");
+        assert!(out.ends_with(", expected usize"), "{out}");
     }
 
     #[test]
