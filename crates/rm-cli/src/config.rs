@@ -146,6 +146,19 @@ impl Config {
             .map_err(|e| CliError::Config(format!("{} is not valid: {e}", path.display())))
     }
 
+    /// A config built from [`TEMPLATE`] rather than a file.
+    ///
+    /// `main` falls back to this for `rmem init` when `rmem.toml` does not
+    /// exist yet, so a first run can still read `base_url`, `api_key_env` and
+    /// the model names to build a provider and probe it -- `init` needs a
+    /// provider before it can write the file that would otherwise supply one.
+    /// Infallible: `the_template_this_crate_writes_is_one_it_can_read_back`
+    /// already pins that `TEMPLATE` parses, so this cannot fail in a way that
+    /// test does not already catch.
+    pub fn from_template() -> Config {
+        toml::from_str(TEMPLATE).expect("TEMPLATE is tested to parse")
+    }
+
     /// The resolver this file describes.
     pub fn ruleset(&self) -> Result<Ruleset, CliError> {
         let mut rules = Vec::new();
@@ -270,6 +283,20 @@ mod tests {
     }
 
     #[test]
+    fn from_template_reads_the_provider_block_a_first_init_needs() {
+        // `main` reaches for this only when there is no `rmem.toml` yet, to
+        // build the provider `init` probes before it can write the file that
+        // would otherwise supply one. If this ever disagreed with TEMPLATE, a
+        // first run would fail on the one command that cannot assume a config
+        // exists.
+        let config = Config::from_template();
+        assert_eq!(config.provider.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.provider.api_key_env, "OPENAI_API_KEY");
+        assert_eq!(config.provider.completion_model, "gpt-4o-mini");
+        assert_eq!(config.provider.embedding_model, "text-embedding-3-small");
+    }
+
+    #[test]
     fn the_template_never_contains_anything_that_looks_like_a_key() {
         // It holds the NAME of an environment variable. A config file is a
         // thing people commit.
@@ -283,9 +310,40 @@ mod tests {
 
     #[test]
     fn a_ruleset_carries_the_thresholds_and_fields_the_file_asked_for() {
+        // `Ruleset` keeps its rules and thresholds private, so the only honest
+        // way to pin what the file asked for is through the behaviour it
+        // exposes -- decide()'s boundaries and score()'s value -- not
+        // `!ruleset.blocking().is_empty()`, which the name promised to check
+        // but the body never did, and which `Ruleset::new` already guarantees
+        // on its own by rejecting an empty rule list.
+        use rm_engine::Record;
+        use rm_resolve::Decision;
+
         let config = parse(TEMPLATE).unwrap();
         let ruleset = config.ruleset().unwrap();
-        assert!(!ruleset.blocking().is_empty(), "blocking keys must survive");
+
+        assert_eq!(
+            ruleset.blocking(),
+            &[BlockingKey::Prefix("name".to_string(), 3)]
+        );
+
+        // review_at = 4.0, match_at = 6.0: read straight off the boundaries
+        // decide() draws, since that is the only way to observe them.
+        assert_eq!(ruleset.decide(3.999), Decision::NonMatch);
+        assert_eq!(ruleset.decide(4.0), Decision::Review);
+        assert_eq!(ruleset.decide(5.999), Decision::Review);
+        assert_eq!(ruleset.decide(6.0), Decision::Match);
+
+        // m = 0.9, u = 0.01 on "name": two records that agree completely score
+        // exactly the field's agreement weight, log2(m / u).
+        let a = Record::new().with("name", "Ben Severn");
+        let b = Record::new().with("name", "Ben Severn");
+        let expected = (0.9_f64 / 0.01).log2();
+        let got = ruleset.score(&a, &b);
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "score = {got}, expected {expected}"
+        );
     }
 
     #[test]

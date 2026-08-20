@@ -277,6 +277,7 @@ dependencies = [
  "rm-engine",
  "rm-extract",
  "rm-providers",
+ "rm-resolve",
  "serde",
  "toml",
 ]

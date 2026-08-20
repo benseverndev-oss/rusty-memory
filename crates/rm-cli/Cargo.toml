@@ -18,3 +18,9 @@ rm-extract = { workspace = true }
 rm-providers = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+
+[dev-dependencies]
+# Only for `Decision`, to read a ruleset's thresholds back through
+# `decide()`'s boundaries in a test. Already in the tree via rm-engine, which
+# re-exports every other type this crate needs from rm-resolve.
+rm-resolve = { workspace = true }

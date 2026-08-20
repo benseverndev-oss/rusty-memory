@@ -2,12 +2,15 @@
 //!
 //! # Data out, text elsewhere
 //!
-//! Every command returns an [`Outcome`], never a string. Rendering lives in
-//! `format`, so a command can be tested as an ordinary function against a stub
-//! provider — no process to spawn, no output to scrape, and no network.
+//! Every command returns an [`Outcome`](command::Outcome), never a string.
+//! Rendering lives in [`mod@format`], so a command can be tested as an ordinary
+//! function against a stub provider — no process to spawn, no output to
+//! scrape, and no network.
 
+pub mod args;
 pub mod command;
 pub mod config;
+pub mod format;
 pub mod store;
 #[cfg(test)]
 pub mod testing;
