@@ -6,6 +6,7 @@
 //! `format`, so a command can be tested as an ordinary function against a stub
 //! provider — no process to spawn, no output to scrape, and no network.
 
+pub mod command;
 pub mod config;
 pub mod store;
 #[cfg(test)]
