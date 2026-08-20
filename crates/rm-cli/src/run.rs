@@ -82,13 +82,12 @@ pub fn run(
     }
 
     let config = Config::load(config_path)?;
-    let mut engine = store::load(
-        &config.store.path,
+    let (ruleset, policy, dimension, metric) = (
         config.ruleset()?,
         config.policy_for_engine()?,
         config.provider.dimension,
         config.metric()?,
-    )?;
+    );
 
     // The provider is built inside the two arms that use it, not once above
     // the match. `Config::provider` reads the API key out of the environment
@@ -97,32 +96,53 @@ pub fn run(
     // them ever touches. That is not merely inconvenient: the review band
     // exists so a human answers the question the resolver would not guess at,
     // and answering it is local work over a file on disk.
-    let (outcome, mutated) = match command {
-        Command::Init { .. } => unreachable!("handled above"),
-        Command::Remember { text } => {
-            let provider = config.provider()?;
-            (
-                command::remember(&mut engine, &text, now, "cli", &provider, &provider)?,
-                true,
-            )
-        }
-        Command::Recall { query, k } => {
-            let provider = config.provider()?;
-            (command::recall(&engine, &query, k, &provider)?, false)
-        }
-        Command::About { entity, attribute } => (
-            command::about(&engine, entity, &attribute, now, now)?,
-            false,
-        ),
-        Command::ReviewList => (command::review_list(&engine)?, false),
-        Command::ReviewConfirm(id) => (command::review_confirm(&mut engine, id)?, true),
-        Command::ReviewReject(id) => (command::review_reject(&mut engine, id)?, true),
-    };
+    // Which of the two brackets the command runs inside, and the only thing
+    // that decides it. `store::with_write` holds an exclusive lock across the
+    // load, the change and the save; `with_read` takes a shared one and writes
+    // nothing. Reading under a lock is not ceremony: without it a `recall` can
+    // read the store in the moment another process has replaced it.
+    let mutates = matches!(
+        command,
+        Command::Remember { .. } | Command::ReviewConfirm(_) | Command::ReviewReject(_)
+    );
 
-    if mutated {
-        store::save(&config.store.path, &engine)?;
+    let path = config.store.path.clone();
+    if mutates {
+        store::with_write(&path, ruleset, policy, dimension, metric, |engine| {
+            match command {
+                Command::Remember { text } => {
+                    let provider = config.provider()?;
+                    command::remember(engine, &text, now, "cli", &provider, &provider)
+                }
+                Command::ReviewConfirm(id) => command::review_confirm(engine, id),
+                Command::ReviewReject(id) => command::review_reject(engine, id),
+                // Guarded by `mutates` directly above, over the same variants.
+                other => unreachable!("{other:?} does not write"),
+            }
+        })
+        .map_err(CliError::from)
+    } else {
+        store::with_read(
+            &path,
+            ruleset,
+            policy,
+            dimension,
+            metric,
+            |engine| match command {
+                Command::Recall { query, k } => {
+                    let provider = config.provider()?;
+                    command::recall(engine, &query, k, &provider)
+                }
+                Command::About { entity, attribute } => {
+                    command::about(engine, entity, &attribute, now, now)
+                }
+                Command::ReviewList => command::review_list(engine),
+                Command::Init { .. } => unreachable!("handled above"),
+                other => unreachable!("{other:?} writes"),
+            },
+        )
+        .map_err(CliError::from)
     }
-    Ok(outcome)
 }
 
 #[cfg(test)]
