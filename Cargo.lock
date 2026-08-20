@@ -275,9 +275,7 @@ name = "rm-cli"
 version = "0.0.0"
 dependencies = [
  "rm-engine",
- "rm-extract",
- "rm-providers",
- "serde",
+ "rm-host",
  "toml",
 ]
 
@@ -321,10 +319,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "rm-host"
+version = "0.0.0"
+dependencies = [
+ "rm-engine",
+ "rm-extract",
+ "rm-providers",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "rm-index"
 version = "0.0.0"
 dependencies = [
  "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rm-mcp"
+version = "0.0.0"
+dependencies = [
+ "rm-engine",
+ "rm-host",
  "serde_json",
 ]
 

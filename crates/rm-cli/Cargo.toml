@@ -14,7 +14,13 @@ path = "src/main.rs"
 
 [dependencies]
 rm-engine = { workspace = true }
-rm-extract = { workspace = true }
-rm-providers = { workspace = true }
-serde = { workspace = true }
+rm-host = { workspace = true }
+
+# `rm-extract`, `rm-providers`, `serde` and `toml` were direct dependencies
+# until the host concerns moved to `rm-host`. Nothing left in this crate names
+# a type from any of them: what is here parses a command line and renders an
+# `Outcome`, and `rm-engine` re-exports the two types that appear in those
+# signatures. `toml` stays as a dev-dependency because one test builds an
+# engine from the config template.
+[dev-dependencies]
 toml = { workspace = true }

@@ -59,6 +59,31 @@ rmem recall "where do I work"
 spelled out rather than hidden, because they are decisions and you should be
 able to see them.
 
+## Giving it to an agent
+
+`rmem-mcp` is an MCP server over the same store and the same `rmem.toml`. It
+speaks stdio, and it speaks both eras of the protocol: `2026-07-28`, which
+replaced the `initialize` handshake with a per-request `_meta` envelope and a
+mandatory `server/discover`, and the handshake revisions back to `2024-11-05`.
+
+```sh
+cargo install --path crates/rm-mcp
+rmem-mcp                        # reads ./rmem.toml, serves stdin
+```
+
+Five tools — `remember`, `recall`, `about`, `reviews`, `resolve_review` — which
+are `rmem`'s five commands over shared code rather than a second implementation
+of them. `about` is the one that differs: it takes both time axes, so an agent
+can ask what was true in May and, separately, what was known last Tuesday.
+
+The answer keeps its three states across the wire. `{"believed": "absent"}` is
+"someone said there is none" and `{"believed": "unknown"}` is "it has never come
+up", and the text block says which in words too, because that is the half most
+clients put in front of a model.
+
+One process at a time per store. There is no lock file, so a server and a
+`rmem` invocation against one `memory.json` will lose each other's writes.
+
 ## Crates
 
 | Crate | Status | Role |
@@ -72,8 +97,9 @@ able to see them.
 | `rm-extract` | in progress | Turn → mentions/edges, and whether arrival implies departure |
 | `rm-engine` | in progress | `remember()` / `recall()` / `forget()` |
 | `rm-providers` | in progress | `Completer`/`Embedder` over an OpenAI-compatible API |
+| `rm-host` | in progress | Config, store file, and the operations over them |
 | `rm-cli` | in progress | `rmem`, the command line |
-| `rm-mcp` | planned | MCP server |
+| `rm-mcp` | in progress | `rmem-mcp`, the MCP server |
 
 No *library* crate touches the network, and every library crate's third-party
 dependencies come from `serde` and `serde_json` alone. The two things that need
@@ -81,11 +107,16 @@ a remote service — completion and embedding — are ports (`rm_extract::Comple
 `rm_engine::Embedder`) the host implements, so the whole library builds, tests
 and audits offline.
 
-Exactly two crates at the edge have more: `rm-providers` adds `ureq` for HTTP,
-and `rm-cli` adds `toml` for its config. Both are binaries-adjacent by design,
-and every test in the workspace still runs offline.
+Exactly two crates have more, both of them about hosting rather than about
+memory: `rm-providers` adds `ureq` for HTTP, and `rm-host` adds `toml` for
+`rmem.toml`. Neither binary adds anything of its own — `rmem-mcp` implements
+the protocol by hand rather than taking an MCP SDK and an async runtime, which
+is the same trade as exact search over an ANN index and a hand-written argument
+parser over `clap`. Every test in the workspace still runs offline, the server
+included: it is driven through a byte slice and a stub provider, so there is no
+process to spawn and no socket to open.
 
-The target is a single static binary and an embeddable library: no Python
+The target is a static binary and an embeddable library: no Python
 runtime, no CMake, no compose file.
 
 ## Development

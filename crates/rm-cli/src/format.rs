@@ -5,7 +5,7 @@
 
 use rm_engine::Believed;
 
-use crate::command::{MentionLanding, Outcome};
+use rm_host::command::{MentionLanding, Outcome};
 
 pub fn render(outcome: &Outcome) -> String {
     match outcome {
@@ -137,6 +137,104 @@ fn named(entity: rm_engine::StableId, landings: &[MentionLanding]) -> String {
 mod tests {
     use super::*;
     use rm_engine::{Believed, Closed, Ingested};
+
+    // Moved here from `rm_host::command` when the host concerns left this
+    // crate. It was always a test of the *join* -- extraction, ingest, closure
+    // and rendering -- and rendering is the half that stayed, so the seam it
+    // guards now runs between two crates rather than two modules. That makes
+    // it more worth keeping, not less: nothing on the `rm-host` side can see
+    // this text at all.
+    use rm_engine::{Engine, Metric, VectorIndex};
+    use rm_host::command::Outcome as HostOutcome;
+    use rm_host::testing::StubProvider;
+
+    fn engine() -> Engine {
+        let config: rm_host::config::Config = toml::from_str(rm_host::config::TEMPLATE).unwrap();
+        Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            config.ruleset().unwrap(),
+            config.policy_for_engine().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_new_job_closes_the_old_one_all_the_way_through_to_what_is_printed() {
+        // The one test that drives extraction -> ingest -> closure -> render.
+        // Every other `remember` fixture in this file carries `"closures":[]`,
+        // and closure rendering was covered only by a hand-constructed
+        // `Ingested` in `format`. So both ends were tested and the join was
+        // not -- and the join is where the inference-versus-testimony
+        // distinction the library works hardest to preserve either survives
+        // to the screen or does not.
+        let mut e = engine();
+
+        let first = StubProvider::new(vec![
+            r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"},
+                            {"kind":"organisation","name":"Acme","text":"Acme"}],
+                "facts":[],
+                "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
+                "closures":[]}"#,
+        ]);
+        rm_host::command::remember(&mut e, "I work at Acme", 100, "cli", &first, &first).unwrap();
+
+        // "I started at Globex last month": a new employment, and the model
+        // volunteering that the previous one ended. `spared` keeps the
+        // closure from closing Globex as fast as it opened it.
+        let second = StubProvider::new(vec![
+            r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"},
+                            {"kind":"organisation","name":"Globex","text":"Globex"}],
+                "facts":[{"subject":0,"attribute":"employer","value":"Globex",
+                          "text":"Ben works at Globex","days_ago":null}],
+                "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
+                "closures":[{"subject":0,"predicate":"employed_by",
+                             "because":"starting a new job ends the previous one",
+                             "days_ago":null}]}"#,
+        ]);
+        let out =
+            rm_host::command::remember(&mut e, "I started at Globex", 200, "cli", &second, &second)
+                .unwrap();
+
+        let HostOutcome::Remembered { ref ingested, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(
+            ingested.closed.len(),
+            1,
+            "the Acme edge is what the closure ends, and Globex is spared"
+        );
+        assert_eq!(ingested.closed[0].predicate, "employed_by");
+        assert_eq!(
+            ingested.closed[0].because,
+            "starting a new job ends the previous one"
+        );
+
+        let text = render(&out);
+        assert_eq!(
+            text.lines().next().unwrap(),
+            "remembered 2 mentions, 1 fact, 1 relationship"
+        );
+        // Under its own heading, not among the facts. A closure is
+        // provenanced `AgentInference` precisely so nobody reads it as
+        // testimony; printing it in the same list would undo that at the last
+        // possible step.
+        let heading = text
+            .lines()
+            .position(|l| l.contains("inferred, not stated:"))
+            .expect("the inference has to be marked as one");
+        let ended = text
+            .lines()
+            .position(|l| l.contains("ended:"))
+            .expect("the closed edge has to be shown");
+        assert!(heading < ended, "the heading has to come first:\n{text}");
+        assert!(
+            text.contains("ended: Ben Severn employed_by entity 1"),
+            "the subject is a mention of this turn, so it is named:\n{text}"
+        );
+        assert!(
+            text.contains("\"starting a new job ends the previous one\""),
+            "the model's reason is the whole point of showing it:\n{text}"
+        );
+    }
 
     /// The one mention-landing line for `name`.
     ///

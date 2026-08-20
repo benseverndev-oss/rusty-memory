@@ -32,7 +32,7 @@ use std::path::Path;
 
 use rm_engine::{Engine, Metric, Policy, Ruleset, VectorIndex};
 
-use crate::CliError;
+use crate::HostError;
 
 /// How the six messages below refer to the store, since none of them prints
 /// the path itself. One constant so they cannot drift apart.
@@ -61,7 +61,7 @@ pub fn load(
     policy: Policy,
     dimension: usize,
     metric: Metric,
-) -> Result<Engine, CliError> {
+) -> Result<Engine, HostError> {
     match std::fs::read_to_string(path) {
         // Not there yet is not an error: the first command should not be a
         // special case a user has to know about.
@@ -70,19 +70,19 @@ pub fn load(
             ruleset,
             policy,
         )),
-        Err(e) => Err(CliError::Store(format!("could not read {WHERE}: {e}"))),
+        Err(e) => Err(HostError::Store(format!("could not read {WHERE}: {e}"))),
         Ok(text) => {
             let engine = Engine::open(&text, ruleset, policy).map_err(|e| {
-                CliError::Store(format!("{WHERE} is not a store this build can open: {e}"))
+                HostError::Store(format!("{WHERE} is not a store this build can open: {e}"))
             })?;
             let (stored_dimension, stored_metric) = engine.index_shape();
             if stored_dimension != dimension {
-                return Err(CliError::Store(format!(
+                return Err(HostError::Store(format!(
                     "{WHERE} holds {stored_dimension}-dimensional vectors, but rmem.toml's [provider] section currently names dimension = {dimension} -- if the embedding model changed, run `rmem init --force` to rediscover the dimension, or point the config back at the model this store was built with"
                 )));
             }
             if stored_metric != metric {
-                return Err(CliError::Store(format!(
+                return Err(HostError::Store(format!(
                     "{WHERE} was built under metric {stored_metric:?}, but rmem.toml's [provider] section currently names metric = {metric:?} -- distances computed under the wrong metric are silently meaningless rather than merely different, so this is refused rather than reinterpreted"
                 )));
             }
@@ -110,14 +110,14 @@ pub fn load(
 /// the next command is not obviously the right trade. Anything that needs it
 /// should fsync the temporary file before the rename and the directory
 /// after.
-pub fn save(path: &Path, engine: &Engine) -> Result<(), CliError> {
+pub fn save(path: &Path, engine: &Engine) -> Result<(), HostError> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, engine.snapshot())
-        .map_err(|e| CliError::Store(format!("could not write beside {WHERE}: {e}")))?;
+        .map_err(|e| HostError::Store(format!("could not write beside {WHERE}: {e}")))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         // Leave nothing behind on the failing path either.
         let _ = std::fs::remove_file(&tmp);
-        CliError::Store(format!("could not replace {WHERE}: {e}"))
+        HostError::Store(format!("could not replace {WHERE}: {e}"))
     })
 }
 

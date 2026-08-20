@@ -1,0 +1,16 @@
+[package]
+name = "rm-host"
+version = "0.0.0"
+description = "What a host of rusty-memory has to decide: config, store file, and the operations over them"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rm-engine = { workspace = true }
+rm-extract = { workspace = true }
+rm-providers = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

@@ -6,7 +6,7 @@ use rm_engine::{Believed, Embedder, Engine, Ingested, Query, Recalled, ReviewId,
 use rm_extract::{Completer, Turn};
 
 use crate::config::TEMPLATE;
-use crate::CliError;
+use crate::HostError;
 
 /// One mention and where it ended up.
 ///
@@ -67,23 +67,24 @@ pub fn init(
     config_path: &Path,
     force: bool,
     probe: &dyn Fn() -> Result<usize, String>,
-) -> Result<Outcome, CliError> {
+) -> Result<Outcome, HostError> {
     if config_path.exists() && !force {
-        return Err(CliError::Config(format!(
+        return Err(HostError::Config(format!(
             "{} already exists, and it may have been edited -- pass --force to replace it",
             config_path.display()
         )));
     }
 
-    let dimension = probe().map_err(CliError::Refused)?;
+    let dimension = probe().map_err(HostError::Refused)?;
 
     // The template's own value is an example. Substituting rather than
     // formatting keeps the file one literal, so the test that parses it is
     // testing the bytes a user receives.
     let contents = TEMPLATE.replace("dimension = 1536", &format!("dimension = {dimension}"));
 
-    std::fs::write(config_path, contents)
-        .map_err(|e| CliError::Config(format!("could not write {}: {e}", config_path.display())))?;
+    std::fs::write(config_path, contents).map_err(|e| {
+        HostError::Config(format!("could not write {}: {e}", config_path.display()))
+    })?;
 
     Ok(Outcome::Initialised {
         path: config_path.to_path_buf(),
@@ -99,7 +100,7 @@ pub fn remember(
     session: &str,
     completer: &impl Completer,
     embedder: &impl Embedder,
-) -> Result<Outcome, CliError> {
+) -> Result<Outcome, HostError> {
     let turn = Turn {
         text: text.to_string(),
         speaker: None,
@@ -108,7 +109,7 @@ pub fn remember(
     };
 
     let extraction =
-        rm_engine::extract(&turn, completer).map_err(|e| CliError::Refused(e.to_string()))?;
+        rm_engine::extract(&turn, completer).map_err(|e| HostError::Refused(e.to_string()))?;
 
     // Which entities existed before, so the landings can say "recognised"
     // rather than only naming an id.
@@ -116,7 +117,7 @@ pub fn remember(
 
     let ingested = engine
         .ingest(&turn, &extraction, embedder)
-        .map_err(|e| CliError::Refused(e.to_string()))?;
+        .map_err(|e| HostError::Refused(e.to_string()))?;
 
     let landings = extraction
         .mentions
@@ -142,13 +143,13 @@ pub fn recall(
     query: &str,
     k: usize,
     embedder: &impl Embedder,
-) -> Result<Outcome, CliError> {
+) -> Result<Outcome, HostError> {
     let embedding = embedder
         .embed(query)
-        .map_err(|e| CliError::Refused(e.to_string()))?;
+        .map_err(|e| HostError::Refused(e.to_string()))?;
     let hits = engine
         .recall(&Query::new(embedding, k))
-        .map_err(|e| CliError::Refused(e.to_string()))?;
+        .map_err(|e| HostError::Refused(e.to_string()))?;
     Ok(Outcome::Recalled(hits))
 }
 
@@ -159,15 +160,15 @@ pub fn about(
     attribute: &str,
     valid_t: rm_engine::Timestamp,
     tx_t: rm_engine::Timestamp,
-) -> Result<Outcome, CliError> {
+) -> Result<Outcome, HostError> {
     engine
         .about(entity, attribute, valid_t, tx_t)
         .map(Outcome::About)
-        .map_err(|e| CliError::Refused(e.to_string()))
+        .map_err(|e| HostError::Refused(e.to_string()))
 }
 
 /// The open questions.
-pub fn review_list(engine: &Engine) -> Result<Outcome, CliError> {
+pub fn review_list(engine: &Engine) -> Result<Outcome, HostError> {
     Ok(Outcome::Reviews(
         engine
             .pending_review()
@@ -183,19 +184,19 @@ pub fn review_list(engine: &Engine) -> Result<Outcome, CliError> {
 }
 
 /// Answer a review with "the same".
-pub fn review_confirm(engine: &mut Engine, id: ReviewId) -> Result<Outcome, CliError> {
+pub fn review_confirm(engine: &mut Engine, id: ReviewId) -> Result<Outcome, HostError> {
     engine
         .confirm(id)
         .map(|survivor| Outcome::Confirmed { survivor })
-        .map_err(|e| CliError::Refused(e.to_string()))
+        .map_err(|e| HostError::Refused(e.to_string()))
 }
 
 /// Answer a review with "different".
-pub fn review_reject(engine: &mut Engine, id: ReviewId) -> Result<Outcome, CliError> {
+pub fn review_reject(engine: &mut Engine, id: ReviewId) -> Result<Outcome, HostError> {
     engine
         .reject(id)
         .map(|()| Outcome::Rejected)
-        .map_err(|e| CliError::Refused(e.to_string()))
+        .map_err(|e| HostError::Refused(e.to_string()))
 }
 
 #[cfg(test)]
@@ -327,83 +328,6 @@ mod tests {
     }
 
     #[test]
-    fn a_new_job_closes_the_old_one_all_the_way_through_to_what_is_printed() {
-        // The one test that drives extraction -> ingest -> closure -> render.
-        // Every other `remember` fixture in this file carries `"closures":[]`,
-        // and closure rendering was covered only by a hand-constructed
-        // `Ingested` in `format`. So both ends were tested and the join was
-        // not -- and the join is where the inference-versus-testimony
-        // distinction the library works hardest to preserve either survives
-        // to the screen or does not.
-        let mut e = engine();
-
-        let first = StubProvider::new(vec![
-            r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"},
-                            {"kind":"organisation","name":"Acme","text":"Acme"}],
-                "facts":[],
-                "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
-                "closures":[]}"#,
-        ]);
-        remember(&mut e, "I work at Acme", 100, "cli", &first, &first).unwrap();
-
-        // "I started at Globex last month": a new employment, and the model
-        // volunteering that the previous one ended. `spared` keeps the
-        // closure from closing Globex as fast as it opened it.
-        let second = StubProvider::new(vec![
-            r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"},
-                            {"kind":"organisation","name":"Globex","text":"Globex"}],
-                "facts":[{"subject":0,"attribute":"employer","value":"Globex",
-                          "text":"Ben works at Globex","days_ago":null}],
-                "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
-                "closures":[{"subject":0,"predicate":"employed_by",
-                             "because":"starting a new job ends the previous one",
-                             "days_ago":null}]}"#,
-        ]);
-        let out = remember(&mut e, "I started at Globex", 200, "cli", &second, &second).unwrap();
-
-        let Outcome::Remembered { ref ingested, .. } = out else {
-            panic!("{out:?}")
-        };
-        assert_eq!(
-            ingested.closed.len(),
-            1,
-            "the Acme edge is what the closure ends, and Globex is spared"
-        );
-        assert_eq!(ingested.closed[0].predicate, "employed_by");
-        assert_eq!(
-            ingested.closed[0].because,
-            "starting a new job ends the previous one"
-        );
-
-        let text = crate::format::render(&out);
-        assert_eq!(
-            text.lines().next().unwrap(),
-            "remembered 2 mentions, 1 fact, 1 relationship"
-        );
-        // Under its own heading, not among the facts. A closure is
-        // provenanced `AgentInference` precisely so nobody reads it as
-        // testimony; printing it in the same list would undo that at the last
-        // possible step.
-        let heading = text
-            .lines()
-            .position(|l| l.contains("inferred, not stated:"))
-            .expect("the inference has to be marked as one");
-        let ended = text
-            .lines()
-            .position(|l| l.contains("ended:"))
-            .expect("the closed edge has to be shown");
-        assert!(heading < ended, "the heading has to come first:\n{text}");
-        assert!(
-            text.contains("ended: Ben Severn employed_by entity 1"),
-            "the subject is a mention of this turn, so it is named:\n{text}"
-        );
-        assert!(
-            text.contains("\"starting a new job ends the previous one\""),
-            "the model's reason is the whole point of showing it:\n{text}"
-        );
-    }
-
-    #[test]
     fn remembering_a_turn_names_every_mention_and_where_it_landed() {
         let mut e = engine();
         let stub = StubProvider::new(vec![EXTRACTION]);
@@ -451,7 +375,7 @@ mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec!["I'm afraid I can't do that"]);
         let err = remember(&mut e, "anything", 100, "cli", &stub, &stub).unwrap_err();
-        assert!(matches!(err, CliError::Refused(_)), "{err:?}");
+        assert!(matches!(err, HostError::Refused(_)), "{err:?}");
         assert!(err.to_string().len() > 30, "the reason must survive: {err}");
     }
 

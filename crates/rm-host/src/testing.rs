@@ -1,9 +1,24 @@
-//! Helpers the tests share. Compiled only under `cfg(test)`.
+//! Helpers the tests share, in this crate and in the crates that host it.
 //!
 //! A temp-directory guard and a stub provider, both hand-written rather than
 //! pulled in. `tempfile` and an HTTP mocking crate would each be a dependency
 //! bought for a few dozen lines, in a workspace that has twice chosen to write
 //! the small thing instead.
+//!
+//! # Why this is not `cfg(test)`
+//!
+//! It was, while `rm-cli` was the only host. A `cfg(test)` module is invisible
+//! to every other crate, so `rm-mcp`'s tests could not have used it -- and a
+//! stub `Completer` and `Embedder` are exactly what a *consumer* needs in
+//! order to drive `remember` and `recall` end to end without a socket, which
+//! is the entire reason those are ports rather than an HTTP client.
+//!
+//! A `testing` feature is the usual answer and it does not work here. Cargo
+//! unifies features across normal and dev dependencies within one build, so a
+//! binary that dev-depends on `rm-host/testing` compiles the stubs into its
+//! release build regardless. The cost is the same either way; this way it is
+//! visible, and CI's `--all-features` run does not quietly become the only
+//! configuration anyone tests.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
