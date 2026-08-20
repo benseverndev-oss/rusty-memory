@@ -107,53 +107,94 @@ impl HttpProvider {
     /// possibly an issue tracker, and a key that reaches any of those has to be
     /// rotated.
     fn post(&self, path: &str, body: String) -> Result<String, ProviderError> {
-        let url = self.url(path);
-        let response = ureq::post(&url)
+        let response = ureq::post(&self.url(path))
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .set("Content-Type", "application/json")
             .send_string(&body);
 
-        self.handle_response(response, &url, path)
+        self.handle_response(response, path)
     }
 
-    /// `message` with the request URL replaced by the field it came from.
+    /// What went wrong reaching the provider, in this crate's own words.
     ///
-    /// `ureq` opens a transport error with the URL it was given, and that URL
-    /// is `base_url` — a value out of `rmem.toml`. `rm-cli` refuses to repeat
-    /// a config value in an error for the reason six leaks on that side
-    /// established, and a URL is a config value like any other: nothing stops
-    /// a key being pasted into `base_url`, and it came straight back out.
+    /// # Why `ureq`'s own message is not relayed
     ///
-    /// Substituted rather than filtered: this replaces the exact string this
-    /// method built, and then the exact `base_url` it holds, so it can never
-    /// remove anything it did not put there. The endpoint stays, because
-    /// `embeddings` and `chat/completions` are this crate's own words and are
-    /// the half of the URL a reader actually needs — "the base_url in your
-    /// config, plus /embeddings" says where it went without saying what is
-    /// written there.
-    fn without_the_configured_url(&self, message: &str, url: &str, path: &str) -> String {
-        let named = format!("<base_url from rmem.toml>/{path}");
-        message
-            .replace(url, &named)
-            .replace(self.base_url.as_str(), "<base_url from rmem.toml>")
+    /// It opens with the URL it was given, and that URL is built from
+    /// `base_url` out of `rmem.toml` — a value a user can paste a credential
+    /// into. The version before this one substituted the URL away, which was
+    /// the same mistake in a different crate: it replaced the string this
+    /// crate *built*, while `ureq` prints the string it *parsed*. Any
+    /// normalisation and the match misses — `https://api.openai.com:443/v1`
+    /// loses its default port, an uppercase scheme is lowercased, a missing
+    /// path gains a slash. Seven of sixteen shapes a review tried leaked, and
+    /// the test passed only because its own fixture was already normalised.
+    ///
+    /// Matching a value we hold against a rendering someone else produced
+    /// cannot be made airtight, so nothing is matched. `ureq::ErrorKind` is a
+    /// fieldless enum, so a value of it cannot carry a URL or anything else
+    /// out of the file, and every arm below returns one of this function's own
+    /// literals. `path` is this crate's own constant — `embeddings` or
+    /// `chat/completions` — not anything read from the config.
+    ///
+    /// # What that costs
+    ///
+    /// `ureq`'s `message()` is dropped, and it sometimes carried the OS error
+    /// behind a refused connection ("the target machine actively refused it").
+    /// It cannot be kept selectively: it carries the hostname outright for
+    /// `Dns` and the scheme for `UnknownScheme`. What a reader needs in order
+    /// to act is the class of failure and which config field points at the
+    /// endpoint, and both survive.
+    fn transport_failure(kind: ureq::ErrorKind, path: &str) -> ProviderError {
+        let why = match kind {
+            ureq::ErrorKind::Dns => {
+                "the host it names could not be resolved -- check the spelling, and that this machine has DNS"
+            }
+            ureq::ErrorKind::ConnectionFailed => {
+                "nothing accepted a connection there -- check the host and port, and any proxy or firewall in the way"
+            }
+            ureq::ErrorKind::InvalidUrl | ureq::ErrorKind::UnknownScheme => {
+                "it is not a URL this build can use -- it needs a scheme it knows, and a host"
+            }
+            ureq::ErrorKind::InsecureRequestHttpsOnly => {
+                "it is an http:// URL and this build was configured to allow https:// only"
+            }
+            ureq::ErrorKind::TooManyRedirects => {
+                "it redirected more times than this build will follow"
+            }
+            ureq::ErrorKind::BadStatus | ureq::ErrorKind::BadHeader => {
+                "what answered did not speak HTTP this build understands -- check that it points at an OpenAI-compatible API rather than, say, a web page"
+            }
+            ureq::ErrorKind::InvalidProxyUrl => {
+                "the proxy URL in this environment is not one this build can use"
+            }
+            ureq::ErrorKind::ProxyConnect => {
+                "the proxy in this environment refused the connection"
+            }
+            ureq::ErrorKind::ProxyUnauthorized => {
+                "the proxy in this environment rejected the credentials it was given"
+            }
+            // Reached only for a non-2xx, which `handle_response` takes
+            // through its own arm before this is ever called.
+            ureq::ErrorKind::HTTP => "the provider answered with an error",
+            ureq::ErrorKind::Io => "the connection failed part way through",
+        };
+        ProviderError::Transport(format!(
+            "{path}, under the base_url named in rmem.toml: {why}"
+        ))
     }
 
     /// Turn a `ureq` result into body text.
     ///
     /// The `Ok` body and the `Status` arm's body both reach `redact` below
     /// before this returns: those are response content, which is where a
-    /// provider could echo the key back. The `Transport` arm and both
-    /// `into_string()` failure arms return via `?` first and never reach it —
-    /// their strings come from the transport and IO layers (a refused
-    /// connection, a body that failed to decode as UTF-8), not from response
-    /// content or the `Authorization` header, so there is nothing in them for
-    /// `redact` to catch. `a_transport_failure_never_carries_the_api_key`
-    /// pins the `Transport` arm specifically, end to end.
+    /// provider could echo the key back. The `Transport` arm never reaches it
+    /// and does not need to — [`Self::transport_failure`] builds that message
+    /// from a fieldless enum, so there is nothing in it to scrub.
     ///
-    /// They do carry the other thing an error here must not carry, which is
-    /// the request URL: `ureq` opens its message with it, and it is built from
-    /// `base_url` out of `rmem.toml`. Every arm goes through
-    /// [`Self::without_the_configured_url`] on the way out.
+    /// Both `into_string()` failure arms relay `std::io::Error`'s text. That
+    /// is not a message built out of a value we hold: nothing from `rmem.toml`
+    /// is passed to the reader, and the body itself is not in the error, only
+    /// the reason it could not be decoded.
     ///
     /// Split out from `post` so the `Status` arm — reached only when a real
     /// server answers with a non-2xx — can be driven in a test with a
@@ -161,17 +202,19 @@ impl HttpProvider {
     fn handle_response(
         &self,
         response: Result<ureq::Response, ureq::Error>,
-        url: &str,
         path: &str,
     ) -> Result<String, ProviderError> {
-        let transport =
-            |e: String| ProviderError::Transport(self.without_the_configured_url(&e, url, path));
+        let undecodable = |e: std::io::Error| {
+            ProviderError::Transport(format!(
+                "the provider's response could not be read as text: {e}"
+            ))
+        };
         let text = match response {
-            Ok(r) => r.into_string().map_err(|e| transport(e.to_string())),
+            Ok(r) => r.into_string().map_err(undecodable),
             // A non-2xx with a body is the provider explaining itself, and the
             // body says more than the status line does.
-            Err(ureq::Error::Status(_, r)) => r.into_string().map_err(|e| transport(e.to_string())),
-            Err(ureq::Error::Transport(t)) => Err(transport(t.to_string())),
+            Err(ureq::Error::Status(_, r)) => r.into_string().map_err(undecodable),
+            Err(ureq::Error::Transport(t)) => Err(Self::transport_failure(t.kind(), path)),
         }?;
 
         Ok(self.redact(&text))
@@ -415,34 +458,102 @@ mod tests {
     }
 
     #[test]
-    fn a_transport_failure_never_carries_the_configured_base_url_either() {
+    fn a_transport_failure_never_carries_the_configured_base_url_in_any_url_shape() {
         // `base_url` is a value out of `rmem.toml`, and `ureq` opens its
-        // transport message with the URL it was handed. So a key pasted into
-        // `base_url` came back out of a connection error verbatim -- the same
-        // class as the six key leaks on the `rm-cli` side, arriving through a
-        // dependency's message rather than through one of ours.
+        // transport message with the URL it was handed.
         //
-        // Still offline: port 1 on loopback has nothing listening, so the
-        // local kernel refuses the connection and no packet leaves the
-        // machine.
-        let leak = "sk-proj-FAKE-SECRET-IN-THE-BASE-URL-9999";
-        let provider = HttpProvider::new(
-            format!("http://127.0.0.1:1/{leak}"),
-            "sk-key-not-under-test".into(),
-            "c".into(),
-            "e".into(),
-        );
-        let err = provider.embed("anything").unwrap_err().0;
+        // The version of this test before it used one already-normalised
+        // fixture and passed while seven of sixteen shapes leaked, because the
+        // fix it guarded substituted away the string this crate *built* while
+        // `ureq` prints the string it *parsed*. So the fixtures here are
+        // deliberately awkward -- an uppercase scheme, a trailing slash, a
+        // query, userinfo, an unknown scheme, no scheme at all -- and they
+        // cover three different `ErrorKind`s. Nothing is matched any more, so
+        // none of them can miss.
+        //
+        // Offline throughout. The shapes that reach the network reach
+        // 127.0.0.1 port 1, where the local kernel refuses the connection and
+        // no packet leaves the machine; the rest fail on the URL before any
+        // socket exists.
+        const CANARY: &str = "REALSECRETabc123DEF456";
+        let bases = [
+            // Awkward first, so a failure reports the informative shape: an
+            // uppercase scheme is one `ureq` normalises, which is what
+            // defeated the substitution this replaced.
+            format!("HTTP://127.0.0.1:1/{CANARY}"),
+            format!("http://127.0.0.1:1/{CANARY}"),
+            format!("http://127.0.0.1:1/{CANARY}/"),
+            format!("http://user:{CANARY}@127.0.0.1:1/v1"),
+            // No socket for these two: the URL is refused before connecting.
+            format!("gopher://{CANARY}/v1"),
+            CANARY.to_string(),
+        ];
 
-        assert!(!err.contains(leak), "base_url came back out: {err}");
-        assert!(
-            err.contains("<base_url from rmem.toml>/embeddings"),
-            "the endpoint is this crate's own word and has to survive: {err}"
-        );
-        assert!(
-            err.contains("could not reach the provider"),
-            "and so does the reason: {err}"
-        );
+        for base in bases {
+            let provider = HttpProvider::new(
+                base.clone(),
+                "sk-key-not-under-test".into(),
+                "c".into(),
+                "e".into(),
+            );
+            let err = provider.embed("anything").unwrap_err().0;
+
+            assert!(
+                !err.contains(CANARY),
+                "base_url {base:?} came back out: {err}"
+            );
+            assert!(
+                !err.contains("127.0.0.1"),
+                "the host is part of base_url too: {err}"
+            );
+            assert!(
+                err.contains("embeddings"),
+                "the endpoint is this crate's own word and has to survive: {err}"
+            );
+            assert!(
+                err.contains("base_url named in rmem.toml"),
+                "and the field to look at: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_transport_failure_kind_gets_a_sentence_of_our_own() {
+        // `transport_failure` maps a fieldless enum onto this crate's own
+        // literals, which is what makes it airtight -- there is nothing in an
+        // `ErrorKind` for a URL to hide in. This pins that every variant is
+        // actually mapped and that none of them says nothing useful, so a new
+        // variant cannot quietly fall through to a bare heading.
+        let kinds = [
+            ureq::ErrorKind::InvalidUrl,
+            ureq::ErrorKind::UnknownScheme,
+            ureq::ErrorKind::Dns,
+            ureq::ErrorKind::InsecureRequestHttpsOnly,
+            ureq::ErrorKind::ConnectionFailed,
+            ureq::ErrorKind::TooManyRedirects,
+            ureq::ErrorKind::BadStatus,
+            ureq::ErrorKind::BadHeader,
+            ureq::ErrorKind::Io,
+            ureq::ErrorKind::InvalidProxyUrl,
+            ureq::ErrorKind::ProxyConnect,
+            ureq::ErrorKind::ProxyUnauthorized,
+            ureq::ErrorKind::HTTP,
+        ];
+        for kind in kinds {
+            let ProviderError::Transport(message) =
+                HttpProvider::transport_failure(kind, "embeddings")
+            else {
+                panic!("a transport failure has to be one");
+            };
+            assert!(
+                message.contains("embeddings") && message.contains("base_url"),
+                "{kind:?}: {message}"
+            );
+            assert!(
+                message.len() > 60,
+                "{kind:?} says nothing a reader could act on: {message}"
+            );
+        }
     }
 
     #[test]
@@ -478,11 +589,7 @@ mod tests {
         // production. The `ProviderError` the reviewer asked about is the
         // one `parse_completion` produces from it.
         let text = provider()
-            .handle_response(
-                Err(ureq::Error::Status(401, response)),
-                "https://h/v1/chat/completions",
-                "chat/completions",
-            )
+            .handle_response(Err(ureq::Error::Status(401, response)), "chat/completions")
             .expect("a readable body is not a transport failure");
         let err = parse_completion(&text).unwrap_err();
 
@@ -523,11 +630,7 @@ mod tests {
         );
         let response = ureq::Response::new(401, "Unauthorized", &body).unwrap();
         let text = provider
-            .handle_response(
-                Err(ureq::Error::Status(401, response)),
-                "https://h/v1/chat/completions",
-                "chat/completions",
-            )
+            .handle_response(Err(ureq::Error::Status(401, response)), "chat/completions")
             .expect("a readable body is not a transport failure");
         let err = parse_completion(&text).unwrap_err().to_string();
 
