@@ -45,6 +45,20 @@ engine.about_under(&Policy::new(Strategy::MostRecent), person, "employer", MAY, 
 `Value`, `Absent`, and `Unknown` — because "they have no employer" and "we have
 never discussed it" are different answers.)
 
+## Trying it
+
+```sh
+cargo install --path crates/rm-cli
+export OPENAI_API_KEY=...
+rmem init                       # asks the model its embedding size, writes rmem.toml
+rmem remember "I just started at Globex"
+rmem recall "where do I work"
+```
+
+`rmem init` writes a config with the resolver's thresholds and probabilities
+spelled out rather than hidden, because they are decisions and you should be
+able to see them.
+
 ## Crates
 
 | Crate | Status | Role |
@@ -57,14 +71,19 @@ never discussed it" are different answers.)
 | `rm-index` | in progress | Exact vector search: deletion, filtering, persistence |
 | `rm-extract` | in progress | Turn → mentions/edges, and whether arrival implies departure |
 | `rm-engine` | in progress | `remember()` / `recall()` / `forget()` |
-| `rm-mcp` / `rm-cli` | planned | MCP server and `rmem` binary |
+| `rm-providers` | in progress | `Completer`/`Embedder` over an OpenAI-compatible API |
+| `rm-cli` | in progress | `rmem`, the command line |
+| `rm-mcp` | planned | MCP server |
 
-No crate touches the network. The two things that need a remote service —
-completion and embedding — are ports (`rm_extract::Completer`,
-`rm_engine::Embedder`) the host implements, so nothing here pulls in an HTTP
-client, TLS or an async runtime, and every test runs offline and
-deterministically against a canned implementation. `serde` and `serde_json` are
-the only third-party crates in the workspace.
+No *library* crate touches the network, and every library crate's third-party
+dependencies come from `serde` and `serde_json` alone. The two things that need
+a remote service — completion and embedding — are ports (`rm_extract::Completer`,
+`rm_engine::Embedder`) the host implements, so the whole library builds, tests
+and audits offline.
+
+Exactly two crates at the edge have more: `rm-providers` adds `ureq` for HTTP,
+and `rm-cli` adds `toml` for its config. Both are binaries-adjacent by design,
+and every test in the workspace still runs offline.
 
 The target is a single static binary and an embeddable library: no Python
 runtime, no CMake, no compose file.

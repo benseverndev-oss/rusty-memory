@@ -143,6 +143,13 @@ Turn → mentions + edges. Needs an LLM, and `goldengraph-core` is deliberately
 touches the network, so everything below it stays testable offline and the core
 stays embeddable.
 
+*Implemented differently, and better.* `rm-extract` defines a `Completer` port
+and never opens a socket itself, so **no library crate touches the network at
+all**. The HTTP client lives in `rm-providers`, which the binary wires in and
+libraries never depend on. That keeps the whole workspace testable offline
+rather than everything below one line, and it is why `ureq` appears in exactly
+one crate.
+
 Also required: `record_key` computation. The store keys identity on
 host-supplied fingerprints and "the core never computes it" — that is the host's
 job, i.e. ours.
@@ -158,8 +165,10 @@ rusty-memory/
     rm-resolve/    # score-core + goldenfuzz + goldenphonetic over memories
     rm-survivor/   # survivorship-core + most_recent/source_priority/valid_interval
     rm-index/      # vector index + persistence + filtered search
-    rm-extract/    # turn -> mentions/edges. The only networked crate.
+    rm-extract/    # turn -> mentions/edges. Defines the Completer port.
     rm-engine/     # remember() / recall() / forget(). Ties it together.
+    rm-providers/  # HTTP impls of the Completer/Embedder ports. The only
+                   # crate that touches the network.
     rm-mcp/        # MCP server binary
     rm-cli/        # `rmem` binary
 ```

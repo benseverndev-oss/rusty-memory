@@ -33,7 +33,6 @@ mod review;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
-use rm_resolve::Decision;
 use rm_store::MemoryStore;
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +72,7 @@ pub use rm_extract::{
 };
 pub use rm_graph::{Direction, Neighborhood, Reached, Walk};
 pub use rm_index::{IndexError, Metric, VectorIndex};
-pub use rm_resolve::{BlockingKey, Comparator, FieldRule, Record, Ruleset};
+pub use rm_resolve::{BlockingKey, Comparator, Decision, FieldRule, Record, Ruleset};
 pub use rm_store::{Edge, EdgeVersion, StableId, StoreError, Version};
 pub use rm_survivor::{Refused, Strategy};
 
@@ -310,6 +309,15 @@ impl Engine {
     /// How many entities the engine knows about.
     pub fn entity_count(&self) -> usize {
         self.identity.len()
+    }
+
+    /// Every entity this engine knows, in ascending id order.
+    ///
+    /// For callers that need to tell a newly created entity from a recognised
+    /// one. `entity_count()` cannot answer that: it says how many exist, not
+    /// which of several mentions was the new one.
+    pub fn entity_ids(&self) -> Vec<StableId> {
+        self.identity.keys().copied().collect()
     }
 
     /// Record one observation.
@@ -773,6 +781,18 @@ impl Engine {
     /// How many vectors are searchable.
     pub fn index_len(&self) -> usize {
         self.index.len()
+    }
+
+    /// The dimension and metric backing this engine's vector index.
+    ///
+    /// Exists so a caller restoring an engine from a snapshot can check the
+    /// restored index agrees with what its own configuration currently
+    /// expects, before a disagreement surfaces far from its cause as a
+    /// `WrongDimension` on the first `remember` or `recall` rather than at
+    /// the door where `Engine::open` already validates everything else it
+    /// can see about a snapshot on its own.
+    pub fn index_shape(&self) -> (usize, Metric) {
+        (self.index.dim(), self.index.metric())
     }
 
     /// Stop recalling an attribute, without destroying what was true.
