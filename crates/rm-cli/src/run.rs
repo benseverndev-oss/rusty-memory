@@ -54,8 +54,24 @@ pub fn run(
         // surface that, not be treated as if it were absent and silently
         // replaced by the template's defaults.
         let config = Config::load_or_template(config_path)?;
-        let provider = config.provider()?;
+        // Built *inside* the probe closure, not before it. `command::init`
+        // refuses an existing config before it probes -- deliberately, so a
+        // user who already has a file does not need a working key and a live
+        // model just to be told the file is there -- and constructing the
+        // provider up here defeated that from one level out: `rmem init`
+        // against an existing file with the key unset blamed the missing key,
+        // and setting the key changed the message to the real one. That is the
+        // same misdirection the rest of this function exists to remove, one
+        // arm short. The closure is only called after the existence check, so
+        // the key is only demanded when it is about to be used.
+        //
+        // `map_err(|e| e.to_string())` collapses the variant into
+        // `CliError::Refused`, which is what `command::init`'s probe signature
+        // takes -- a closure over a `String`, so it can be tested without a
+        // socket. The words survive verbatim, and they are the part that took
+        // effort to write.
         return command::init(config_path, force, &|| {
+            let provider = config.provider().map_err(|e| e.to_string())?;
             provider.probe_dimension().map_err(|e| e.to_string())
         });
     }
@@ -248,6 +264,46 @@ mod tests {
         assert!(!store.exists(), "a read touched the store file");
         go(&config, &["review"]).unwrap();
         assert!(!store.exists(), "a read touched the store file");
+    }
+
+    #[test]
+    fn init_against_an_existing_config_refuses_the_file_without_asking_for_a_key() {
+        // `command::init` refuses an existing config before probing, and
+        // `init_refuses_an_existing_config_without_ever_calling_the_probe`
+        // pins that -- but it calls `command::init` directly, so it never sees
+        // what `run` does on the way in. `run` built the provider first, so
+        // `rmem init` on an existing file with the key unset blamed the
+        // missing key; setting the key changed the message to the real one.
+        // Nothing covered `run(["init"])` at all, which is how one arm was
+        // left behind by the fix that removed this everywhere else.
+        let dir = TempDir::new();
+        let config = config_in(&dir);
+        let before = std::fs::read_to_string(&config).unwrap();
+
+        let err = go(&config, &["init"]).unwrap_err();
+        assert!(
+            !matches!(err, CliError::MissingKey),
+            "the file is what is in the way, not the key: {err}"
+        );
+        assert!(err.to_string().contains("--force"), "{err}");
+        // And the file it refused to replace is byte-for-byte the file it was.
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), before);
+    }
+
+    #[test]
+    fn init_with_force_does_ask_for_the_key_because_it_is_about_to_probe() {
+        // The other side of the ordering: `--force` means the existence check
+        // passes, so the probe runs, so the key is genuinely needed. A refusal
+        // here is the right one, and it names the field to look at.
+        let dir = TempDir::new();
+        let config = config_in(&dir);
+
+        let err = go(&config, &["init", "--force"]).unwrap_err();
+        assert!(err.to_string().contains("api_key_env"), "{err}");
+        assert!(
+            !err.to_string().contains("--force"),
+            "the file is not what is in the way this time: {err}"
+        );
     }
 
     #[test]
