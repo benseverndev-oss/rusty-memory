@@ -198,13 +198,78 @@ mod tests {
         assert!(err.to_string().contains("Ben"), "{err}");
     }
 
+    /// The commands [`USAGE`]'s table names, one entry per line.
+    ///
+    /// A line is `    rmem <invocation>` then two or more spaces then the
+    /// description, so the invocation is everything before the first double
+    /// space. Placeholders (`<id>`, `[--force]`, `"<turn>"`) are dropped,
+    /// leaving the literal words a user types: `init`, `review confirm`.
+    ///
+    /// Parsed out rather than checked with `USAGE.contains(name)`, which was
+    /// the bug: the prose line "Entity ids come from `remember` and `recall`.
+    /// Review ids come from `review`." satisfied a bare substring check for
+    /// three of the five commands, so deleting their table lines outright
+    /// left every test passing.
+    fn commands_in_usage() -> Vec<String> {
+        USAGE
+            .lines()
+            // Indented: the unindented banner at the top of USAGE is a
+            // title, not a table entry, and it starts with "rmem " too.
+            .filter(|l| l.starts_with("    rmem "))
+            .map(|l| {
+                l.trim()
+                    .split("  ")
+                    .next()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .skip(1)
+                    .take_while(|w| w.starts_with(char::is_alphabetic))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
     #[test]
     fn the_usage_text_names_every_command_the_parser_accepts() {
         // The one guard against a hand-written usage drifting from a
         // hand-written parser, which is the cost this crate accepted by not
-        // taking clap.
-        for name in ["init", "remember", "recall", "about", "review"] {
-            assert!(USAGE.contains(name), "usage never mentions {name}");
+        // taking clap. Every form the `match` in `parse` accepts needs its
+        // own line -- `review` and `review confirm` included, since a table
+        // that lists only the subcommands never tells a reader that bare
+        // `rmem review` is a thing.
+        let table = commands_in_usage();
+        for invocation in [
+            "init",
+            "remember",
+            "recall",
+            "about",
+            "review",
+            "review confirm",
+            "review reject",
+        ] {
+            assert!(
+                table.iter().any(|entry| entry == invocation),
+                "the command table has no line for `rmem {invocation}`; it has {table:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_command_the_usage_names_is_one_the_parser_recognises() {
+        // Drift has two directions. The test above catches a command the
+        // parser accepts and the usage forgot; this one catches a command
+        // the usage promises and the parser dropped, which is the worse of
+        // the two -- a user reads the line, types it, and is told it is not
+        // an rmem command.
+        for entry in commands_in_usage() {
+            let name = entry.split(' ').next().unwrap().to_string();
+            if let Err(e) = parse(std::iter::once(name.clone())) {
+                assert!(
+                    !e.to_string().contains("is not an rmem command"),
+                    "the usage names `rmem {name}`, which the parser refuses outright"
+                );
+            }
         }
     }
 }
