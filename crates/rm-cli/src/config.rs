@@ -193,25 +193,34 @@ impl Config {
         }
     }
 
+    /// Read a config, saying what is wrong with it in this crate's own words.
+    ///
+    /// Nothing `toml` produced reaches the message. Not its `Display`, which
+    /// reproduces the offending source line; not its `message()`, which quotes
+    /// whatever it did not like — and what it did not like came out of the
+    /// file, in key position (`unknown field` ...) and in value position
+    /// (`invalid type: string` ...) alike.
+    ///
+    /// The version before this one filtered `message()`, dropping quoted spans
+    /// it did not recognise. That cannot be made correct: a backtick inside a
+    /// backtick span is not escaped, so no scanner can tell a delimiter from
+    /// content, and a fuzz of 180,000 configs found 3,455 payloads that walked
+    /// straight through. See [`our_reason`].
+    ///
+    /// What is left is built from three things this crate already holds: the
+    /// error's position, which becomes a line and column; its kind, which
+    /// selects one of [`our_reason`]'s literals; and [`SCHEMA`], which supplies
+    /// the fields legal in whichever table the fault fell inside. Between them
+    /// they say where, why, and what would have been valid.
     fn parse(path: &Path, text: &str) -> Result<Config, CliError> {
         toml::from_str(text).map_err(|e| {
-            // Not `{e}`: `Error`'s `Display` reproduces the offending source
-            // line verbatim, and a config file is the one place `api_key_env`
-            // makes it plausible someone pasted a real key into `api_key` by
-            // mistake. `span()` gives the location without the line.
-            //
-            // `message()` is not safe on its own either, which is what the
-            // sweep for this rule turned up: it quotes whatever it did not
-            // like, and what it did not like came out of the file. Both
-            // positions leak -- `unknown field \u{60}sk-proj-...\u{60}` for a key
-            // pasted in key position, `invalid type: string "sk-proj-...",
-            // expected usize` for one pasted in value position. Removing the
-            // source line closed the bigger hole and left these two.
+            let span = e.span();
             CliError::Config(format!(
-                "{} is not valid: {} ({})",
+                "{} is not valid: {} ({}){}",
                 path.display(),
-                without_quoted_file_text(e.message()),
-                location(text, e.span())
+                our_reason(e.message()),
+                location(text, span.clone()),
+                table_hint(text, span),
             ))
         })
     }
@@ -337,99 +346,135 @@ impl Config {
     }
 }
 
-/// Every word this crate is willing to see quoted back out of a parser
-/// message: the config's own field names, plus the handful of literal tokens
-/// `toml` quotes when it is describing syntax rather than content.
+/// The tables `rmem.toml` may hold, and the fields legal in each.
 ///
-/// An allowlist of our own vocabulary rather than a filter for things that
-/// look like secrets, which is the distinction the rest of this file turns on.
-/// A span not on this list came out of the user's file, and the whole rule
-/// here is that a message never repeats one of those.
-const KNOWN_WORDS: &[&str] = &[
-    // Tables and the keys inside them, in TEMPLATE's order.
-    "store",
-    "path",
-    "provider",
-    "base_url",
-    "api_key_env",
-    "completion_model",
-    "embedding_model",
-    "dimension",
-    "metric",
-    "resolution",
-    "review_at",
-    "match_at",
-    "field",
-    "comparator",
-    "m",
-    "u",
-    "blocking",
-    "kind",
-    "n",
-    "policy",
-    "default",
-    "attribute",
-    // Tokens `toml` quotes when it is talking about syntax: "expected
-    // newline, `#`" and friends. Punctuation, not content.
-    "#",
-    "=",
-    ".",
-    ",",
-    "[",
-    "]",
-    "\"",
-    "'",
+/// Written by hand because it has to be *ours*. Every word of a parse refusal
+/// is now built from this table and from the error's position, so that not one
+/// character of the message came out of the user's file.
+/// `every_key_the_template_uses_is_one_the_schema_lists` guards it against
+/// drift as fields are added.
+///
+/// `[policy.attribute]` is deliberately absent. It is an open map, so it has no
+/// legal-field list to offer, and inventing one would mean printing attribute
+/// names a user chose.
+const SCHEMA: &[(&str, &[&str])] = &[
+    ("[store]", &["path"]),
+    (
+        "[provider]",
+        &[
+            "base_url",
+            "api_key_env",
+            "completion_model",
+            "embedding_model",
+            "dimension",
+            "metric",
+        ],
+    ),
+    ("[resolution]", &["review_at", "match_at"]),
+    ("[[resolution.field]]", &["field", "comparator", "m", "u"]),
+    ("[[resolution.blocking]]", &["kind", "field", "n"]),
+    ("[policy]", &["default"]),
 ];
 
-/// `message` with every quoted span that did not come from this crate removed.
+/// This crate's own sentence for what went wrong, chosen by looking at
+/// `message` and never by copying any of it.
 ///
-/// `toml::de::Error::message()` quotes what it did not like, and what it did
-/// not like came out of the file. Both key and value positions leak:
-/// `sk-proj-... = "x"` under `[provider]` produces ``unknown field
-/// `sk-proj-...` ``, and `dimension = "sk-proj-..."` produces `invalid type:
-/// string "sk-proj-...", expected usize`.
+/// # Why the filter it replaced could not work
 ///
-/// So each backtick- or quote-delimited span is checked against
-/// [`KNOWN_WORDS`] and dropped unless this crate put it there. What survives
-/// is the parser's own prose -- "unknown field", "invalid type: string,
-/// expected usize" -- and its list of the fields that *would* have been
-/// valid, which comes from the struct definitions rather than from the file.
-/// Together with the line and column, that is everything a reader needs.
-fn without_quoted_file_text(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut chars = message.char_indices();
-    while let Some((start, c)) = chars.next() {
-        if c != '`' && c != '"' {
-            out.push(c);
-            continue;
-        }
-        // Find the closing delimiter, honouring backslash escapes: a TOML
-        // basic string containing a quote arrives here as `\"`, and ending the
-        // span at it would leave the rest of the value in the message.
-        let mut end = None;
-        while let Some((i, d)) = chars.next() {
-            if d == '\\' {
-                chars.next();
-            } else if d == c {
-                end = Some(i);
-                break;
-            }
-        }
-        match end {
-            Some(end) if KNOWN_WORDS.contains(&&message[start + c.len_utf8()..end]) => {
-                out.push_str(&message[start..=end]);
-            }
-            // Unclosed as well as unrecognised: if the shape is not one this
-            // understands, the rest of the message is dropped rather than
-            // relayed on the chance that it is harmless.
-            Some(_) => out.push('…'),
-            None => {
-                out.push('…');
-                break;
-            }
+/// The previous version scanned `toml`'s message and dropped quoted spans it
+/// did not recognise. A review fuzzed 180,000 configs against it and found
+/// 3,455 distinct leaking payloads: every one in key position, every one
+/// containing a backtick. `toml` renders a field name inside backticks using
+/// `Display`, and a backtick inside a backtick span is not escaped — so
+/// nothing reading that string can tell a backtick that is *content* from the
+/// one that closes the span. That is a property of the string, not a bug in
+/// the scanner, and no refinement of the scanner removes it.
+///
+/// So the message is no longer filtered; it is not used. The return type is
+/// `&'static str`, which is the point: every value this can return is a
+/// literal below, so it is not possible for anything read out of the file to
+/// reach a caller. `message` is looked at only to decide *which* of our
+/// sentences to print, and a wrong guess picks a wrong sentence rather than
+/// leaking anything.
+///
+/// The cost is real and worth stating: a kind not listed here degrades to the
+/// last line, so a reader gets the location and "not valid TOML" rather than
+/// the parser's own words. The location, and the field list `table_hint` adds,
+/// are what carry the repair.
+fn our_reason(message: &str) -> &'static str {
+    const KINDS: &[(&str, &str)] = &[
+        (
+            "unknown field",
+            "that line sets a field this build does not know",
+        ),
+        (
+            "missing field",
+            "a field this build requires is not set in that table",
+        ),
+        (
+            "duplicate key",
+            "that key is set more than once in the same table",
+        ),
+        (
+            "invalid type",
+            "the value there is not the type that field takes",
+        ),
+        (
+            "invalid value",
+            "the value there is not one that field accepts",
+        ),
+        (
+            "invalid length",
+            "the value there is not the length that field takes",
+        ),
+        (
+            "invalid escape sequence",
+            "a backslash escape inside that string is not one TOML defines; TOML allows \\b, \\t, \\n, \\f, \\r, \\\", \\\\, \\uXXXX and \\UXXXXXXXX",
+        ),
+        ("invalid string", "that string is not well formed"),
+        ("unterminated", "that value is never closed"),
+        ("expected", "the syntax there is not valid TOML"),
+        ("unexpected", "the syntax there is not valid TOML"),
+        ("trailing", "there is more text after the end of that value"),
+    ];
+    for (prefix, ours) in KINDS {
+        if message.starts_with(prefix) {
+            return ours;
         }
     }
-    out
+    "it is not valid TOML"
+}
+
+/// The fields legal in the table the fault fell inside, if it is one of ours.
+///
+/// Read out of this crate's own copy of the file, and matched against
+/// [`SCHEMA`] rather than printed: the table name and the field names that
+/// reach the message are the constants above, so a header spelled anything
+/// else simply yields no hint. This is the useful half of what `toml`'s
+/// "expected one of ..." used to give, rebuilt from a source that cannot carry
+/// a secret.
+fn table_hint(text: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let Some(span) = span else {
+        return String::new();
+    };
+    let mut start = span.start.min(text.len());
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let Some(header) = text[..start]
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('['))
+    else {
+        return String::new();
+    };
+    for (table, fields) in SCHEMA {
+        if *table == header {
+            return format!(". {table} takes {}", fields.join(", "));
+        }
+    }
+    String::new()
 }
 
 /// Where a byte offset into `text` falls, as a 1-based line and *character*
@@ -670,7 +715,7 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
 
         let err = Config::load(&path).unwrap_err().to_string();
         assert!(
-            err.contains("unknown field"),
+            err.contains("a field this build does not know"),
             "the paste has to be refused, not dropped: {err}"
         );
         assert!(
@@ -708,7 +753,7 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         .unwrap();
 
         let err = Config::load(&path).unwrap_err().to_string();
-        assert!(err.contains("unknown field"), "{err}");
+        assert!(err.contains("a field this build does not know"), "{err}");
         assert!(err.contains("line"), "{err}");
     }
 
@@ -823,12 +868,10 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
     fn a_parse_error_still_names_the_fields_that_would_have_been_valid() {
         use crate::testing::TempDir;
 
-        // The other half: stripping quoted spans must not strip the parser's
-        // list of legal field names, which comes from the struct definitions
-        // rather than from the file and is the most useful thing in the
-        // message. This is what the allowlist is for -- without it the honest
-        // fix would have been to drop every quoted span and leave "unknown
-        // field ..., expected one of ..., ..., ...".
+        // The useful half of what `toml`'s "expected one of ..." used to give,
+        // rebuilt from a source that cannot carry a secret: `SCHEMA`, plus the
+        // table the fault fell inside, read from this crate's own copy of the
+        // file and *matched* against SCHEMA rather than printed.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
         std::fs::write(
@@ -838,23 +881,46 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         .unwrap();
 
         let text = Config::load(&path).unwrap_err().to_string();
-        assert!(text.contains("unknown field"), "{text}");
+        assert!(text.contains("does not know"), "{text}");
         assert!(
             !text.contains("embedding_model_name"),
             "a field name is file text too: {text}"
         );
         assert!(
-            text.contains("`embedding_model`") && text.contains("`base_url`"),
-            "the legal names are ours, not the file's, and have to survive: {text}"
+            text.contains("[provider] takes"),
+            "the table has to be named: {text}"
+        );
+        assert!(
+            text.contains("embedding_model") && text.contains("base_url"),
+            "and the fields that would have been valid: {text}"
         );
     }
 
     #[test]
-    fn every_key_the_template_uses_is_one_the_message_filter_knows() {
-        // `KNOWN_WORDS` is written by hand, so it drifts the moment a field is
-        // added. Drift is quiet in the safe direction -- a new field name
-        // would be stripped from messages rather than leaked -- which is
-        // exactly why nothing else would ever catch it.
+    fn a_bad_escape_says_which_escapes_toml_actually_allows() {
+        use crate::testing::TempDir;
+
+        // Under the filter this replaced, `invalid escape sequence` arrived
+        // with its list of legal escapes destroyed -- `n` and `u` survived
+        // only because they happen to be config field names, and the trailing
+        // ellipsis was the escape handler eating a closing backtick. A user
+        // who typed a bad escape learned nothing. Built from our own words,
+        // the message can simply say what TOML allows.
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        std::fs::write(&path, TEMPLATE.replace("memory.json", "memory\\q.json")).unwrap();
+
+        let text = Config::load(&path).unwrap_err().to_string();
+        assert!(text.contains("backslash escape"), "{text}");
+        assert!(text.contains("\\uXXXX"), "{text}");
+        assert!(text.contains("line"), "{text}");
+    }
+
+    #[test]
+    fn every_key_the_template_uses_is_one_the_schema_lists() {
+        // `SCHEMA` is written by hand, so it drifts the moment a field is
+        // added. Drift is quiet -- a new field would simply drop out of the
+        // hint -- which is exactly why nothing else would catch it.
         let mut table = "";
         for line in TEMPLATE.lines() {
             let line = line.trim();
@@ -874,33 +940,96 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
                 // The other direction, and the more important one. Keys in
                 // this table are attribute names a user invents, so they are
                 // data, not vocabulary -- `employer` happens to be in
-                // TEMPLATE, and `"sk-proj-..."` could be in someone's. Listing
-                // one here would make every key in that table quotable.
+                // TEMPLATE, and a pasted key could be in someone's. SCHEMA
+                // lists no fields for it at all, so no hint is ever offered
+                // there.
                 assert!(
-                    !KNOWN_WORDS.contains(&key),
-                    "{key:?} is a [policy.attribute] key, which is the user's text, not ours"
+                    !SCHEMA.iter().any(|(t, _)| *t == table),
+                    "[policy.attribute] is an open map and must have no field list"
                 );
                 continue;
             }
+            let fields = SCHEMA
+                .iter()
+                .find(|(t, _)| *t == table)
+                .unwrap_or_else(|| panic!("SCHEMA does not list the table {table:?}"))
+                .1;
             assert!(
-                KNOWN_WORDS.contains(&key),
-                "TEMPLATE uses {key:?}, which KNOWN_WORDS does not list"
+                fields.contains(&key),
+                "TEMPLATE uses {key:?} in {table}, which SCHEMA does not list"
             );
         }
     }
 
     #[test]
-    fn a_quoted_span_containing_an_escaped_quote_is_removed_whole() {
-        // A TOML basic string may contain `\"`, and a scan that ended the span
-        // at the first unescaped-looking quote would leave the rest of the
-        // value in the message -- the tail of a secret rather than all of it,
-        // which is not better.
-        let message = r#"invalid type: string "sk-FAKE\"STILL-SECRET", expected usize"#;
-        let out = without_quoted_file_text(message);
-        assert!(!out.contains("sk-FAKE"), "{out}");
-        assert!(!out.contains("STILL-SECRET"), "{out}");
-        assert!(out.starts_with("invalid type: string "), "{out}");
-        assert!(out.ends_with(", expected usize"), "{out}");
+    fn no_parse_refusal_repeats_the_file_however_the_payload_is_shaped() {
+        use crate::testing::TempDir;
+
+        // The guard that replaces the scanner, and the shape of it is the
+        // point. A review fuzzed 180,000 configs against the filter that used
+        // to live here and found 3,455 leaking payloads -- all in key
+        // position, all containing a backtick, because `toml` renders a field
+        // name inside backticks and does not escape a backtick within one. No
+        // scanner can pair those delimiters.
+        //
+        // So the payloads here are deliberately awkward rather than
+        // representative: a backtick in the middle, a backtick leading, quotes,
+        // a bare secret. If any of them reaches a message, the approach is
+        // wrong again rather than the pattern being one more special case.
+        const CANARY: &str = "REALSECRETabc123DEF456";
+        let payloads = [
+            format!("sk-proj-{CANARY}"),
+            format!("sk-proj-`{CANARY}"),
+            format!("`{CANARY}"),
+            format!("{CANARY}`"),
+            format!("`{CANARY}`"),
+            format!("sk-proj-\\\"{CANARY}"),
+            format!("sk-proj-'{CANARY}'"),
+            format!("[{CANARY}]"),
+            format!("{CANARY} = {CANARY}"),
+        ];
+
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        let mut refused = 0;
+        for payload in &payloads {
+            // Key position under a closed table, value position on an integer
+            // field, value position on a string field, a duplicate key, and
+            // the open map -- five different `toml` error kinds.
+            let cases = [
+                TEMPLATE.replace(
+                    "completion_model =",
+                    &format!("\"{payload}\" = \"x\"\ncompletion_model ="),
+                ),
+                TEMPLATE.replace("dimension = 1536", &format!("dimension = \"{payload}\"")),
+                TEMPLATE.replace("metric = \"cosine\"", &format!("metric = \"{payload}\"")),
+                TEMPLATE.replace(
+                    "path = \"memory.json\"",
+                    &format!("path = \"memory.json\"\n\"{payload}\" = \"x\"\npath = \"b\""),
+                ),
+                format!("{TEMPLATE}\"{payload}\" = \"nonsense\"\n"),
+            ];
+            for case in cases {
+                std::fs::write(&path, &case).unwrap();
+                let text = match Config::load(&path) {
+                    Err(e) => e.to_string(),
+                    Ok(config) => match (config.metric(), config.policy_for_engine()) {
+                        (Err(e), _) => e.to_string(),
+                        (_, Err(e)) => e.to_string(),
+                        _ => continue,
+                    },
+                };
+                refused += 1;
+                assert!(
+                    !text.contains(CANARY),
+                    "the file came back out of a refusal: {text}"
+                );
+            }
+        }
+        assert!(
+            refused >= payloads.len(),
+            "the fixtures stopped being refused, so this stopped testing anything"
+        );
     }
 
     #[test]
