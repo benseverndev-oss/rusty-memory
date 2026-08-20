@@ -8,6 +8,26 @@
 //! The cost is real: [`USAGE`] is written by hand and can drift from this
 //! parser. `the_usage_text_names_every_command_the_parser_accepts` is the guard
 //! against that, and it is the only one there is.
+//!
+//! # Why these messages quote what the user typed
+//!
+//! Everywhere else in this crate a refusal names a field or a location and
+//! never a value, because eight credential leaks came out of error messages
+//! echoing `rmem.toml`. Every message in this module does the opposite: it
+//! quotes the argument it did not understand.
+//!
+//! That is deliberate, and the difference is where the value has already been.
+//! A config file is committed, shared, and read by a program while nobody is
+//! watching, so a secret in one reaches places its author never chose. A value
+//! typed on a command line is already in the shell's history, in the process
+//! table, and on the screen it was typed on — echoing it back exposes nothing
+//! that was not exposed by typing it. Against that, refusing to show which
+//! argument was wrong would make every usage error useless: "that is not an
+//! rmem command" without saying which word is a worse message than no message.
+//!
+//! Checked rather than assumed: every interpolation below draws from the
+//! `args` iterator and none of them from any file. Anything that begins
+//! reading a file in here needs this paragraph revisited.
 
 use crate::CliError;
 
