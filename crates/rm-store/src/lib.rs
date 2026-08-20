@@ -58,6 +58,88 @@ use serde::{Deserialize, Serialize};
 /// than silently resolving to whatever took its place.
 pub type StableId = u64;
 
+/// Where a snapshot's JSON failed to parse, and what kind of failure it was —
+/// never what `serde_json` said about it.
+///
+/// This used to carry `serde_json::Error::to_string()`, and that string quotes
+/// whatever the parser did not like: `invalid type: string "sk-proj-...",
+/// expected u64` for a wrong-typed field. `line()`, `column()` and
+/// `classify()` are structural facts about *where* and *what kind* of failure
+/// it was, not text read out of the snapshot, so a type built only from those
+/// three cannot carry a secret regardless of what malformed snapshot produced
+/// it — the guarantee is in the type, not in anything that inspects the
+/// message afterward. The cost: `expected u64` is gone, and that is the only
+/// part of the old message that could ever have been one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotParseError {
+    pub line: usize,
+    pub column: usize,
+    pub category: ParseCategory,
+}
+
+impl std::fmt::Display for SnapshotParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at line {}, column {}",
+            self.category.reason(),
+            self.line,
+            self.column
+        )
+    }
+}
+
+impl From<serde_json::Error> for SnapshotParseError {
+    fn from(e: serde_json::Error) -> Self {
+        SnapshotParseError {
+            line: e.line(),
+            column: e.column(),
+            category: e.classify().into(),
+        }
+    }
+}
+
+/// What kind of thing went wrong while reading the JSON, per
+/// [`serde_json::error::Category`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseCategory {
+    /// The reader itself failed -- not applicable to a snapshot already held
+    /// as a `&str`, but kept so this mirrors `serde_json`'s own categories
+    /// rather than inventing a smaller set that a future `serde_json` could
+    /// outgrow.
+    Io,
+    /// The bytes are not well-formed JSON at all.
+    Syntax,
+    /// The JSON is well-formed but does not match the shape a store snapshot
+    /// takes -- a field of the wrong type, an unknown enum variant, a missing
+    /// field.
+    Data,
+    /// The input ended before a complete value was read.
+    Eof,
+}
+
+impl ParseCategory {
+    fn reason(self) -> &'static str {
+        match self {
+            ParseCategory::Io => "the snapshot could not be read as bytes",
+            ParseCategory::Syntax => "the snapshot is not well-formed JSON",
+            ParseCategory::Data => "the JSON there does not match the shape a store snapshot takes",
+            ParseCategory::Eof => "the snapshot ends before its JSON is complete",
+        }
+    }
+}
+
+impl From<serde_json::error::Category> for ParseCategory {
+    fn from(c: serde_json::error::Category) -> Self {
+        match c {
+            serde_json::error::Category::Io => ParseCategory::Io,
+            serde_json::error::Category::Syntax => ParseCategory::Syntax,
+            serde_json::error::Category::Data => ParseCategory::Data,
+            serde_json::error::Category::Eof => ParseCategory::Eof,
+        }
+    }
+}
+
 /// Something went wrong that the caller has to decide about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreError {
@@ -66,7 +148,7 @@ pub enum StoreError {
     /// Survivorship declined to guess. Carries its explanation.
     Refused(Refused),
     /// A snapshot could not be read.
-    Parse(String),
+    Parse(SnapshotParseError),
     /// A snapshot was read, and describes a store that cannot exist.
     ///
     /// Distinct from [`StoreError::Parse`] because the two ask different things
@@ -86,7 +168,7 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::UnknownEntity(id) => write!(f, "no entity with id {id}"),
             StoreError::Refused(r) => write!(f, "{r}"),
-            StoreError::Parse(m) => write!(f, "could not read snapshot: {m}"),
+            StoreError::Parse(e) => write!(f, "could not read snapshot: {e}"),
             StoreError::CorruptSnapshot(why) => {
                 write!(
                     f,
@@ -913,7 +995,7 @@ impl MemoryStore {
     /// contradict each other.
     pub fn open(snapshot: &str) -> Result<Self, StoreError> {
         let mut store: MemoryStore =
-            serde_json::from_str(snapshot).map_err(|e| StoreError::Parse(e.to_string()))?;
+            serde_json::from_str(snapshot).map_err(|e| StoreError::Parse(e.into()))?;
 
         // Keyed on the map, not on `Entity::id`: `create_entity` inserts at
         // `next_id`, so the keys are what a reissued id would collide with.
@@ -2358,5 +2440,31 @@ mod tests {
     fn a_malformed_snapshot_is_reported_not_panicked_on() {
         let err = MemoryStore::open("{ not json").unwrap_err();
         assert!(matches!(err, StoreError::Parse(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_snapshot_parse_failure_names_a_position_never_the_text_that_broke_it() {
+        // The awkward fixture: a backtick embedded in the very value
+        // `serde_json` used to quote. Before this fix `StoreError::Parse`
+        // carried `serde_json`'s own message -- `invalid type: string
+        // "CANARY-`-...", expected u64` -- which is exactly the shape a
+        // 180,000-config fuzz proved a downstream scanner cannot filter: a
+        // backtick inside a backtick span is not escaped, so nothing can
+        // tell content from a span's own close. `next_id` wants a `u64` and
+        // this hands it a string, so the failure is real and in `Data`
+        // position, not merely syntactic.
+        let canary = "CANARY-`-0123456789abcdef";
+        let snapshot = format!(r#"{{"entities":{{}},"next_id":"{canary}","edges":{{}}}}"#);
+
+        let err = MemoryStore::open(&snapshot).unwrap_err();
+        let rendered = err.to_string();
+        let StoreError::Parse(parse) = err else {
+            panic!("expected a parse failure, got {rendered}");
+        };
+        assert_eq!(parse.category, ParseCategory::Data);
+        assert_eq!(parse.line, 1);
+        assert!(!rendered.contains(canary), "{rendered}");
+        assert!(!rendered.contains('`'), "{rendered}");
+        assert!(!rendered.contains("CANARY"), "{rendered}");
     }
 }

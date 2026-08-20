@@ -85,6 +85,94 @@ pub enum Metric {
 /// Rejecting at the door rather than storing something unusable: a NaN
 /// propagates into every comparison it touches and turns the ranking into
 /// nonsense without ever erroring.
+/// Where a snapshot's JSON failed to parse, and what kind of failure it was —
+/// never what `serde_json` said about it.
+///
+/// This used to be carried as `serde_json::Error::to_string()` inside
+/// [`IndexError::CorruptSnapshot`], and that string quotes whatever the parser
+/// did not like: `` unknown variant `sk-...`, expected `Cosine` or `L2` `` for
+/// a bad `metric`. That example renders inside *backticks*, and `serde_json`
+/// does not escape one that appears in the text it quotes -- so a backtick
+/// inside a backtick span is indistinguishable from the span's own close, and
+/// a fuzz of 180,000 configs proved no downstream scanner can tell them apart.
+/// `line()`, `column()` and `classify()` are structural facts about *where*
+/// and *what kind* of failure it was, not text read out of the snapshot, so a
+/// type built only from those three cannot carry a secret regardless of what
+/// malformed snapshot produced it. The cost: the parser's own reason --
+/// `expected \`Cosine\` or \`L2\`` -- is gone, and that is the only part of
+/// the old message that could ever have been one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotParseError {
+    pub line: usize,
+    pub column: usize,
+    pub category: ParseCategory,
+}
+
+impl std::fmt::Display for SnapshotParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at line {}, column {}",
+            self.category.reason(),
+            self.line,
+            self.column
+        )
+    }
+}
+
+impl From<serde_json::Error> for SnapshotParseError {
+    fn from(e: serde_json::Error) -> Self {
+        SnapshotParseError {
+            line: e.line(),
+            column: e.column(),
+            category: e.classify().into(),
+        }
+    }
+}
+
+/// What kind of thing went wrong while reading the JSON, per
+/// [`serde_json::error::Category`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseCategory {
+    /// The reader itself failed -- not applicable to a snapshot already held
+    /// as a `&str`, but kept so this mirrors `serde_json`'s own categories
+    /// rather than inventing a smaller set that a future `serde_json` could
+    /// outgrow.
+    Io,
+    /// The bytes are not well-formed JSON at all.
+    Syntax,
+    /// The JSON is well-formed but does not match the shape an index
+    /// snapshot takes -- a field of the wrong type, an unknown enum variant,
+    /// a missing field.
+    Data,
+    /// The input ended before a complete value was read.
+    Eof,
+}
+
+impl ParseCategory {
+    fn reason(self) -> &'static str {
+        match self {
+            ParseCategory::Io => "the snapshot could not be read as bytes",
+            ParseCategory::Syntax => "the snapshot is not well-formed JSON",
+            ParseCategory::Data => {
+                "the JSON there does not match the shape an index snapshot takes"
+            }
+            ParseCategory::Eof => "the snapshot ends before its JSON is complete",
+        }
+    }
+}
+
+impl From<serde_json::error::Category> for ParseCategory {
+    fn from(c: serde_json::error::Category) -> Self {
+        match c {
+            serde_json::error::Category::Io => ParseCategory::Io,
+            serde_json::error::Category::Syntax => ParseCategory::Syntax,
+            serde_json::error::Category::Data => ParseCategory::Data,
+            serde_json::error::Category::Eof => ParseCategory::Eof,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IndexError {
     /// The vector's length does not match the index's dimension.
@@ -94,11 +182,27 @@ pub enum IndexError {
     /// A zero vector under [`Metric::Cosine`], which has no direction and so
     /// no angle to anything.
     ZeroVectorUnderCosine,
+    /// A snapshot's JSON never parsed at all.
+    ///
+    /// Was folded into [`IndexError::CorruptSnapshot`], which this crate's own
+    /// doc comment describes as "the bytes were well-formed" -- true of every
+    /// other case that variant covers and false of this one, so a caller
+    /// reading `open`'s error had no way to tell "these bytes are not JSON, or
+    /// not this shape of JSON" from "this is a well-formed index whose own
+    /// numbers disagree with each other" without inspecting the string inside.
+    /// Split out because the two ask different things of a caller: `Parse`
+    /// means a truncated write or a wrong file, and a retry with better bytes
+    /// can fix it. `CorruptSnapshot` means the bytes *are* a well-formed
+    /// index and its invariants still contradict each other, which a retry of
+    /// the same bytes cannot fix. `rm_store` and `rm_engine` already draw this
+    /// line with a variant of this name; drawing it differently here would
+    /// make the three doors read as three unrelated designs.
+    Parse(SnapshotParseError),
     /// A snapshot parsed as JSON but described an index that cannot exist.
     ///
-    /// Separate from a parse failure: the bytes were well-formed, so nothing
-    /// upstream would have flagged them, and the damage only shows up as a
-    /// panic on the first query.
+    /// Separate from [`IndexError::Parse`]: the bytes were well-formed, so
+    /// nothing upstream would have flagged them, and the damage only shows up
+    /// as a panic on the first query.
     CorruptSnapshot(String),
 }
 
@@ -120,6 +224,7 @@ impl std::fmt::Display for IndexError {
                 "the zero vector has no direction, so it has no cosine \
                  similarity to anything; use Metric::L2 if magnitude is meaningful"
             ),
+            IndexError::Parse(e) => write!(f, "could not read snapshot: {e}"),
             IndexError::CorruptSnapshot(why) => write!(
                 f,
                 "snapshot parsed but describes an impossible index: {why}"
@@ -323,9 +428,15 @@ impl VectorIndex {
     /// snapshot with the wrong number of floats parses cleanly and then panics
     /// on the first search, which is the failure mode the whole "reject at the
     /// door" premise exists to avoid — a restore path is a door.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError::Parse`] if the bytes never became a `VectorIndex` at all,
+    /// and [`IndexError::CorruptSnapshot`] if they did and the numbers inside
+    /// it contradict each other.
     pub fn open(snapshot: &str) -> Result<Self, IndexError> {
-        let mut ix: VectorIndex = serde_json::from_str(snapshot)
-            .map_err(|e| IndexError::CorruptSnapshot(e.to_string()))?;
+        let mut ix: VectorIndex =
+            serde_json::from_str(snapshot).map_err(|e| IndexError::Parse(e.into()))?;
 
         if ix.dim == 0 {
             return Err(IndexError::CorruptSnapshot(
@@ -656,7 +767,34 @@ mod tests {
 
     #[test]
     fn a_malformed_snapshot_is_reported_not_panicked_on() {
-        assert!(VectorIndex::open("{ not json").is_err());
+        let err = VectorIndex::open("{ not json").unwrap_err();
+        assert!(matches!(err, IndexError::Parse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_snapshot_parse_failure_names_a_position_never_the_text_that_broke_it() {
+        // The awkward fixture: a backtick embedded in the very value
+        // `serde_json` used to quote. Before this fix that failure travelled
+        // as `IndexError::CorruptSnapshot(e.to_string())`, and the real
+        // message this crate's own docs quote is `` unknown variant
+        // `CANARY-...`, expected `Cosine` or `L2` `` -- rendered inside
+        // backticks that `serde_json` does not escape, so a backtick inside
+        // the value is indistinguishable from the span's own close. A
+        // 180,000-config fuzz proved no downstream scanner can filter that
+        // shape, which is why it is closed at the source instead.
+        let canary = "CANARY-`-0123456789abcdef";
+        let snapshot = format!(r#"{{"dim":2,"metric":"{canary}","ids":[],"vectors":[]}}"#);
+
+        let err = VectorIndex::open(&snapshot).unwrap_err();
+        let rendered = err.to_string();
+        let IndexError::Parse(parse) = err else {
+            panic!("expected a parse failure, got {rendered}");
+        };
+        assert_eq!(parse.category, ParseCategory::Data);
+        assert_eq!(parse.line, 1);
+        assert!(!rendered.contains(canary), "{rendered}");
+        assert!(!rendered.contains('`'), "{rendered}");
+        assert!(!rendered.contains("CANARY"), "{rendered}");
     }
 
     #[test]
