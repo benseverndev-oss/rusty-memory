@@ -169,8 +169,21 @@ impl Config {
     }
 
     fn parse(path: &Path, text: &str) -> Result<Config, CliError> {
-        toml::from_str(text)
-            .map_err(|e| CliError::Config(format!("{} is not valid: {e}", path.display())))
+        toml::from_str(text).map_err(|e| {
+            // Not `{e}`: `Error`'s `Display` reproduces the offending source
+            // line verbatim, and a config file is the one place `api_key_env`
+            // makes it plausible someone pasted a real key into `api_key` by
+            // mistake. `message()` and `span()` give the reason and the
+            // location without echoing what triggered it -- everything a
+            // reader needs to find and fix the line, and the one thing that
+            // could ever leak stays out.
+            CliError::Config(format!(
+                "{} is not valid: {} ({})",
+                path.display(),
+                e.message(),
+                location(text, e.span())
+            ))
+        })
     }
 
     /// A config built from [`TEMPLATE`] rather than a file.
@@ -239,6 +252,20 @@ impl Config {
             self.provider.embedding_model.clone(),
         ))
     }
+}
+
+/// Where a byte offset into `text` falls, as 1-based line and column -- the
+/// same convention `toml`'s own `Display` uses, computed by hand so the
+/// message can carry the location without carrying the line itself.
+fn location(text: &str, span: Option<std::ops::Range<usize>>) -> String {
+    let Some(span) = span else {
+        return "location unknown".to_string();
+    };
+    let start = span.start.min(text.len());
+    let newline = '\n';
+    let line = text[..start].matches(newline).count() + 1;
+    let column = start - text[..start].rfind(newline).map_or(0, |i| i + 1) + 1;
+    format!("line {line}, column {column}")
 }
 
 fn comparator(name: &str) -> Result<Comparator, CliError> {
@@ -370,6 +397,33 @@ mod tests {
         let err = Config::load_or_template(&path).unwrap_err();
         assert!(err.to_string().contains("rmem.toml"), "{err}");
         assert!(err.to_string().contains("not valid"), "{err}");
+    }
+
+    #[test]
+    fn a_broken_config_names_the_failing_line_without_echoing_what_is_on_it() {
+        use crate::testing::TempDir;
+
+        // toml::de::Error's own Display reproduces the offending source line
+        // verbatim, and this file is the one place `api_key_env` makes it
+        // plausible someone pastes a real key into `api_key` by mistake --
+        // an unquoted value is an easy typo and a realistic way to land a
+        // parse error on exactly that line. The location has to survive so
+        // the line can be found and fixed; the line's content must not,
+        // because it is the only part of this error that could ever carry a
+        // secret.
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        let broken =
+            format!("{TEMPLATE}\napi_key = sk-THIS-IS-A-FAKE-SECRET-TOKEN-LEAK-CHECK-1234567890\n");
+        std::fs::write(&path, &broken).unwrap();
+
+        let err = Config::load(&path).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            !text.contains("sk-THIS-IS-A-FAKE-SECRET-TOKEN"),
+            "the secret-looking value leaked into the error: {text}"
+        );
+        assert!(text.contains("line"), "{text}");
     }
 
     #[test]
