@@ -32,7 +32,8 @@ Reply with only a JSON object of this shape, and nothing else:
 
 {{
   "mentions": [
-    {{"kind": "person", "name": "Alex Chen", "text": "Alex"}}
+    {{"kind": "person", "name": "Alex Chen", "text": "Alex"}},
+    {{"kind": "organisation", "name": "Globex", "text": "Globex"}}
   ],
   "facts": [
     {{"subject": 0, "attribute": "employer", "value": "Globex",
@@ -184,8 +185,9 @@ mod tests {
         let wire: crate::WireExtraction = serde_json::from_str(json)
             .expect("the prompt's own example must parse as the wire schema it teaches");
 
-        assert_eq!(wire.mentions.len(), 1);
+        assert_eq!(wire.mentions.len(), 2);
         assert_eq!(wire.mentions[0].name, "Alex Chen");
+        assert_eq!(wire.mentions[1].name, "Globex");
         assert_eq!(wire.facts.len(), 1);
         assert_eq!(wire.facts[0].attribute, "employer");
         assert_eq!(wire.facts[0].value.as_deref(), Some("Globex"));
@@ -196,6 +198,40 @@ mod tests {
             wire.closures[0].because,
             "starting a new job ends the previous one"
         );
+    }
+
+    /// A completer that answers with the prompt's own example, which is what a
+    /// model copying the shape it was shown would send back.
+    struct Echo;
+
+    impl crate::Completer for Echo {
+        fn complete(&self, prompt: &str) -> Result<String, crate::CompleterError> {
+            Ok(example_json(prompt).to_string())
+        }
+    }
+
+    #[test]
+    fn the_prompt_s_example_survives_every_refusal_extract_applies() {
+        // Parsing the example as `WireExtraction` proves only that serde can
+        // read it. `extract` then applies checks serde cannot express -- every
+        // index in range, no relation to itself, no nameless mention -- and the
+        // example shipped for a while with `"object": 1` against a
+        // single-entry `mentions` array, which parsed cleanly and would have
+        // been refused. A prompt teaching an extraction its own crate rejects
+        // is the drift the crate owning both exists to prevent, so the guard
+        // has to be the same validation, not a weaker one that happens to
+        // stand next to it.
+        let out = crate::extract(&turn("anything", None), &Echo)
+            .unwrap_or_else(|e| panic!("the prompt's own example must survive `extract`: {e}"));
+
+        assert_eq!(out.mentions.len(), 2);
+        assert_eq!(out.mentions[1].name, "Globex");
+        assert_eq!(out.facts.len(), 1);
+        assert_eq!(out.relations.len(), 1);
+        assert_eq!(out.closures.len(), 1);
+        // The index the old example got wrong: the relation's object is the
+        // second mention, so the example needs a second mention to name.
+        assert_eq!(out.relations[0].object, 1);
     }
 
     #[test]
