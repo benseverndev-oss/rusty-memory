@@ -237,6 +237,27 @@ impl Config {
     }
 
     /// The resolver this file describes.
+    ///
+    /// The `m`, `u` and threshold checks are made here rather than left to
+    /// `Ruleset::new`, and that is the whole point of them. `FieldRule`'s own
+    /// validation names the field it was given — `field {:?}: m = ...` — and
+    /// that string came out of `[[resolution.field]]`, so `field =
+    /// "sk-proj-SECRET"` with `m = 0.9, u = 0.95` printed a credential the
+    /// moment its error was relayed. Naming its input is reasonable for a
+    /// library; relaying it is not reasonable here.
+    ///
+    /// So the same conditions are checked first, in this crate's words, naming
+    /// the entry by index the way `where_` does elsewhere. The numbers *are*
+    /// interpolated: they deserialise as `f64`, so no string from the file can
+    /// reach them whatever is written there.
+    ///
+    /// `Ruleset::new` is still called and its refusal still honoured — it is
+    /// the authority on what a valid ruleset is, and duplicating that judgement
+    /// rather than deferring to it would be the real mistake. What is dropped
+    /// is its *text*, so a rule added there later cannot start printing the
+    /// file through this path. The cost, stated: such a rule would arrive here
+    /// as the last message below, which says where to look and not what is
+    /// wrong.
     pub fn ruleset(&self) -> Result<Ruleset, CliError> {
         let mut rules = Vec::new();
         // Entries are numbered rather than named. `field = "name"` is itself
@@ -245,14 +266,30 @@ impl Config {
         // location, which is what a reader needs and what nothing can hide a
         // secret in.
         for (n, f) in self.resolution.field.iter().enumerate() {
+            let where_ = format!("[[resolution.field]] entry {}", n + 1);
+            for (name, p) in [("m", f.m), ("u", f.u)] {
+                if !(p > 0.0 && p < 1.0) {
+                    return Err(CliError::Config(format!(
+                        "{where_} in rmem.toml gives {name} = {p}, but it is a probability and must be strictly between 0 and 1 -- 0 or 1 would make this one field's agreement decide every comparison on its own, whatever the other evidence says"
+                    )));
+                }
+            }
+            if f.m <= f.u {
+                return Err(CliError::Config(format!(
+                    "{where_} in rmem.toml gives m = {} and u = {}, but m must be greater than u -- otherwise agreement on this field is evidence *against* a match. Either the two are swapped, or the field does not discriminate and should be left out.",
+                    f.m, f.u
+                )));
+            }
             rules.push(FieldRule::new(
                 f.field.clone(),
-                comparator(
-                    &f.comparator,
-                    &format!("[[resolution.field]] entry {}", n + 1),
-                )?,
+                comparator(&f.comparator, &where_)?,
                 f.m,
                 f.u,
+            ));
+        }
+        if rules.is_empty() {
+            return Err(CliError::Config(
+                "rmem.toml has no [[resolution.field]] entries, so every pair scores 0 and the thresholds decide everything uniformly. Add at least one field to compare.".to_string(),
             ));
         }
         let mut blocking = Vec::new();
@@ -262,13 +299,24 @@ impl Config {
                 &format!("[[resolution.blocking]] entry {}", n + 1),
             )?);
         }
-        Ruleset::new(
-            rules,
-            blocking,
-            self.resolution.review_at,
-            self.resolution.match_at,
-        )
-        .map_err(|e| CliError::Config(e.to_string()))
+
+        let (review_at, match_at) = (self.resolution.review_at, self.resolution.match_at);
+        if !(review_at.is_finite() && match_at.is_finite()) {
+            return Err(CliError::Config(
+                "rmem.toml's [resolution] review_at and match_at must both be finite numbers of bits".to_string(),
+            ));
+        }
+        if review_at > match_at {
+            return Err(CliError::Config(format!(
+                "rmem.toml's [resolution] gives review_at = {review_at}, which is above match_at = {match_at}. That leaves no review band and makes some matches unreachable; review_at must be at or below match_at."
+            )));
+        }
+
+        Ruleset::new(rules, blocking, review_at, match_at).map_err(|_| {
+            CliError::Config(
+                "rmem.toml's [resolution] section is not one this build can turn into a resolver, for a reason the checks above did not anticipate. Its own words are not repeated here: they name the fields they were given, and a field name comes out of the file.".to_string(),
+            )
+        })
     }
 
     /// The survivorship policy this file describes.
@@ -1203,6 +1251,72 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             (got - expected).abs() < 1e-9,
             "score = {got}, expected {expected}"
         );
+    }
+
+    #[test]
+    fn a_field_name_never_reaches_a_refusal_about_its_own_rule() {
+        // The leak-through-a-library-error class, and a pointed one: the
+        // commit that rewrote `ruleset` to number entries rather than name them
+        // said in its own comment that `field = "name"` is text out of the file
+        // and quoting it "would be the same mistake in a smaller place" -- and
+        // then handed that string to `FieldRule::new`, whose validation
+        // interpolates it with `{:?}`.
+        //
+        // Every condition `FieldRule::validate` can refuse on, driven with a
+        // credential in the field name. `m = 0.9, u = 0.95` is the reviewer's
+        // repro.
+        const CANARY: &str = "sk-proj-REALSECRETabc123DEF456";
+        let cases = [
+            // m is not greater than u.
+            ("m = 0.9", "m = 0.9"),
+            // m outside (0, 1).
+            ("m = 0.9", "m = 1.0"),
+            ("m = 0.9", "m = 0.0"),
+            // u outside (0, 1).
+            ("u = 0.95", "u = 0.0"),
+            ("u = 0.95", "u = 1.0"),
+        ];
+        for (from, to) in cases {
+            let bad = TEMPLATE
+                .replace("field = \"name\"", &format!("field = \"{CANARY}\""))
+                .replace("u = 0.01", "u = 0.95")
+                .replace(from, to);
+            let config = parse(&bad).expect("still valid TOML");
+            let Err(err) = config.ruleset() else {
+                panic!("{from} -> {to} should have been refused");
+            };
+            let text = err.to_string();
+            assert!(
+                !text.contains(CANARY),
+                "the field name came back out: {text}"
+            );
+            assert!(
+                !format!("{err:?}").contains(CANARY),
+                "it came back out through Debug"
+            );
+            assert!(
+                text.contains("[[resolution.field]] entry 1"),
+                "the entry has to be located: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_with_no_field_rules_is_refused_naming_the_table_to_add_one_to() {
+        // `Ruleset::new` refuses this too, and its wording is fine -- but it is
+        // its wording, and none of those are relayed now. Checking it here also
+        // lets the refusal name the table an entry has to be added to, which
+        // "no field rules" did not.
+        let start = TEMPLATE.find("[[resolution.field]]").unwrap();
+        let end = TEMPLATE.find("[[resolution.blocking]]").unwrap();
+        let none = format!("{}{}", &TEMPLATE[..start], &TEMPLATE[end..])
+            .replace("review_at = 4.0", "field = []\nreview_at = 4.0");
+
+        let config = parse(&none).expect("still valid TOML");
+        let Err(err) = config.ruleset() else {
+            panic!("a ruleset with no rules cannot resolve anything");
+        };
+        assert!(err.to_string().contains("[[resolution.field]]"), "{err}");
     }
 
     #[test]
