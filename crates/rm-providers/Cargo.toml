@@ -1,0 +1,16 @@
+[package]
+name = "rm-providers"
+version = "0.0.0"
+description = "Completer and Embedder over an OpenAI-compatible API. The only crate here that opens a socket."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rm-engine = { workspace = true }
+rm-extract = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true }
