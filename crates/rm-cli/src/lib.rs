@@ -11,6 +11,7 @@ pub mod args;
 pub mod command;
 pub mod config;
 pub mod format;
+pub mod run;
 pub mod store;
 #[cfg(test)]
 pub mod testing;
