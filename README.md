@@ -55,7 +55,7 @@ never discussed it" are different answers.)
 | `rm-graph` | in progress | Entity graph, k-hop retrieval |
 | `rm-resolve` | in progress | Probabilistic entity resolution, with a review band |
 | `rm-index` | in progress | Exact vector search: deletion, filtering, persistence |
-| `rm-extract` | planned | Turn → mentions/edges. The only networked crate. |
+| `rm-extract` | in progress | Turn → mentions/edges. The only networked crate. |
 | `rm-engine` | in progress | `remember()` / `recall()` / `forget()` |
 | `rm-mcp` / `rm-cli` | planned | MCP server and `rmem` binary |
 
