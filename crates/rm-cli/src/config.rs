@@ -277,17 +277,35 @@ impl Config {
     }
 }
 
-/// Where a byte offset into `text` falls, as 1-based line and column -- the
-/// same convention `toml`'s own `Display` uses, computed by hand so the
-/// message can carry the location without carrying the line itself.
+/// Where a byte offset into `text` falls, as a 1-based line and *character*
+/// column -- the same convention `toml`'s own `Display` uses, computed by hand
+/// so the message can carry the location without carrying the line itself.
 fn location(text: &str, span: Option<std::ops::Range<usize>>) -> String {
     let Some(span) = span else {
         return "location unknown".to_string();
     };
-    let start = span.start.min(text.len());
-    let newline = '\n';
-    let line = text[..start].matches(newline).count() + 1;
-    let column = start - text[..start].rfind(newline).map_or(0, |i| i + 1) + 1;
+    // Clamped, then walked back to a character boundary. `min` alone keeps
+    // the slice in bounds but not on a boundary, and slicing mid-character
+    // panics -- with a message that prints up to 256 bytes of the string
+    // being sliced, which here is the head of `rmem.toml`. That is exactly
+    // the leak `Config::parse` closes, arriving as a panic instead. No
+    // malformed input has been found that gets `toml` to hand back a
+    // mid-character span, so this guards a mechanism rather than a live
+    // defect; it is one line and the failure mode is severe.
+    let mut start = span.start.min(text.len());
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let before = &text[..start];
+    let line = before.matches('\n').count() + 1;
+    // Characters, not bytes. `toml_edit`, which produces the spans, counts
+    // characters, so a byte column disagrees with what `toml`'s own `Display`
+    // would have said the moment the line holds anything non-ASCII. Since the
+    // source line is deliberately not echoed, the column is the only
+    // affordance left for finding the fault -- so it has to agree with what
+    // the reader will check it against.
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let column = text[line_start..start].chars().count() + 1;
     format!("line {line}, column {column}")
 }
 
@@ -513,6 +531,39 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         let path = dir.path().join("rmem.toml");
         std::fs::write(&path, TEMPLATE).unwrap();
         Config::load(&path).expect("the template must still parse");
+    }
+
+    #[test]
+    fn a_location_column_counts_characters_the_way_toml_does() {
+        // The source line is deliberately not echoed, so the column is the
+        // only affordance left for finding the fault -- and whoever checks it
+        // will check against `toml` itself, or an editor that agrees with it.
+        // `toml_edit` counts characters; this counted bytes, and the two
+        // disagree the moment the line holds anything non-ASCII.
+        let text = "note = \"\u{1F600}\u{1F600}\u{1F600}\\q\"\n";
+        let err = toml::from_str::<toml::Value>(text).unwrap_err();
+        let ours = location(text, err.span());
+        let theirs = err.to_string();
+        assert!(
+            theirs.contains(&ours),
+            "toml reports {theirs:?}; this reports {ours:?}"
+        );
+    }
+
+    #[test]
+    fn a_span_that_lands_mid_character_does_not_panic() {
+        // `location` is handed a byte range and clamps it with `min`, which
+        // keeps the slice in bounds but not on a character boundary. Slicing
+        // mid-character panics, and Rust's slice-error message prints up to
+        // 256 bytes of the string being sliced -- the head of `rmem.toml`,
+        // which is the very thing `Config::parse` stopped echoing. Driven
+        // directly rather than through the parser because no malformed input
+        // has been found that makes `toml` hand back such a span.
+        let text = "\u{1F600} = 1\n";
+        for start in 0..=text.len() + 4 {
+            let _ = location(text, Some(start..text.len()));
+        }
+        assert_eq!(location(text, Some(2..3)), "line 1, column 1");
     }
 
     #[test]
