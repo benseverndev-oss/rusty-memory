@@ -250,7 +250,33 @@ impl Config {
     pub fn policy_for_engine(&self) -> Result<Policy, CliError> {
         let mut policy = Policy::new(strategy(&self.policy.default)?);
         for (attribute, name) in &self.policy.attribute {
-            policy = policy.with(attribute.clone(), strategy(name)?);
+            // `[policy.attribute]` is an open map -- any attribute name, any
+            // strategy name -- which makes it the one table in `rmem.toml`
+            // that `deny_unknown_fields` cannot defend. It is also the last
+            // table in `TEMPLATE`, so `api_key = "sk-..."` appended to the
+            // end of the file, which is what appending to a file means, lands
+            // here as a map entry rather than as an unknown field. Driven
+            // rather than reasoned about: it put the value on the terminal
+            // verbatim, through `strategy`'s catch-all arm.
+            //
+            // So this names the attribute and not what was written against
+            // it. The attribute is the half a reader needs to find the line,
+            // and the value is the half that can be a secret -- the same
+            // split `Config::parse` makes between a location and a source
+            // line.
+            let chosen = match strategy(name) {
+                Ok(s) => s,
+                // `source_priority`'s refusal is a sentence written into this
+                // binary rather than read out of the file, so relaying it
+                // carries nothing the user typed.
+                Err(e) if name == "source_priority" => return Err(e),
+                Err(_) => {
+                    return Err(CliError::Config(format!(
+                        "the strategy for attribute {attribute:?} under [policy.attribute] is not one this build knows; use one of most_complete, longest_value, majority_vote, confidence_majority, first_non_null, unanimous_or_null, most_recent, valid_interval. What is written there is deliberately not repeated: this table accepts any name, so it is where a key pasted at the end of rmem.toml lands, and printing it would put it in your terminal and your scrollback."
+                    )))
+                }
+            };
+            policy = policy.with(attribute.clone(), chosen);
         }
         Ok(policy)
     }
@@ -268,7 +294,27 @@ impl Config {
 
     /// A provider built from this file and the environment.
     pub fn provider(&self) -> Result<HttpProvider, CliError> {
-        let key = std::env::var(&self.provider.api_key_env)
+        // `api_key_env` holds the NAME of a variable, and the likeliest way to
+        // get this file wrong is to put the key there instead -- the field is
+        // called `api_key_env` and a key is what you have in your hand.
+        // `CliError::MissingKey` then printed it verbatim, because a name is
+        // exactly what that message exists to tell you. Driven: a key pasted
+        // there reached stderr in full.
+        //
+        // Checked as a validation rather than as a secret detector, which is
+        // the distinction that makes it safe to act on. An environment
+        // variable's name is letters, digits and underscores; a value that is
+        // not one cannot be an environment variable at all, whatever else it
+        // may be, so refusing it is a statement about the field rather than a
+        // guess about the value. The message names the field and not what is
+        // in it.
+        let name = &self.provider.api_key_env;
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(CliError::Config(
+                "rmem.toml's api_key_env must be the NAME of an environment variable -- letters, digits and underscores, like OPENAI_API_KEY -- and what is written there is not one. It is not repeated here: if what you pasted is the key itself, printing it would put it in your terminal, your scrollback and any log that catches them.".to_string(),
+            ));
+        }
+        let key = std::env::var(name)
             .map_err(|_| CliError::MissingKey(self.provider.api_key_env.clone()))?;
         Ok(HttpProvider::new(
             self.provider.base_url.clone(),
@@ -566,6 +612,61 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             let _ = location(text, Some(start..text.len()));
         }
         assert_eq!(location(text, Some(2..3)), "line 1, column 1");
+    }
+
+    #[test]
+    fn a_key_pasted_at_the_end_of_the_file_is_refused_without_being_printed() {
+        // Found by driving the binary, not by reading it. `deny_unknown_fields`
+        // catches `api_key = "sk-..."` under `[provider]` -- but appending to
+        // a file means appending at the end, and the end of TEMPLATE is
+        // `[policy.attribute]`, an open map. So the paste is a valid map
+        // entry, not an unknown field, and `strategy`'s catch-all arm quoted
+        // it straight to the terminal.
+        let pasted = format!("{TEMPLATE}api_key = \"sk-PASTED-FAKE-SECRET-AT-THE-END-99\"\n");
+        let err = parse(&pasted)
+            .unwrap()
+            .policy_for_engine()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("sk-PASTED-FAKE-SECRET"),
+            "the pasted value reached the message: {err}"
+        );
+        assert!(
+            err.contains("api_key"),
+            "the attribute has to be named so the line can be found: {err}"
+        );
+        assert!(
+            err.contains("most_recent"),
+            "and what a strategy may be: {err}"
+        );
+    }
+
+    #[test]
+    fn a_key_written_where_its_variable_name_belongs_is_refused_without_being_printed() {
+        // The likeliest way to get this file wrong: the field is called
+        // `api_key_env` and a key is what you have in your hand. The refusal
+        // then printed it, because naming the variable is exactly what that
+        // message exists to do.
+        //
+        // Refused as a validation, not as a secret detector: an environment
+        // variable's name is letters, digits and underscores, so this value
+        // cannot be one whatever else it is.
+        let mut config = parse(TEMPLATE).unwrap();
+        config.provider.api_key_env = "sk-PASTED-FAKE-SECRET-IN-THE-ENV-FIELD".to_string();
+        let err = match config.provider() {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected a refusal"),
+        };
+        assert!(
+            !err.contains("sk-PASTED-FAKE-SECRET"),
+            "the pasted value reached the message: {err}"
+        );
+        assert!(err.contains("api_key_env"), "{err}");
+        assert!(
+            err.contains("OPENAI_API_KEY"),
+            "it has to show what a variable name looks like: {err}"
+        );
     }
 
     #[test]
