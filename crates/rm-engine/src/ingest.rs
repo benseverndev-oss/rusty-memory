@@ -6,7 +6,7 @@
 //! `remember`, which resolves the mention against everything already known.
 
 use rm_core::{Interval, Provenance, Source};
-use rm_extract::Extraction;
+use rm_extract::{Extraction, Turn};
 use rm_store::StableId;
 
 use crate::{AssertionId, Engine, EngineError, Observation, Record, Remembered, ReviewId};
@@ -67,13 +67,17 @@ pub struct Ingested {
 impl Engine {
     /// Apply an extracted turn.
     ///
-    /// Every embedding is produced and validated before anything is written, so
-    /// a failing embedder costs nothing. That is the guarantee `Engine::remember`
-    /// already makes and for the same reason: a fact in the store with no vector
-    /// to find it is undetectable from outside — no query reports it and no
-    /// error names it.
+    /// Every embedding -- for every mention and every fact -- is produced and
+    /// validated before anything is written, so a failing embedder costs
+    /// nothing. That is the guarantee `Engine::remember` already makes and for
+    /// the same reason: a fact in the store with no vector to find it is
+    /// undetectable from outside -- no query reports it and no error names it.
+    /// Embedding a fact's text lazily inside its own write loop would keep that
+    /// promise for mentions only, so both passes are produced up front, before
+    /// the first write of either kind.
     pub fn ingest(
         &mut self,
+        turn: &Turn,
         extraction: &Extraction,
         embedder: &impl Embedder,
     ) -> Result<Ingested, EngineError> {
@@ -84,6 +88,18 @@ impl Engine {
             self.index.check(&v)?;
             vectors.push(v);
         }
+        let mut fact_vectors: Vec<Vec<f32>> = Vec::with_capacity(extraction.facts.len());
+        for fact in &extraction.facts {
+            let v = embedder.embed(&fact.text)?;
+            self.index.check(&v)?;
+            fact_vectors.push(v);
+        }
+
+        // Every write this turn produces carries the turn's own provenance.
+        // `ToolOutput` because an extraction is what a tool returned, not what
+        // the user said in so many words -- the user said the sentence, and
+        // this is a model's reading of it.
+        let prov = Provenance::new(Source::ToolOutput, turn.observed_at, turn.session.clone());
 
         let mut out = Ingested::default();
 
@@ -99,11 +115,72 @@ impl Engine {
                 mention: Record::new().with("name", mention.name.clone()),
                 attribute: "kind".to_string(),
                 value: Some(mention.kind.clone()),
-                valid: Interval::since(0),
-                provenance: Provenance::new(Source::ToolOutput, 0, "extraction"),
+                valid: Interval::since(turn.observed_at),
+                provenance: prov.clone(),
                 embedding,
             })?;
             record(&mut out, remembered);
+        }
+
+        // Facts, each embedded by its own text. A fact and its subject are
+        // different search targets: sharing an embedding would make "where does
+        // he work" reachable only by first reaching Ben.
+        for (fact, embedding) in extraction.facts.iter().zip(fact_vectors) {
+            // `fact.subject` cannot be out of bounds: `rm_extract::extract`
+            // refuses any fact naming a mention index `>= mentions.len()`
+            // before an `Extraction` is ever produced. `out.entities` has one
+            // entry per mention, filled by the loop above in mention order, so
+            // `out.entities[fact.subject]` is the entity that mention already
+            // resolved to.
+            //
+            // Writing straight to that entity rather than calling `remember`
+            // again is deliberate, not an optimisation: `remember` resolves by
+            // scoring the mention's fields against every blocked candidate, and
+            // a mention built from nothing but a name can legitimately land in
+            // the review band on a second look, even against the entity it
+            // just came from -- `test_ruleset` requires a corroborating field
+            // to place a name-only match above the line, and a `Mention` never
+            // carries one. Re-resolving would then either misfile the fact
+            // under a fresh, review-pending entity or -- with a more lenient
+            // ruleset -- gamble on landing back on the right one. The subject
+            // is not a guess here; it is the id `remember` already returned for
+            // this exact mention earlier in this same call, so reusing it is
+            // the only way to make the brief's own guarantee ("a fact resolves
+            // to the same entity its mention already did") actually hold
+            // rather than usually hold.
+            let entity = out.entities[fact.subject];
+            // `write` only reads `attribute`, `value`, `valid`, `provenance`
+            // and `embedding` -- `kind` and `mention` exist because
+            // `Observation` is the one shape both `remember` and `write` take,
+            // not because a fact's write needs an identity to resolve.
+            let assertion = self.write(
+                entity,
+                &Observation {
+                    kind: extraction.mentions[fact.subject].kind.clone(),
+                    mention: Record::new()
+                        .with("name", extraction.mentions[fact.subject].name.clone()),
+                    attribute: fact.attribute.clone(),
+                    value: fact.value.clone(),
+                    valid: Interval::since(fact.valid_from),
+                    provenance: prov.clone(),
+                    embedding,
+                },
+            )?;
+            out.assertions.push(assertion);
+        }
+
+        for relation in &extraction.relations {
+            // `relation.subject` and `relation.object` cannot be out of bounds
+            // for the same reason as `fact.subject` above, and `out.entities`
+            // has exactly one entry per mention -- built by the loop just
+            // above, in the same order `extract` assigned local indices.
+            self.relate(
+                out.entities[relation.subject],
+                relation.predicate.clone(),
+                out.entities[relation.object],
+                Interval::since(relation.valid_from),
+                prov.clone(),
+            )?;
         }
 
         Ok(out)

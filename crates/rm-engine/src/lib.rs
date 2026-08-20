@@ -2885,11 +2885,35 @@ mod tests {
         }
     }
 
+    /// Like `Buckets`, except for one text it fails on. Selective rather than
+    /// blanket-failing, so a test can put the failure anywhere in an
+    /// extraction -- a second mention, or a fact rather than its subject --
+    /// and prove nothing written before it survives.
+    struct FailsOn(&'static str);
+
+    impl Embedder for FailsOn {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedderError> {
+            if text == self.0 {
+                return Err(EmbedderError("the embedding service is down".to_string()));
+            }
+            Buckets.embed(text)
+        }
+    }
+
     fn mention(kind: &str, name: &str) -> rm_extract::Mention {
         rm_extract::Mention {
             kind: kind.to_string(),
             name: name.to_string(),
             text: name.to_string(),
+        }
+    }
+
+    fn a_turn() -> rm_extract::Turn {
+        rm_extract::Turn {
+            text: "Ben works at Globex in Bristol".to_string(),
+            speaker: Some("Ben Severn".to_string()),
+            observed_at: 100,
+            session: "session-1".to_string(),
         }
     }
 
@@ -2903,7 +2927,7 @@ mod tests {
             ..Default::default()
         };
 
-        let out = e.ingest(&extraction, &Buckets).unwrap();
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
         assert_eq!(out.entities.len(), 2);
         assert_eq!(e.entity_count(), 2);
         assert_ne!(out.entities[0], out.entities[1]);
@@ -2916,7 +2940,7 @@ mod tests {
             mentions: vec![mention("place", "Bristol")],
             ..Default::default()
         };
-        let out = e.ingest(&extraction, &Buckets).unwrap();
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
         assert_eq!(
             e.about(out.entities[0], "kind", 100, 100).unwrap(),
             Believed::Value("place".into())
@@ -2934,13 +2958,63 @@ mod tests {
             ..Default::default()
         };
 
-        let err = e.ingest(&extraction, &NoEmbedder).unwrap_err();
+        let err = e.ingest(&a_turn(), &extraction, &NoEmbedder).unwrap_err();
         assert!(matches!(err, EngineError::Embed(_)), "{err:?}");
         assert!(
             err.to_string().contains("embedding service is down"),
             "the host's own explanation must survive: {err}"
         );
         assert_eq!(e.entity_count(), 0);
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn a_failing_embedder_on_a_later_mention_leaves_no_earlier_write_behind() {
+        // A single-mention extraction cannot tell "embed everything, then
+        // write everything" apart from "embed one, write one, embed the
+        // next" -- `remember` already validates a lone vector before writing
+        // it, so that case passes either way. Two mentions, failing on the
+        // second, is what actually exercises the outer pass: an interleaved
+        // implementation would have written the first mention before ever
+        // reaching the second's embedding.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn"), mention("place", "Bristol")],
+            ..Default::default()
+        };
+
+        let err = e
+            .ingest(&a_turn(), &extraction, &FailsOn("Bristol"))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Embed(_)), "{err:?}");
+        assert_eq!(e.entity_count(), 0, "the first mention must not survive");
+        assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn a_failing_embedder_on_a_fact_also_leaves_the_store_and_the_index_untouched() {
+        // The trap the two-phase pass exists to close: embedding a fact's
+        // text inside the fact loop would let the mention above it land
+        // first, and the mention-only tests above cannot show that -- this is
+        // the case that would catch it.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben works at Globex".to_string(),
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let err = e
+            .ingest(&a_turn(), &extraction, &FailsOn("Ben works at Globex"))
+            .unwrap_err();
+        assert!(matches!(err, EngineError::Embed(_)), "{err:?}");
+        assert_eq!(e.entity_count(), 0, "the mention must not survive either");
         assert_eq!(e.index_len(), 0);
     }
 
@@ -2955,7 +3029,7 @@ mod tests {
             mentions: vec![mention("person", "Ben Severn")],
             ..Default::default()
         };
-        e.ingest(&first, &Buckets).unwrap();
+        e.ingest(&a_turn(), &first, &Buckets).unwrap();
 
         let second = rm_extract::Extraction {
             mentions: vec![rm_extract::Mention {
@@ -2965,7 +3039,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let out = e.ingest(&second, &Buckets).unwrap();
+        let out = e.ingest(&a_turn(), &second, &Buckets).unwrap();
 
         assert_eq!(out.reviews.len(), 1, "the near-miss has to be asked about");
         assert_eq!(
@@ -2980,9 +3054,134 @@ mod tests {
     fn ingesting_nothing_writes_nothing_and_is_not_an_error() {
         let mut e = engine();
         let out = e
-            .ingest(&rm_extract::Extraction::default(), &Buckets)
+            .ingest(&a_turn(), &rm_extract::Extraction::default(), &Buckets)
             .unwrap();
         assert!(out.entities.is_empty());
         assert_eq!(e.entity_count(), 0);
+    }
+
+    #[test]
+    fn a_fact_lands_on_the_entity_its_mention_resolved_to() {
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben works at Globex".to_string(),
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        assert_eq!(
+            e.about(out.entities[0], "employer", 100, 100).unwrap(),
+            Believed::Value("Globex".into())
+        );
+    }
+
+    #[test]
+    fn a_fact_is_embedded_by_its_own_text_not_its_subject_s() {
+        // "Where does he work" has to be able to reach the assertion without
+        // first reaching Ben. Sharing the mention's embedding would make the
+        // fact unreachable except through its subject.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben works at Globex".to_string(),
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+        e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+
+        let by_fact = Buckets.embed("Ben works at Globex").unwrap();
+        let hits = e.recall(&Query::new(by_fact, 1)).unwrap();
+        assert_eq!(
+            hits[0].value.as_deref(),
+            Some("Globex"),
+            "the nearest thing to the fact's own text must be the fact"
+        );
+    }
+
+    #[test]
+    fn a_relation_lands_between_the_entities_its_mentions_resolved_to() {
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![
+                mention("person", "Ben Severn"),
+                mention("organisation", "Globex"),
+            ],
+            relations: vec![rm_extract::Relation {
+                subject: 0,
+                predicate: "employed_by".to_string(),
+                object: 1,
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        let walk = Walk::new(vec![out.entities[0]], 1, 10, 100, 200);
+        let reached = e.neighborhood(&walk);
+        assert!(
+            reached.reached.iter().any(|r| r.entity == out.entities[1]),
+            "the walk should reach Globex from Ben"
+        );
+    }
+
+    #[test]
+    fn everything_a_turn_produced_carries_that_turn_s_session_and_moment() {
+        // Provenance is what lets a later reader ask where a memory came from,
+        // and an extraction that stamped its own writes with a placeholder
+        // would make every one of them untraceable.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben works at Globex".to_string(),
+                valid_from: 100,
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+
+        let history = e.store_history(out.entities[0], "employer");
+        assert_eq!(history[0].provenance.source_ref, "session-1");
+        assert_eq!(history[0].provenance.observed_at, 100);
+        assert_eq!(history[0].provenance.source, Source::ToolOutput);
+    }
+
+    #[test]
+    fn a_fact_keeps_the_valid_time_the_extraction_gave_it() {
+        // "I joined sixty days ago", said now, is valid from sixty days ago --
+        // not from the moment the turn was heard.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn")],
+            facts: vec![rm_extract::Fact {
+                subject: 0,
+                attribute: "employer".to_string(),
+                value: Some("Globex".to_string()),
+                text: "Ben joined Globex".to_string(),
+                valid_from: 40,
+            }],
+            ..Default::default()
+        };
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        assert_eq!(
+            e.about(out.entities[0], "employer", 50, 200).unwrap(),
+            Believed::Value("Globex".into()),
+            "it was already true at 50, before the turn was heard at 100"
+        );
     }
 }
