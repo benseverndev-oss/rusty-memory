@@ -110,7 +110,19 @@ impl HttpProvider {
             .set("Content-Type", "application/json")
             .send_string(&body);
 
-        match response {
+        self.handle_response(response)
+    }
+
+    /// Turn a `ureq` result into body text, with the key scrubbed either way.
+    ///
+    /// Split out from `post` so the `Status` arm — reached only when a real
+    /// server answers with a non-2xx — can be driven in a test with a
+    /// response built in-process by `ureq::Response::new`, without a socket.
+    fn handle_response(
+        &self,
+        response: Result<ureq::Response, ureq::Error>,
+    ) -> Result<String, ProviderError> {
+        let text = match response {
             Ok(r) => r
                 .into_string()
                 .map_err(|e| ProviderError::Transport(e.to_string())),
@@ -120,6 +132,28 @@ impl HttpProvider {
                 .into_string()
                 .map_err(|e| ProviderError::Transport(e.to_string())),
             Err(ureq::Error::Transport(t)) => Err(ProviderError::Transport(t.to_string())),
+        }?;
+
+        Ok(self.redact(&text))
+    }
+
+    /// Scrub every occurrence of the API key out of `text`.
+    ///
+    /// Some providers echo the offending credential back in an error body —
+    /// "invalid api key: sk-...". `wire::api_error` deliberately relays a
+    /// provider's own words verbatim for every other message, which would
+    /// relay the key too on an account this crate does not control. This is
+    /// the one point every response body passes through before becoming a
+    /// `ProviderError`, so it is the one place that has to catch that.
+    fn redact(&self, text: &str) -> String {
+        if self.api_key.is_empty() {
+            // `str::replace` with an empty pattern inserts the replacement
+            // between every character instead of doing nothing, so an empty
+            // key — invalid in practice, but not a type error — must be
+            // handled separately rather than falling into the branch below.
+            text.to_string()
+        } else {
+            text.replace(self.api_key.as_str(), "[REDACTED]")
         }
     }
 
@@ -163,10 +197,14 @@ mod tests {
 
     fn provider() -> HttpProvider {
         // Port 1 on the loopback address has nothing listening on it, so the
-        // connection is refused immediately by the local kernel: no DNS
-        // lookup, no packet leaving the machine, no dependence on how the
-        // network's resolver handles an unregistered name. That refusal is
-        // still a transport failure, which is all these tests need.
+        // connection is refused by the local kernel: no DNS lookup, no packet
+        // leaving the machine, no dependence on how the network's resolver
+        // handles an unregistered name. That refusal is still a transport
+        // failure, which is all these tests need. It is not instant — this
+        // machine takes roughly two seconds to refuse it, deterministically,
+        // for a cause not established (plausibly local firewall or AV
+        // interception of connects to a reserved port) — but it stays within
+        // what this task treats as offline.
         HttpProvider::new(
             "http://127.0.0.1:1".to_string(),
             "sk-secret-do-not-print".to_string(),
@@ -208,14 +246,58 @@ mod tests {
     #[test]
     fn a_transport_failure_says_it_could_not_reach_the_provider() {
         // 127.0.0.1:1 refuses the connection locally: no listener owns that
-        // port, so the OS answers immediately without a DNS lookup or a packet
-        // leaving the machine. That keeps this test — the one here that
-        // exercises the transport rather than the wire parsing — offline.
+        // port, so no DNS lookup happens and no packet leaves the machine.
+        // That keeps this test — the one here that exercises the transport
+        // rather than the wire parsing — offline. See `provider` above for
+        // why this takes a couple of seconds rather than being instant.
         let err = provider().embed("anything").unwrap_err();
         assert!(
             err.0.contains("could not reach the provider"),
             "expected a transport error, got: {}",
             err.0
+        );
+    }
+
+    #[test]
+    fn a_completer_transport_failure_also_says_it_could_not_reach_the_provider() {
+        // `complete` and `embed` share `post`; only `embed` was exercised
+        // above. This pins the same conversion through the other port so a
+        // future change to one path can't silently stop covering the other.
+        let err = provider().complete("anything").unwrap_err();
+        assert!(
+            err.0.contains("could not reach the provider"),
+            "expected a transport error, got: {}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn a_401_body_that_echoes_the_key_back_is_scrubbed_before_it_reaches_the_caller() {
+        // The refused-connection tests above only ever reach the `Transport`
+        // arm of `handle_response`'s match; nothing exercised `Status`. That
+        // arm is where a real leak would live: some providers echo the
+        // offending credential back in the error body ("invalid api key:
+        // sk-..."), and `wire::api_error` relays a provider's message
+        // verbatim by design. `ureq::Response::new` builds a `Response` by
+        // parsing an in-memory string, the same as `ureq::Response::from_str`
+        // does — no socket, no listener, nothing that leaves the machine.
+        let key = "sk-secret-do-not-print";
+        let body = format!(r#"{{"error":{{"message":"invalid api key: {key}"}}}}"#);
+        let response = ureq::Response::new(401, "Unauthorized", &body).unwrap();
+
+        // A `Status` response with a readable body is not itself a transport
+        // failure — `handle_response` hands the text up for `wire` to
+        // interpret, exactly as `complete` and `embed_inner` do in
+        // production. The `ProviderError` the reviewer asked about is the
+        // one `parse_completion` produces from it.
+        let text = provider()
+            .handle_response(Err(ureq::Error::Status(401, response)))
+            .expect("a readable body is not a transport failure");
+        let err = parse_completion(&text).unwrap_err();
+
+        assert!(
+            !err.to_string().contains(key),
+            "an error must never carry the key: {err}"
         );
     }
 }
