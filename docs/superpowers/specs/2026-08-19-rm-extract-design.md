@@ -1,6 +1,16 @@
 # rm-extract — design
 
-Status: approved design, pre-implementation.
+Status: **as built**. Shipped on `feat/rm-extract`; this stays the design
+record, not the API reference — for the shipped signatures and their reasoning,
+read the rustdoc.
+
+Two places below were superseded during execution and have been corrected in
+place, because a spec that contradicts the code teaches the wrong thing to
+whoever reads it next: `ingest` takes the `Turn` as well as the `Extraction`,
+and step 3 of the order of operations no longer re-resolves a fact's subject.
+Both are marked where they appear. Everything else is left as it was approved,
+including arguments for alternatives that were rejected — that is what the
+document is for.
 
 Turn → mentions, facts, relations. The crate that needs a language model, and
 the one that decides whether arrival implies departure.
@@ -211,9 +221,14 @@ pub struct Closed {
     pub because: String,
 }
 
-pub fn ingest(&mut self, extraction: &Extraction, embedder: &impl Embedder)
+pub fn ingest(&mut self, turn: &Turn, extraction: &Extraction, embedder: &impl Embedder)
     -> Result<Ingested, EngineError>;
 ```
+
+*(As built: the `turn` argument was added during execution. An `Extraction`
+addresses everything by local index and carries no provenance, so without the
+turn `ingest` has no `observed_at` and no `session` to stamp on the writes it
+makes — and provenance is not optional in this workspace.)*
 
 `Embedder` is a second narrow port, symmetric with `Completer` and for the same
 reason. It lives in `rm-engine` because `ingest` is what needs it; a test
@@ -232,8 +247,20 @@ other would write confidently wrong memories with nothing raising an error.
    undetectable from outside.
 2. **Remember each mention**, asserting its `kind`, and record the resulting
    entity against its local index.
-3. **Remember each fact**, reusing its subject's mention so resolution lands it
-   on the same entity.
+3. **Write each fact** straight to the entity its mention resolved to in step 2,
+   embedding the fact's own text.
+
+   *(As built: this said "remember each fact, reusing its subject's mention so
+   resolution lands it on the same entity". Re-resolving does not reliably land
+   there. A `Mention` carries only a name, and `test_ruleset` needs a
+   corroborating field to put a name-only match above the review band, so a
+   second look at the same mention can legitimately score into review — against
+   the very entity it just created. The fact would then be misfiled under a
+   fresh, review-pending entity, or, under a more lenient ruleset, land
+   correctly by luck. The subject is not a guess: it is the id `remember`
+   already returned for this exact mention earlier in the same call, so reusing
+   it is what makes "a fact resolves to the same entity its mention did" hold
+   rather than usually hold.)*
 4. **Relate**, mapping both endpoints through the local-index table.
 5. **Resolve closures** against the store.
 
