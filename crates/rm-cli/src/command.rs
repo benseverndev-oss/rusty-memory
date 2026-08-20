@@ -33,12 +33,26 @@ pub struct ReviewLine {
 /// What a command did.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
-    Initialised { path: PathBuf, dimension: usize },
-    Remembered(Ingested, Vec<MentionLanding>),
+    Initialised {
+        path: PathBuf,
+        dimension: usize,
+    },
+    Remembered {
+        ingested: Ingested,
+        landings: Vec<MentionLanding>,
+        /// How many relationships the turn asserted.
+        ///
+        /// Carried rather than derived: `Ingested` records entities,
+        /// assertions, reviews and closures, but nothing about relations --
+        /// `relate` returns no id -- and the spec's worked output counts them.
+        relations: usize,
+    },
     Recalled(Vec<Recalled>),
     About(Believed),
     Reviews(Vec<ReviewLine>),
-    Confirmed { survivor: StableId },
+    Confirmed {
+        survivor: StableId,
+    },
     Rejected,
 }
 
@@ -115,7 +129,11 @@ pub fn remember(
         })
         .collect();
 
-    Ok(Outcome::Remembered(ingested, landings))
+    Ok(Outcome::Remembered {
+        ingested,
+        landings,
+        relations: extraction.relations.len(),
+    })
 }
 
 /// Search for assertions near a query.
@@ -309,12 +327,92 @@ mod tests {
     }
 
     #[test]
+    fn a_new_job_closes_the_old_one_all_the_way_through_to_what_is_printed() {
+        // The one test that drives extraction -> ingest -> closure -> render.
+        // Every other `remember` fixture in this file carries `"closures":[]`,
+        // and closure rendering was covered only by a hand-constructed
+        // `Ingested` in `format`. So both ends were tested and the join was
+        // not -- and the join is where the inference-versus-testimony
+        // distinction the library works hardest to preserve either survives
+        // to the screen or does not.
+        let mut e = engine();
+
+        let first = StubProvider::new(vec![
+            r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"},
+                            {"kind":"organisation","name":"Acme","text":"Acme"}],
+                "facts":[],
+                "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
+                "closures":[]}"#,
+        ]);
+        remember(&mut e, "I work at Acme", 100, "cli", &first, &first).unwrap();
+
+        // "I started at Globex last month": a new employment, and the model
+        // volunteering that the previous one ended. `spared` keeps the
+        // closure from closing Globex as fast as it opened it.
+        let second = StubProvider::new(vec![
+            r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"},
+                            {"kind":"organisation","name":"Globex","text":"Globex"}],
+                "facts":[{"subject":0,"attribute":"employer","value":"Globex",
+                          "text":"Ben works at Globex","days_ago":null}],
+                "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
+                "closures":[{"subject":0,"predicate":"employed_by",
+                             "because":"starting a new job ends the previous one",
+                             "days_ago":null}]}"#,
+        ]);
+        let out = remember(&mut e, "I started at Globex", 200, "cli", &second, &second).unwrap();
+
+        let Outcome::Remembered { ref ingested, .. } = out else {
+            panic!("{out:?}")
+        };
+        assert_eq!(
+            ingested.closed.len(),
+            1,
+            "the Acme edge is what the closure ends, and Globex is spared"
+        );
+        assert_eq!(ingested.closed[0].predicate, "employed_by");
+        assert_eq!(
+            ingested.closed[0].because,
+            "starting a new job ends the previous one"
+        );
+
+        let text = crate::format::render(&out);
+        assert_eq!(
+            text.lines().next().unwrap(),
+            "remembered 2 mentions, 1 fact, 1 relationship"
+        );
+        // Under its own heading, not among the facts. A closure is
+        // provenanced `AgentInference` precisely so nobody reads it as
+        // testimony; printing it in the same list would undo that at the last
+        // possible step.
+        let heading = text
+            .lines()
+            .position(|l| l.contains("inferred, not stated:"))
+            .expect("the inference has to be marked as one");
+        let ended = text
+            .lines()
+            .position(|l| l.contains("ended:"))
+            .expect("the closed edge has to be shown");
+        assert!(heading < ended, "the heading has to come first:\n{text}");
+        assert!(
+            text.contains("ended: Ben Severn employed_by entity 1"),
+            "the subject is a mention of this turn, so it is named:\n{text}"
+        );
+        assert!(
+            text.contains("\"starting a new job ends the previous one\""),
+            "the model's reason is the whole point of showing it:\n{text}"
+        );
+    }
+
+    #[test]
     fn remembering_a_turn_names_every_mention_and_where_it_landed() {
         let mut e = engine();
         let stub = StubProvider::new(vec![EXTRACTION]);
         let out = remember(&mut e, "I work at Globex", 100, "cli", &stub, &stub).unwrap();
 
-        let Outcome::Remembered(ingested, landings) = out else {
+        let Outcome::Remembered {
+            ingested, landings, ..
+        } = out
+        else {
             panic!("{out:?}")
         };
         assert_eq!(landings.len(), 2);
@@ -342,7 +440,7 @@ mod tests {
             &second,
         )
         .unwrap();
-        let Outcome::Remembered(_, landings) = out else {
+        let Outcome::Remembered { landings, .. } = out else {
             panic!("{out:?}")
         };
         assert!(!landings[0].was_new, "Ben was already known");
@@ -388,7 +486,7 @@ mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![EXTRACTION]);
         let out = remember(&mut e, "I work at Globex", 100, "cli", &stub, &stub).unwrap();
-        let Outcome::Remembered(ingested, _) = out else {
+        let Outcome::Remembered { ingested, .. } = out else {
             panic!()
         };
 
@@ -417,7 +515,7 @@ mod tests {
                 "facts":[],"relations":[],"closures":[]}"#,
         ]);
         let out = remember(&mut e, "Ben again", 200, "cli", &b, &b).unwrap();
-        let Outcome::Remembered(ingested, _) = out else {
+        let Outcome::Remembered { ingested, .. } = out else {
             panic!()
         };
         assert_eq!(

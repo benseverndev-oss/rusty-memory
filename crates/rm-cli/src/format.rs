@@ -14,13 +14,29 @@ pub fn render(outcome: &Outcome) -> String {
             path.display()
         ),
 
-        Outcome::Remembered(ingested, landings) => {
+        Outcome::Remembered {
+            ingested,
+            landings,
+            relations,
+        } => {
+            // The counts the spec's worked example shows, and the three it
+            // shows: mentions, facts, relationships. `assertions` is not one
+            // of them -- it is mentions plus facts, since `Ingested` documents
+            // one `kind` assertion per mention followed by one per fact -- so
+            // printing it named a number nothing on screen explained.
+            let facts = ingested.assertions.len().saturating_sub(landings.len());
             let mut out = format!(
-                "remembered {} mention(s), {} assertion(s)\n",
-                landings.len(),
-                ingested.assertions.len()
+                "remembered {}, {}, {}\n",
+                plural(landings.len(), "mention"),
+                plural(facts, "fact"),
+                plural(*relations, "relationship"),
             );
-            for MentionLanding { name, entity, was_new } in landings {
+            for MentionLanding {
+                name,
+                entity,
+                was_new,
+            } in landings
+            {
                 let how = if *was_new { "new" } else { "recognised" };
                 out.push_str(&format!("  {name}  → entity {entity} ({how})\n"));
             }
@@ -31,8 +47,11 @@ pub fn render(outcome: &Outcome) -> String {
                 out.push_str("inferred, not stated:\n");
                 for c in &ingested.closed {
                     out.push_str(&format!(
-                        "  ended: entity {} {} entity {} — \"{}\"\n",
-                        c.subject, c.predicate, c.object, c.because
+                        "  ended: {} {} {} — \"{}\"\n",
+                        named(c.subject, landings),
+                        c.predicate,
+                        named(c.object, landings),
+                        c.because
                     ));
                 }
             }
@@ -88,25 +107,55 @@ pub fn render(outcome: &Outcome) -> String {
     }
 }
 
+/// `1 fact`, `2 facts`. Every word this renders pluralises with a bare `s`.
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("{n} {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
+/// What to call `entity` on screen.
+///
+/// The name if this turn mentioned it, and the id otherwise. A closed edge's
+/// subject is always a mention of the turn that closed it -- `Closure.subject`
+/// is an index into the extraction's own mentions -- so it always has a name.
+/// Its *object* usually does not: the whole point of "I started at Globex" is
+/// that it ends an edge to a previous employer the turn never named, and this
+/// crate has no way to ask the store for an entity's name. Printing the id
+/// there is honest; printing it for the subject too, which the code has in
+/// hand, threw away the tie to the mention lines two rows above.
+fn named(entity: rm_engine::StableId, landings: &[MentionLanding]) -> String {
+    landings
+        .iter()
+        .find(|l| l.entity == entity)
+        .map_or_else(|| format!("entity {entity}"), |l| l.name.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rm_engine::{Believed, Closed, Ingested};
 
-    /// The one rendered line mentioning `name`.
+    /// The one mention-landing line for `name`.
     ///
-    /// Panics rather than returning an `Option` so a fixture that stops
-    /// producing the line fails here, naming it, rather than further down
-    /// inside an assertion about its contents.
-    fn line_for<'a>(name: &str, text: &'a str) -> &'a str {
-        let mut found = text.lines().filter(|l| l.contains(name));
-        let line = found.next().unwrap_or_else(|| {
-            panic!(
-                "no line names {name}:
-{text}"
-            )
-        });
-        assert!(found.next().is_none(), "more than one line names {name}");
+    /// Narrowed to the landing block — the lines carrying an arrow — because
+    /// the closure below now names its subject too, so "the line mentioning
+    /// Ben Severn" is no longer one line. Panics rather than returning an
+    /// `Option` so a fixture that stops producing the line fails here, naming
+    /// it, rather than further down inside an assertion about its contents.
+    fn landing_line_for<'a>(name: &str, text: &'a str) -> &'a str {
+        let mut found = text
+            .lines()
+            .filter(|l| l.contains("→ entity") && l.contains(name));
+        let line = found
+            .next()
+            .unwrap_or_else(|| panic!("no landing line names {name} in:\n{text}"));
+        assert!(
+            found.next().is_none(),
+            "more than one landing line names {name}"
+        );
         line
     }
 
@@ -138,7 +187,11 @@ mod tests {
                 was_new: true,
             },
         ];
-        let text = render(&Outcome::Remembered(ingested, landings));
+        let text = render(&Outcome::Remembered {
+            ingested,
+            landings,
+            relations: 1,
+        });
 
         // Tied to the entity, not merely present anywhere in the output.
         // `assert!(text.contains("new"))` passed with the mapping inverted:
@@ -152,20 +205,34 @@ mod tests {
         // this test's own comment all call the most useful thing on the
         // screen.
         assert_eq!(
-            line_for("Ben Severn", &text),
+            landing_line_for("Ben Severn", &text),
             "  Ben Severn  → entity 0 (recognised)",
             "Ben was already known"
         );
         assert_eq!(
-            line_for("Globex", &text),
+            landing_line_for("Globex", &text),
             "  Globex  → entity 7 (new)",
             "Globex had never been seen"
         );
 
+        // The spec's worked example, line for line. It counts mentions, facts
+        // and relationships; "assertion" was a number of the library's own
+        // that nothing else on screen explained, and relationships went
+        // unmentioned altogether.
+        assert_eq!(
+            text.lines().next().unwrap(),
+            "remembered 2 mentions, 0 facts, 1 relationship"
+        );
+
         assert!(text.to_lowercase().contains("inferred"), "{text}");
-        assert!(
-            text.contains("starting a new job ends the previous one"),
-            "{text}"
+        // Named, not numbered. The subject of a closed edge is always a
+        // mention of this same turn, so its name is two lines above and the
+        // code has it in hand; printing `entity 0` there broke the tie for no
+        // reason. Entity 3 stays an id because this turn never mentioned it,
+        // which is the ordinary case for a previous employer.
+        assert_eq!(
+            text.lines().find(|l| l.contains("ended:")).unwrap(),
+            "  ended: Ben Severn employed_by entity 3 — \"starting a new job ends the previous one\""
         );
     }
 
@@ -184,7 +251,11 @@ mod tests {
             entity: 0,
             was_new: true,
         }];
-        let text = render(&Outcome::Remembered(ingested, landings));
+        let text = render(&Outcome::Remembered {
+            ingested,
+            landings,
+            relations: 0,
+        });
         assert!(text.contains('4'), "the id has to be actionable: {text}");
         assert!(text.to_lowercase().contains("review"), "{text}");
     }
