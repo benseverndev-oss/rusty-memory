@@ -93,6 +93,23 @@ mod tests {
     use super::*;
     use rm_engine::{Believed, Closed, Ingested};
 
+    /// The one rendered line mentioning `name`.
+    ///
+    /// Panics rather than returning an `Option` so a fixture that stops
+    /// producing the line fails here, naming it, rather than further down
+    /// inside an assertion about its contents.
+    fn line_for<'a>(name: &str, text: &'a str) -> &'a str {
+        let mut found = text.lines().filter(|l| l.contains(name));
+        let line = found.next().unwrap_or_else(|| {
+            panic!(
+                "no line names {name}:
+{text}"
+            )
+        });
+        assert!(found.next().is_none(), "more than one line names {name}");
+        line
+    }
+
     #[test]
     fn remembering_shows_what_was_inferred_apart_from_what_was_said() {
         // The library provenances a closure as AgentInference precisely so
@@ -123,8 +140,28 @@ mod tests {
         ];
         let text = render(&Outcome::Remembered(ingested, landings));
 
-        assert!(text.contains("recognised"), "{text}");
-        assert!(text.contains("new"), "{text}");
+        // Tied to the entity, not merely present anywhere in the output.
+        // `assert!(text.contains("new"))` passed with the mapping inverted:
+        // the fixture carries one landing of each kind so both words appear
+        // whatever `was_new` maps to, and the closure's own `because` string
+        // says "starting a new job ends the previous one", which satisfies a
+        // bare substring check for "new" for reasons that have nothing to do
+        // with labelling. What shipped under that mutation called every newly
+        // created entity "recognised" and every recognised one "new" --
+        // inverting the thing the spec, `MentionLanding`'s doc comment and
+        // this test's own comment all call the most useful thing on the
+        // screen.
+        assert_eq!(
+            line_for("Ben Severn", &text),
+            "  Ben Severn  → entity 0 (recognised)",
+            "Ben was already known"
+        );
+        assert_eq!(
+            line_for("Globex", &text),
+            "  Globex  → entity 7 (new)",
+            "Globex had never been seen"
+        );
+
         assert!(text.to_lowercase().contains("inferred"), "{text}");
         assert!(
             text.contains("starting a new job ends the previous one"),
