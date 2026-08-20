@@ -46,9 +46,28 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
     };
 
     match first.as_str() {
-        "init" => Ok(Command::Init {
-            force: args.iter().any(|a| a == "--force"),
-        }),
+        "init" => {
+            // Anything that is not `--force` is refused rather than ignored.
+            // `rmem init --frce` used to parse as `Init { force: false }` and
+            // then refuse with "pass --force to replace it" -- which reads as
+            // the flag being broken, and sends the reader to look at
+            // everything except the four characters they mistyped.
+            let unknown: Vec<&str> = args[1..]
+                .iter()
+                .map(String::as_str)
+                .filter(|a| *a != "--force")
+                .collect();
+            if !unknown.is_empty() {
+                return Err(CliError::Usage(format!(
+                    "init does not take {unknown:?} -- the only thing it takes is --force
+
+{USAGE}"
+                )));
+            }
+            Ok(Command::Init {
+                force: args.iter().any(|a| a == "--force"),
+            })
+        }
 
         "remember" => match args.get(1) {
             Some(text) => Ok(Command::Remember { text: text.clone() }),
@@ -63,6 +82,18 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                     "recall needs something to search for, in quotes\n\n{USAGE}"
                 )));
             };
+            // `-k` in the query position is a missing query, not a search
+            // for the literal string "-k". The flag scan below would find it
+            // at index 1 and read the number after it, so `rmem recall -k 20`
+            // quietly searched for "-k" with k = 20 and reported nothing near
+            // it -- a wrong answer that looks exactly like a right one.
+            if query == "-k" {
+                return Err(CliError::Usage(format!(
+                    "recall needs something to search for before -k, in quotes: `rmem recall \"<query>\" -k 20`
+
+{USAGE}"
+                )));
+            }
             let k = match args.iter().position(|a| a == "-k") {
                 None => 5,
                 Some(i) => args
@@ -190,6 +221,50 @@ mod tests {
             let err = parse_args(&args).unwrap_err();
             assert!(err.to_string().len() > 20, "{args:?}: {err}");
         }
+    }
+
+    #[test]
+    fn recall_with_no_query_before_the_flag_is_refused_rather_than_searched_for() {
+        // `rmem recall -k 20` took "-k" as the query, then found the same
+        // "-k" at index 1 in the flag scan and read 20 off the end of it. So
+        // it searched the store for the literal string "-k" and reported
+        // nothing near it -- a wrong answer indistinguishable from a right
+        // one, which is the worst shape a parser bug can take.
+        let err = parse_args(&["recall", "-k", "20"]).unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)), "{err:?}");
+        assert!(err.to_string().contains("-k"), "{err}");
+        assert!(
+            err.to_string().contains("search for"),
+            "it has to say what was expected: {err}"
+        );
+        // A real query with the flag after it is still the ordinary case.
+        assert_eq!(
+            parse_args(&["recall", "jobs", "-k", "20"]).unwrap(),
+            Command::Recall {
+                query: "jobs".into(),
+                k: 20
+            }
+        );
+    }
+
+    #[test]
+    fn init_refuses_an_argument_it_does_not_recognise_and_names_it() {
+        // `rmem init --frce` parsed as `Init { force: false }` and was then
+        // refused by `command::init` with "pass --force to replace it" --
+        // which reads as the flag being broken rather than mistyped, and
+        // sends the reader everywhere except the four characters at fault.
+        let err = parse_args(&["init", "--frce"]).unwrap_err();
+        assert!(err.to_string().contains("--frce"), "{err}");
+        assert!(err.to_string().contains("--force"), "{err}");
+        // And the two spellings it does accept still parse.
+        assert_eq!(
+            parse_args(&["init"]).unwrap(),
+            Command::Init { force: false }
+        );
+        assert_eq!(
+            parse_args(&["init", "--force"]).unwrap(),
+            Command::Init { force: true }
+        );
     }
 
     #[test]
