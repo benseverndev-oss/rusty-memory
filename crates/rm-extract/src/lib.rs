@@ -222,10 +222,32 @@ const DAY_MS: i64 = 86_400_000;
 /// `None` is the turn's own moment. The subtraction saturates rather than
 /// wrapping: a model that answers with `i64::MAX` should produce a timestamp at
 /// the far edge of representable time, not one in the future.
-fn resolve(days_ago: Option<i64>, observed_at: Timestamp) -> Timestamp {
+///
+/// A negative count is refused rather than resolved, because it is the one
+/// input that reaches the future by arithmetic rather than by saturation. On a
+/// fact it is merely wrong -- a fact dated after the turn that produced it. On
+/// a closure it is damaging: `rm_engine`'s `ingest` asks
+/// `edges_from(subject, closure.at, Timestamp::MAX)`, so a future `at` reads a
+/// state of the graph that has not happened and tombstones the edges it finds
+/// effective from then. Nothing errors, no query notices, and a live edge
+/// silently expires on a date nobody chose.
+///
+/// Refused for facts and relations too, not only for closures. Accepting the
+/// same nonsense in two places and refusing it in a third would leave a caller
+/// unable to read a timestamp after the turn as anything but ambiguous -- did
+/// the model mean the future, or did it get the sign wrong? Neither is worth
+/// storing, and `days_ago` has one meaning in the prompt.
+fn resolve(
+    days_ago: Option<i64>,
+    observed_at: Timestamp,
+    what: &str,
+) -> Result<Timestamp, ExtractError> {
     match days_ago {
-        None => observed_at,
-        Some(days) => observed_at.saturating_sub(days.saturating_mul(DAY_MS)),
+        None => Ok(observed_at),
+        Some(days) if days < 0 => Err(ExtractError::Malformed(format!(
+            "a {what} gives days_ago as {days}, which is a moment after the turn it came from -- days_ago counts backwards, and a future timestamp on a closure would end edges that have not been asserted yet"
+        ))),
+        Some(days) => Ok(observed_at.saturating_sub(days.saturating_mul(DAY_MS))),
     }
 }
 
@@ -234,8 +256,8 @@ fn resolve(days_ago: Option<i64>, observed_at: Timestamp) -> Timestamp {
 /// Refuses rather than salvages. A response this crate can only partly
 /// understand is a turn silently half-remembered, and nothing downstream can
 /// tell that apart from a turn that genuinely said less -- so a mention with no
-/// name, or an index naming a mention that is not there, fails the whole
-/// extraction and says which.
+/// name, an index naming a mention that is not there, or a `days_ago` that
+/// counts forwards, fails the whole extraction and says which.
 ///
 /// No retries. The host owns the [`Completer`], so backoff, retry and provider
 /// failover are its business and it is better placed to do them.
@@ -275,7 +297,7 @@ pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, Ex
             attribute: f.attribute,
             value: f.value,
             text: f.text,
-            valid_from: resolve(f.days_ago, turn.observed_at),
+            valid_from: resolve(f.days_ago, turn.observed_at, "fact")?,
         });
     }
 
@@ -292,7 +314,7 @@ pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, Ex
             subject: r.subject,
             predicate: r.predicate,
             object: r.object,
-            valid_from: resolve(r.days_ago, turn.observed_at),
+            valid_from: resolve(r.days_ago, turn.observed_at, "relation")?,
         });
     }
 
@@ -301,7 +323,7 @@ pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, Ex
         out.closures.push(Closure {
             subject: c.subject,
             predicate: c.predicate,
-            at: resolve(c.days_ago, turn.observed_at),
+            at: resolve(c.days_ago, turn.observed_at, "closure")?,
             because: c.because,
         });
     }
@@ -544,6 +566,50 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
         assert!(err.to_string().contains("itself"), "{err}");
+    }
+
+    #[test]
+    fn a_days_ago_that_counts_forwards_is_refused() {
+        // A negative count reaches the future by arithmetic, which saturation
+        // cannot catch. On a closure that is not merely wrong: `ingest` asks
+        // `edges_from(subject, at, Timestamp::MAX)`, so a future `at` reads a
+        // graph that has not happened and tombstones what it finds -- a live
+        // edge that quietly expires later, with nothing raising an error.
+        let err = extract(
+            &turn(),
+            &Canned(
+                r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
+                    "facts":[],"relations":[],
+                    "closures":[{"subject":0,"predicate":"employed_by",
+                                 "days_ago":-30,"because":"x"}]}"#,
+            ),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
+        assert!(err.to_string().contains("-30"), "{err}");
+        assert!(err.to_string().contains("days_ago"), "{err}");
+    }
+
+    #[test]
+    fn a_fact_or_relation_dated_after_its_turn_is_refused_too() {
+        // Refused everywhere `days_ago` appears, not only where it does damage.
+        // The word has one meaning in the prompt, and accepting it backwards in
+        // two places while refusing it in a third would leave a caller unable
+        // to read a timestamp after the turn as anything but ambiguous.
+        for bad in [
+            r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
+                "facts":[{"subject":0,"attribute":"employer","value":"Globex",
+                          "text":"x","days_ago":-1}],
+                "relations":[],"closures":[]}"#,
+            r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"},
+                            {"kind":"organisation","name":"Globex","text":"Globex"}],
+                "facts":[],
+                "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":-1}],
+                "closures":[]}"#,
+        ] {
+            let err = extract(&turn(), &Canned(bad)).unwrap_err();
+            assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
+        }
     }
 
     #[test]

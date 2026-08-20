@@ -61,7 +61,8 @@ Rules:
 - "value" may be null to say an attribute has no value — "he is between jobs"
   is a fact with a null value, not a missing fact.
 - "days_ago" is how long before now the thing began or ended, as a whole number
-  of days, or null if it is happening now. Do not output dates or timestamps.
+  of days, or null if it is happening now. It is never negative: nothing here
+  is in the future. Do not output dates or timestamps.
 - "closures" is for relationships that have ended. If the turn says someone
   started a new job, their previous employment ended: emit a closure naming the
   subject and the predicate, and say why in "because". Do not name what it
