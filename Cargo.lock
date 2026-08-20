@@ -343,7 +343,6 @@ version = "0.0.0"
 dependencies = [
  "rm-engine",
  "rm-host",
- "serde",
  "serde_json",
 ]
 

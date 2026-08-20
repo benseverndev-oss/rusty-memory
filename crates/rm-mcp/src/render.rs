@@ -1,0 +1,439 @@
+//! Turning an [`Outcome`] into what a tool call returns.
+//!
+//! Two renderings of the same thing, and both are needed. `structuredContent`
+//! is the machine-readable half, and is what a client validating against an
+//! `outputSchema` would check. The `content` text block is what most clients
+//! actually put in front of a model, and older revisions have nothing else — so
+//! anything true only of the structured half is, for those clients, not said at
+//! all.
+//!
+//! That is why the text here is not `rm_cli::format`'s text. The CLI writes for
+//! someone who asked the question and is holding the context; this writes for a
+//! model that will read the line back later with none of it.
+
+use serde_json::{json, Value};
+
+use rm_engine::{Believed, Provenance, Recalled, Source};
+use rm_host::command::{MentionLanding, Outcome};
+
+/// What one tool call returns.
+pub struct Rendered {
+    pub text: String,
+    pub structured: Value,
+}
+
+pub fn render(outcome: &Outcome) -> Rendered {
+    match outcome {
+        Outcome::Remembered {
+            ingested,
+            landings,
+            relations,
+        } => {
+            // Mentions first, then facts: `Ingested::assertions` documents one
+            // assertion per mention followed by one per fact, which is the
+            // only way back to the count -- an `AssertionId` says nothing
+            // about what produced it.
+            let facts = ingested.assertions.len().saturating_sub(landings.len());
+            let mut text = format!(
+                "Remembered {} mention(s), {facts} fact(s), {relations} relationship(s).\n",
+                landings.len()
+            );
+            for MentionLanding {
+                name,
+                entity,
+                was_new,
+            } in landings
+            {
+                let how = if *was_new { "new" } else { "recognised" };
+                text.push_str(&format!("  {name} -> entity {entity} ({how})\n"));
+            }
+            if !ingested.closed.is_empty() {
+                // Under its own heading, exactly as the CLI does it. A closure
+                // is provenanced as an agent's inference precisely so nobody
+                // reads it as testimony, and listing it beside what was said
+                // would undo that at the last possible step -- here, in front
+                // of the model most likely to repeat it as fact.
+                text.push_str("Inferred, not stated:\n");
+                for c in &ingested.closed {
+                    text.push_str(&format!(
+                        "  ended: entity {} {} entity {} -- \"{}\"\n",
+                        c.subject, c.predicate, c.object, c.because
+                    ));
+                }
+            }
+            if !ingested.reviews.is_empty() {
+                text.push_str(&format!(
+                    "Open questions (nothing was merged): {}. Call reviews to see them.\n",
+                    ingested
+                        .reviews
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            Rendered {
+                text,
+                structured: json!({
+                    "mentions": landings.iter().map(|l| json!({
+                        "name": l.name,
+                        "entity": l.entity,
+                        "was_new": l.was_new,
+                    })).collect::<Vec<_>>(),
+                    "facts": facts,
+                    "relations": relations,
+                    "inferred_closures": ingested.closed.iter().map(|c| json!({
+                        "subject": c.subject,
+                        "predicate": c.predicate,
+                        "object": c.object,
+                        "because": c.because,
+                    })).collect::<Vec<_>>(),
+                    "reviews": ingested.reviews,
+                }),
+            }
+        }
+
+        Outcome::Recalled(hits) if hits.is_empty() => Rendered {
+            text: "Nothing recalled: memory has nothing near that yet.".to_string(),
+            structured: json!({"hits": []}),
+        },
+        Outcome::Recalled(hits) => {
+            let mut text = format!("{} hit(s), nearest first:\n", hits.len());
+            for h in hits {
+                // `None` is a tombstone, not an absence of data: an assertion
+                // that says nothing is never stored, so this is a claim that
+                // the attribute had no value. Printing it as blank would make
+                // it indistinguishable from a value nobody bothered to fill
+                // in, which is the flattening this project exists to refuse.
+                let value = match &h.value {
+                    Some(v) => v.clone(),
+                    None => "(asserted to have no value)".to_string(),
+                };
+                let stale = if h.superseded {
+                    "  [superseded by a later assertion]"
+                } else {
+                    ""
+                };
+                text.push_str(&format!(
+                    "  entity {}  {} = {value}  (score {:.3}, {}){stale}\n",
+                    h.entity,
+                    h.attribute,
+                    h.score,
+                    source_name(&h.provenance.source),
+                ));
+            }
+            Rendered {
+                text,
+                structured: json!({"hits": hits.iter().map(hit).collect::<Vec<_>>()}),
+            }
+        }
+
+        // Three states, and the whole thesis is that they stay three. `null`
+        // cannot tell "they have no employer, and someone said so" from
+        // "nobody has ever mentioned an employer", and neither can an empty
+        // string, so the structured half is tagged and the text says which one
+        // it is in words.
+        Outcome::About(Believed::Value(v)) => Rendered {
+            text: v.clone(),
+            structured: json!({"believed": "value", "value": v}),
+        },
+        Outcome::About(Believed::Absent) => Rendered {
+            text: "Absent: this was asserted to have no value. That is an answer, not a gap."
+                .to_string(),
+            structured: json!({"believed": "absent"}),
+        },
+        Outcome::About(Believed::Unknown) => Rendered {
+            text: "Unknown: nothing has ever been said about this. It is not that there is no value -- it has never come up.".to_string(),
+            structured: json!({"believed": "unknown"}),
+        },
+
+        Outcome::Reviews(lines) if lines.is_empty() => Rendered {
+            text: "No open questions.".to_string(),
+            structured: json!({"reviews": []}),
+        },
+        Outcome::Reviews(lines) => {
+            let mut text = format!("{} open question(s), nothing merged:\n", lines.len());
+            for l in lines {
+                text.push_str(&format!(
+                    "  review {}: entity {} against entity {} ({:.2} bits of evidence)\n",
+                    l.id, l.a, l.b, l.score
+                ));
+            }
+            Rendered {
+                text,
+                structured: json!({"reviews": lines.iter().map(|l| json!({
+                    "id": l.id,
+                    "a": l.a,
+                    "b": l.b,
+                    "score": l.score,
+                })).collect::<Vec<_>>()}),
+            }
+        }
+
+        Outcome::Confirmed { survivor } => Rendered {
+            text: format!("Merged. Entity {survivor} survives, and carries both histories."),
+            structured: json!({"merged": true, "survivor": survivor}),
+        },
+        Outcome::Rejected => Rendered {
+            text: "Kept apart, and this pair will not be asked about again.".to_string(),
+            structured: json!({"merged": false}),
+        },
+
+        // Not reachable from this crate's tool table -- `init` writes a config
+        // file, which is `rmem`'s job and not a thing to do down a socket. It
+        // is rendered rather than panicked on because a server that aborts on
+        // an unexpected value takes the whole conversation with it, and this
+        // one is trivially renderable.
+        Outcome::Initialised { path, dimension } => Rendered {
+            text: format!(
+                "Wrote a configuration at {} with embedding dimension {dimension}.",
+                path.display()
+            ),
+            structured: json!({"dimension": dimension}),
+        },
+    }
+}
+
+fn hit(h: &Recalled) -> Value {
+    let Provenance {
+        source,
+        observed_at,
+        source_ref,
+    } = &h.provenance;
+    json!({
+        "entity": h.entity,
+        "attribute": h.attribute,
+        // Null here is unambiguous because it sits beside `asserted_absent`:
+        // the pair says "this assertion claimed there is no value", which a
+        // bare null could not.
+        "value": h.value,
+        "asserted_absent": h.value.is_none(),
+        "score": h.score,
+        "superseded": h.superseded,
+        "valid_from": h.valid.from,
+        "valid_to": h.valid.to,
+        "source": source_name(source),
+        "observed_at": observed_at,
+        "session": source_ref,
+    })
+}
+
+/// What to call a [`Source`] on the wire.
+///
+/// Written out rather than derived through `serde`, because the name is part of
+/// this server's contract with a model and `Source` is a library type that is
+/// free to gain variants. `External` carries the host's own label, which is the
+/// one case where the value is the informative part.
+fn source_name(source: &Source) -> String {
+    match source {
+        Source::UserAssertion => "user_assertion".to_string(),
+        Source::ToolOutput => "tool_output".to_string(),
+        Source::AgentInference => "agent_inference".to_string(),
+        Source::External(who) => format!("external:{who}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rm_engine::{Closed, Ingested, Interval, Provenance, Source};
+    use rm_host::command::ReviewLine;
+
+    fn landing(name: &str, entity: rm_engine::StableId, was_new: bool) -> MentionLanding {
+        MentionLanding {
+            name: name.to_string(),
+            entity,
+            was_new,
+        }
+    }
+
+    #[test]
+    fn the_three_states_of_believed_stay_three_on_the_wire() {
+        // The thesis at its last possible step. `Absent` -- someone said there
+        // is none -- and `Unknown` -- nobody has ever mentioned it -- are
+        // different answers, and every system that flattens them to null or to
+        // "" has thrown away the distinction this project exists to keep.
+        let value = render(&Outcome::About(Believed::Value("Globex".into())));
+        let absent = render(&Outcome::About(Believed::Absent));
+        let unknown = render(&Outcome::About(Believed::Unknown));
+
+        assert_eq!(
+            value.structured,
+            json!({"believed": "value", "value": "Globex"})
+        );
+        assert_eq!(absent.structured, json!({"believed": "absent"}));
+        assert_eq!(unknown.structured, json!({"believed": "unknown"}));
+        assert_ne!(absent.structured, unknown.structured);
+    }
+
+    #[test]
+    fn the_text_block_alone_distinguishes_absent_from_unknown() {
+        // The structured half is not enough. Most clients put the text block
+        // in front of the model and nothing else, and revisions before
+        // 2025-06-18 have no structured half at all -- so a distinction made
+        // only there is, for those readers, not made.
+        let absent = render(&Outcome::About(Believed::Absent)).text;
+        let unknown = render(&Outcome::About(Believed::Unknown)).text;
+        assert_ne!(absent, unknown);
+        assert!(absent.to_lowercase().contains("asserted"), "{absent}");
+        assert!(unknown.to_lowercase().contains("never"), "{unknown}");
+        // And neither may be empty or a bare value, which is what a model
+        // reading back a transcript would take for "no answer".
+        assert!(absent.len() > 20 && unknown.len() > 20);
+    }
+
+    #[test]
+    fn a_recalled_tombstone_is_not_a_blank() {
+        // `Recalled::value` of `None` is a claim that the attribute had no
+        // value, not a missing field: an assertion that says nothing is never
+        // stored and cannot be recalled. A blank in the text would be read as
+        // a value nobody filled in.
+        let hit = Recalled {
+            entity: 3,
+            assertion: 0,
+            attribute: "employer".into(),
+            value: None,
+            valid: Interval::since(100),
+            provenance: Provenance::new(Source::UserAssertion, 100, "session-a"),
+            score: 0.5,
+            superseded: false,
+        };
+        let out = render(&Outcome::Recalled(vec![hit]));
+        assert!(out.text.contains("no value"), "{}", out.text);
+        assert_eq!(out.structured["hits"][0]["value"], Value::Null);
+        assert_eq!(out.structured["hits"][0]["asserted_absent"], json!(true));
+    }
+
+    #[test]
+    fn a_superseded_hit_says_so_in_both_halves() {
+        // It is returned rather than hidden -- what was believed is part of
+        // the record -- which only works if the reader is told it is stale.
+        let hit = Recalled {
+            entity: 1,
+            assertion: 0,
+            attribute: "employer".into(),
+            value: Some("Acme".into()),
+            valid: Interval::between(100, 200),
+            provenance: Provenance::new(Source::AgentInference, 150, "s"),
+            score: 0.9,
+            superseded: true,
+        };
+        let out = render(&Outcome::Recalled(vec![hit]));
+        assert!(out.text.contains("superseded"), "{}", out.text);
+        assert_eq!(out.structured["hits"][0]["superseded"], json!(true));
+        assert_eq!(out.structured["hits"][0]["valid_to"], json!(200));
+        assert_eq!(
+            out.structured["hits"][0]["source"],
+            json!("agent_inference")
+        );
+    }
+
+    #[test]
+    fn an_empty_recall_is_an_answer_and_not_a_shrug() {
+        let out = render(&Outcome::Recalled(vec![]));
+        assert_eq!(out.structured, json!({"hits": []}));
+        assert!(!out.text.is_empty());
+    }
+
+    #[test]
+    fn an_inferred_closure_is_kept_out_of_the_facts() {
+        // The same separation `rm-cli` makes, and for a sharper reason here:
+        // the reader is a model, and a closure listed among the facts is one
+        // an agent will repeat as something the user said.
+        let ingested = Ingested {
+            entities: vec![0, 1],
+            assertions: vec![0, 1, 2],
+            reviews: vec![],
+            closed: vec![Closed {
+                subject: 0,
+                predicate: "employed_by".into(),
+                object: 1,
+                because: "starting a new job ends the previous one".into(),
+            }],
+        };
+        let out = render(&Outcome::Remembered {
+            ingested,
+            landings: vec![landing("Ben Severn", 0, false), landing("Globex", 1, true)],
+            relations: 1,
+        });
+
+        let heading = out
+            .text
+            .find("Inferred, not stated:")
+            .expect("the inference has to be marked as one");
+        let ended = out.text.find("ended:").expect("the closure has to show");
+        assert!(heading < ended, "the heading comes first:\n{}", out.text);
+        assert!(out.text.contains("starting a new job"), "{}", out.text);
+        // And it is its own field, not an entry in the facts count.
+        assert_eq!(out.structured["facts"], json!(1));
+        assert_eq!(
+            out.structured["inferred_closures"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn remembering_says_which_mentions_were_recognised_and_which_were_new() {
+        // The most useful thing an agent can be told here: whether memory
+        // learned about someone or recognised them.
+        let out = render(&Outcome::Remembered {
+            ingested: Ingested {
+                entities: vec![0, 1],
+                assertions: vec![0, 1],
+                reviews: vec![7],
+                closed: vec![],
+            },
+            landings: vec![landing("Ben Severn", 0, false), landing("Globex", 1, true)],
+            relations: 0,
+        });
+        assert!(
+            out.text.contains("Ben Severn -> entity 0 (recognised)"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("Globex -> entity 1 (new)"),
+            "{}",
+            out.text
+        );
+        assert_eq!(out.structured["mentions"][0]["was_new"], json!(false));
+        // And an open question is surfaced with the tool that answers it,
+        // since nothing was merged and something has to say so.
+        assert!(out.text.contains("nothing was merged"), "{}", out.text);
+        assert!(out.text.contains("reviews"), "{}", out.text);
+        assert_eq!(out.structured["reviews"], json!([7]));
+    }
+
+    #[test]
+    fn a_review_line_carries_its_evidence() {
+        let out = render(&Outcome::Reviews(vec![ReviewLine {
+            id: 4,
+            a: 1,
+            b: 2,
+            score: 4.98,
+        }]));
+        assert!(out.text.contains("review 4"), "{}", out.text);
+        assert!(out.text.contains("4.98"), "{}", out.text);
+        assert_eq!(out.structured["reviews"][0]["id"], json!(4));
+    }
+
+    #[test]
+    fn a_merge_names_the_survivor_because_the_other_id_is_now_gone() {
+        let out = render(&Outcome::Confirmed { survivor: 2 });
+        assert!(out.text.contains("Entity 2"), "{}", out.text);
+        assert_eq!(out.structured, json!({"merged": true, "survivor": 2}));
+        let out = render(&Outcome::Rejected);
+        assert_eq!(out.structured, json!({"merged": false}));
+    }
+
+    #[test]
+    fn a_host_named_source_keeps_its_label() {
+        // `External` is the one variant where the value is the informative
+        // part: "crm" and "calendar" are different provenance, and collapsing
+        // both to "external" would lose the only thing they carry.
+        assert_eq!(source_name(&Source::External("crm".into())), "external:crm");
+    }
+}

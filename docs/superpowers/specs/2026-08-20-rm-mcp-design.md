@@ -114,10 +114,17 @@ from taste:
 - otherwise, `_meta` carries a protocol version → modern.
 - otherwise → legacy operation, from a client that has already handshaked.
 
-That is per-request and stateless in both directions: we never record that a
-handshake happened, because in the modern era there is nothing to record and in
-the legacy era the alternative is to reject a client's first `tools/call` for
-paperwork reasons.
+Routing is per-request, and the modern side of it is entirely stateless — there
+is nothing a modern request does not carry. The legacy side keeps exactly one
+thing: the version an `initialize` settled on. That is not a lapse. The
+specification scopes a legacy handshake "to the stdio process", and the
+alternative is to guess, on every subsequent `tools/call`, whether the client
+can read `structuredContent`.
+
+What is *not* remembered is whether a handshake happened at all. A legacy
+client whose first message is a `tools/call` is served at the newest handshake
+revision rather than refused: there is no session here for the paperwork to
+have established, and refusing would fail the client easiest to help.
 
 Versions served: `2026-07-28` modern; `2025-11-25`, `2025-06-18`, `2025-03-26`
 and `2024-11-05` legacy. The legacy list is not generosity — it is four
@@ -129,8 +136,14 @@ comparison is `>=` on the string and the test says so.
 
 A legacy client asking for a version outside that list gets `2025-11-25` back —
 the spec's instruction is to answer with a version we *do* support and let the
-client decide — and a modern client asking for an unknown version gets `-32022`
-naming all five.
+client decide.
+
+A modern client asking for an unknown version gets `-32022`, and its `supported`
+array names `2026-07-28` alone. That is narrower than the five this server
+speaks, and deliberately so: `supported` is what a client will *retry* with, in
+the same `_meta` envelope, and a handshake revision retried that way fails
+again. The four are named in the error's message instead, alongside the door
+that does open them.
 
 ## The tool surface
 
@@ -250,12 +263,19 @@ moment anything here becomes concurrent.
 
 ## Dependencies
 
-None that are new. `rm-mcp` takes `rm-host`, `rm-engine`, `rm-providers`,
-`serde` and `serde_json` — every one of them already in the workspace, and
-`serde_json` already in eight crates. There is no JSON-RPC framework, no MCP
-SDK, and no async runtime, because a stdio server handling one line at a time
-needs none of the three and the SDK would be by a wide margin the largest
-dependency in the tree.
+None that are new. `rm-mcp` takes `rm-host`, `rm-engine` and `serde_json`, and
+that is the whole list. There is no JSON-RPC framework, no MCP SDK, and no
+async runtime, because a stdio server handling one line at a time needs none of
+the three and the SDK would be by a wide margin the largest dependency in the
+tree.
+
+Not even `rm-providers`, which is the surprising one. `main` passes
+`Config::provider` as the factory the server builds its ports from, and never
+names the `HttpProvider` that comes back — `Server` is generic over anything
+implementing both ports, so the concrete type is inferred through `rm-host` and
+checked by the compiler without appearing in this crate's manifest. The trade
+that made the ports worth having pays here twice: the server needs no HTTP
+client to be written, and its tests need none to run.
 
 Hand-writing the protocol is the same trade this workspace has now made four
 times — exact search over an ANN index, ports over an HTTP client, a hand-rolled

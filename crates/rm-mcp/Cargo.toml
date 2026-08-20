@@ -8,8 +8,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "rmem-mcp"
+path = "src/main.rs"
+
 [dependencies]
 rm-engine = { workspace = true }
 rm-host = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }

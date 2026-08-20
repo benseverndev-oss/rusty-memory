@@ -154,6 +154,29 @@ Also required: `record_key` computation. The store keys identity on
 host-supplied fingerprints and "the core never computes it" — that is the host's
 job, i.e. ours.
 
+### 5. The protocol moved while this was being built
+
+Not foreseen here, and worth recording because it changed what `rm-mcp` is.
+MCP's current revision, `2026-07-28`, **removed the `initialize` handshake**.
+There is no session and no negotiated state: every request declares its own
+protocol version in a `_meta` field, the server accepts or rejects each request
+independently, and a mandatory `server/discover` replaces the handshake as the
+way to ask what a server speaks. Revisions through `2025-11-25` still handshake;
+the specification calls the two worlds *modern* and *legacy*.
+
+A modern-only server is less code and, by the specification's own compatibility
+matrix, unreachable: *legacy client, modern server — **Fails***, with no
+fall-forward mechanism for the client to recover with. The revision is weeks
+old and shipping clients are not on it. So `rm-mcp` serves both, routing on one
+rule the specification supplies — `initialize` is legacy, a `_meta` envelope is
+modern, anything else is a legacy client that already handshaked.
+
+The stateless half of that is free here, because nothing in this workspace kept
+per-connection state to begin with. The one thing the server does remember is
+the version a legacy handshake settled on, because the legacy era genuinely is
+scoped to the process and the alternative is guessing whether the client can
+read `structuredContent`.
+
 ## Crate layout
 
 ```
@@ -169,9 +192,20 @@ rusty-memory/
     rm-engine/     # remember() / recall() / forget(). Ties it together.
     rm-providers/  # HTTP impls of the Completer/Embedder ports. The only
                    # crate that touches the network.
-    rm-mcp/        # MCP server binary
+    rm-host/       # Config, store file, and the operations over them. What
+                   # both binaries need and neither should own.
+    rm-mcp/        # `rmem-mcp` binary: MCP server
     rm-cli/        # `rmem` binary
 ```
+
+`rm-host` is not in the original list, and it is the one crate here that exists
+for a reason internal to this repository rather than to the domain. `rm-cli`
+was written first and answered three questions — where a store lives, where
+configuration comes from, who calls a model — that turned out to be about
+*hosting* rather than about a command line. When `rm-mcp` arrived, the choice
+was to duplicate those answers or to depend on a binary crate, and the rm-cli
+design had already refused both. So they moved. `rm-cli` kept argument parsing,
+text rendering and dispatch; `rm-mcp` adds a protocol and nothing else.
 
 The deliverable is a **single static binary and an embeddable library**. No
 Python runtime, no CMake, no ABI-tag matching, no Compose file. That is the
