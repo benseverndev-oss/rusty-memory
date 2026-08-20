@@ -55,6 +55,22 @@ pub struct Ingested {
     /// Local mention index to the entity it resolved to. Same order and length
     /// as the extraction's `mentions`.
     pub entities: Vec<StableId>,
+    /// Every assertion this turn wrote, in write order: one per mention first,
+    /// each the `kind` assertion that made its entity, in the extraction's
+    /// mention order; then one per fact, in the extraction's fact order.
+    ///
+    /// Stated because it is the only way back. An `AssertionId` says nothing
+    /// about what produced it, so without the ordering a caller holding this
+    /// vector can tell how many things landed but not which sentence any of
+    /// them came from -- and the two halves are not otherwise distinguishable,
+    /// since a mention's `kind` assertion has the same shape as a fact's.
+    /// `assertions[i]` for `i < mentions.len()` is the mention at that index;
+    /// beyond that, subtract `mentions.len()` to get the fact.
+    ///
+    /// Not split into two fields, which would encode this in the type rather
+    /// than in prose: `entities` is already indexed by mention position, so a
+    /// second mention-indexed vector beside it would invite the reader to
+    /// wonder which of the two the fact indices belong to.
     pub assertions: Vec<AssertionId>,
     /// Open questions raised while resolving the mentions. A mention that
     /// scored in the review band created its own entity and filed a question

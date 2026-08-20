@@ -140,9 +140,23 @@ pub enum EngineError {
     /// end in an error -- [`StoreError::SelfEdge`] -- but only after
     /// `Engine::relate` was reached, which is after every mention and fact
     /// this same call wrote had already landed. Checking it alongside
-    /// [`BadMentionIndex`], before the first write, gives a relation that can
-    /// never be created the same costs-nothing failure a bad index gets,
-    /// rather than one that merely fails no worse than it would have anyway.
+    /// [`BadMentionIndex`], before the first write, gives a relation naming
+    /// one index twice the same costs-nothing failure a bad index gets.
+    ///
+    /// **That guarantee covers the index case only.** A relation can also name
+    /// two *different* mentions that resolution then lands on the same entity
+    /// -- the same person said twice in one turn, which `extract` does not
+    /// dedupe. Nothing here can catch that, because the check runs before the
+    /// first write and the entity ids do not exist until the mention loop has
+    /// run. It is [`Engine::relate`] that refuses it, by which point this
+    /// call's mentions and facts are already in the store and the `Ingested`
+    /// naming them is dropped with the error. The writes stand; the caller
+    /// cannot learn which ones.
+    ///
+    /// Moving the check later would not fix that -- it would only move which
+    /// writes had already happened -- so the honest statement is that `ingest`
+    /// is atomic against a malformed extraction and not against a coincidence
+    /// of resolution.
     SelfRelation(usize),
     /// A mention carried no name, and resolution has nothing else to match on.
     ///
@@ -3176,6 +3190,55 @@ mod tests {
         );
         assert_eq!(e.entity_count(), 0, "checked before the first write");
         assert_eq!(e.index_len(), 0);
+    }
+
+    #[test]
+    fn the_assertions_come_back_in_write_order_so_a_caller_can_tell_what_produced_each() {
+        // Mentions first, in the extraction's mention order, then facts in the
+        // extraction's fact order. An `AssertionId` carries nothing about its
+        // origin, and a mention's `kind` assertion has the same shape as a
+        // fact's, so this ordering is the only route from an id back to the
+        // sentence it came from. Pinned here because it is documented on
+        // `Ingested::assertions` as a promise, and a promise nothing checks is
+        // one a later refactor can quietly break.
+        let mut e = engine();
+        let extraction = rm_extract::Extraction {
+            mentions: vec![mention("person", "Ben Severn"), mention("place", "Bristol")],
+            facts: vec![
+                rm_extract::Fact {
+                    subject: 0,
+                    attribute: "employer".to_string(),
+                    value: Some("Globex".to_string()),
+                    text: "Ben works at Globex".to_string(),
+                    valid_from: 100,
+                },
+                rm_extract::Fact {
+                    subject: 1,
+                    attribute: "country".to_string(),
+                    value: Some("England".to_string()),
+                    text: "Bristol is in England".to_string(),
+                    valid_from: 100,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let out = e.ingest(&a_turn(), &extraction, &Buckets).unwrap();
+        assert_eq!(
+            out.assertions.len(),
+            4,
+            "one per mention, then one per fact"
+        );
+
+        let at = |i: usize| e.assertion(out.assertions[i]).unwrap().clone();
+        assert_eq!(at(0).attribute, "kind");
+        assert_eq!(at(0).entity, out.entities[0]);
+        assert_eq!(at(1).attribute, "kind");
+        assert_eq!(at(1).entity, out.entities[1]);
+        assert_eq!(at(2).attribute, "employer");
+        assert_eq!(at(2).entity, out.entities[0]);
+        assert_eq!(at(3).attribute, "country");
+        assert_eq!(at(3).entity, out.entities[1]);
     }
 
     #[test]
