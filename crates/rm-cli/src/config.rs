@@ -79,7 +79,24 @@ default = "most_recent"
 employer = "valid_interval"
 "#;
 
+/// Every config struct carries `deny_unknown_fields`.
+///
+/// The invariant this crate is built around is that an API key never reaches
+/// disk, and `TEMPLATE`'s comment says so -- "the NAME of the environment
+/// variable holding your key -- never the key. This file is a thing people
+/// commit." A comment is not a mechanism. Without this, `api_key = "sk-..."`
+/// pasted under `[provider]` was dropped on the floor in silence: the command
+/// ran, exited 0, and the user believed a key they had just written into a
+/// committed file was in use when it never was.
+///
+/// It earns its place a second way, on ordinary typos. `embeding_model` used
+/// to fall through and surface later as a missing-field error naming
+/// `embedding_model`, which is the one field the file appears to have.
+///
+/// The message names the field and never its value. That is the whole point:
+/// the value is the part that may be a key.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub store: StoreConfig,
     pub provider: ProviderConfig,
@@ -88,11 +105,13 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreConfig {
     pub path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub base_url: String,
     pub api_key_env: String,
@@ -103,6 +122,7 @@ pub struct ProviderConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResolutionConfig {
     pub review_at: f64,
     pub match_at: f64,
@@ -111,6 +131,7 @@ pub struct ResolutionConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldConfig {
     pub field: String,
     pub comparator: String,
@@ -119,6 +140,7 @@ pub struct FieldConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockingConfig {
     pub kind: String,
     pub field: String,
@@ -127,6 +149,7 @@ pub struct BlockingConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     pub default: String,
     #[serde(default)]
@@ -424,6 +447,72 @@ mod tests {
             "the secret-looking value leaked into the error: {text}"
         );
         assert!(text.contains("line"), "{text}");
+    }
+
+    #[test]
+    fn a_key_pasted_into_the_config_is_refused_by_name_rather_than_ignored() {
+        use crate::testing::TempDir;
+
+        // `[provider]` names `api_key_env`, so `api_key` is the obvious
+        // wrong guess, and a user who makes it has just written a live
+        // credential into a file this template's own comment calls "a thing
+        // people commit". Before `deny_unknown_fields` serde dropped the
+        // field silently: `rmem review` printed "no open questions" and
+        // exited 0, and nothing anywhere ever said the key was not in use.
+        //
+        // The error names the field and must never name its value -- the
+        // value is the part that is a secret, which is the same reason
+        // `Config::parse` reports a location instead of the source line.
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        let pasted = TEMPLATE.replace(
+            "api_key_env = \"OPENAI_API_KEY\"",
+            "api_key_env = \"OPENAI_API_KEY\"
+api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
+        );
+        std::fs::write(&path, pasted).unwrap();
+
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("api_key"), "the field has to be named: {err}");
+        assert!(
+            !err.contains("sk-PASTED-FAKE-SECRET"),
+            "the value must never be echoed: {err}"
+        );
+    }
+
+    #[test]
+    fn a_misspelled_field_is_refused_naming_the_word_that_was_written() {
+        use crate::testing::TempDir;
+
+        // The ordinary-typo half of the same guard. `embeding_model` used to
+        // fall through and reappear later as "missing field
+        // `embedding_model`" -- a message naming the one field the file
+        // appears to have, which sends the reader looking in the wrong
+        // place.
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        std::fs::write(
+            &path,
+            TEMPLATE.replace("embedding_model =", "embeding_model ="),
+        )
+        .unwrap();
+
+        let err = Config::load(&path).unwrap_err().to_string();
+        assert!(err.contains("embeding_model"), "{err}");
+    }
+
+    #[test]
+    fn the_template_this_crate_writes_survives_deny_unknown_fields() {
+        // `deny_unknown_fields` is exactly the kind of change that can make
+        // the file this crate writes one it can no longer read. Parsed here
+        // through `Config::load`, the path a real command takes, rather than
+        // through this module's own `parse` helper.
+        use crate::testing::TempDir;
+
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        std::fs::write(&path, TEMPLATE).unwrap();
+        Config::load(&path).expect("the template must still parse");
     }
 
     #[test]
