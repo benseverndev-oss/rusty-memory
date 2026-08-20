@@ -55,9 +55,15 @@ never discussed it" are different answers.)
 | `rm-graph` | in progress | Entity graph, k-hop retrieval |
 | `rm-resolve` | in progress | Probabilistic entity resolution, with a review band |
 | `rm-index` | in progress | Exact vector search: deletion, filtering, persistence |
-| `rm-extract` | in progress | Turn → mentions/edges. The only networked crate. |
+| `rm-extract` | in progress | Turn → mentions/edges, and whether arrival implies departure |
 | `rm-engine` | in progress | `remember()` / `recall()` / `forget()` |
 | `rm-mcp` / `rm-cli` | planned | MCP server and `rmem` binary |
+
+No crate touches the network. The two things that need a remote service —
+completion and embedding — are ports (`rm_extract::Completer`,
+`rm_engine::Embedder`) the host implements, so the whole workspace builds, tests
+and audits with no third-party dependencies at all, and every test runs offline
+and deterministically against a canned implementation.
 
 The target is a single static binary and an embeddable library: no Python
 runtime, no CMake, no compose file.
