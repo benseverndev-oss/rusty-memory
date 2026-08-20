@@ -445,12 +445,24 @@ const SCHEMA: &[(&str, &[&str])] = &[
 /// sentences to print, and a wrong guess picks a wrong sentence rather than
 /// leaking anything.
 ///
-/// The cost is real and worth stating: a kind not listed here degrades to the
-/// last line, so a reader gets the location and "not valid TOML" rather than
-/// the parser's own words. The location, and the field list `table_hint` adds,
-/// are what carry the repair.
+/// The cost, and it is now small: a kind not listed here degrades to the last
+/// line, so a reader gets the location and "not valid TOML" rather than a
+/// reason. Every message kind this version of `toml` can produce is listed --
+/// its parser's twenty labels, its four custom errors, serde's six, and
+/// winnow's bare "expected" -- so the fallback is reached only by a kind a
+/// future version adds. `every_toml_message_kind_has_a_sentence_of_our_own`
+/// drives one input per kind and fails if any of them reaches it.
 fn our_reason(message: &str) -> &'static str {
+    // Ordered only where one prefix contains another: "invalid time offset"
+    // has to be tried before "invalid time", or an offset is reported as a
+    // time. Everything else is grouped by what a reader is looking at.
+    //
+    // The wording is ours throughout, deliberately: the parser's own phrasing
+    // is the thing that cannot be relayed, so reaching for it here — even by
+    // paraphrase close enough to copy — would be re-introducing the habit that
+    // this table exists to replace.
     const KINDS: &[(&str, &str)] = &[
+        // serde, about the shape of the document rather than its syntax.
         (
             "unknown field",
             "that line sets a field this build does not know",
@@ -464,6 +476,10 @@ fn our_reason(message: &str) -> &'static str {
             "that key is set more than once in the same table",
         ),
         (
+            "dotted key",
+            "that dotted key tries to extend something that is not a table",
+        ),
+        (
             "invalid type",
             "the value there is not the type that field takes",
         ),
@@ -475,15 +491,97 @@ fn our_reason(message: &str) -> &'static str {
             "invalid length",
             "the value there is not the length that field takes",
         ),
+        // Strings and what can go inside one.
         (
             "invalid escape sequence",
             "a backslash escape inside that string is not one TOML defines; TOML allows \\b, \\t, \\n, \\f, \\r, \\\", \\\\, \\uXXXX and \\UXXXXXXXX",
         ),
+        (
+            "invalid unicode",
+            "a unicode escape inside that string does not have the digits it needs; TOML wants exactly four hex digits after \\u and exactly eight after \\U",
+        ),
+        (
+            "invalid multiline",
+            "that multiline string is never closed; it opens and closes with three quotes",
+        ),
+        (
+            "invalid basic string",
+            "that string is never closed, or holds a character that has to be escaped; a basic string opens and closes with a double quote",
+        ),
+        (
+            "invalid literal string",
+            "that string is never closed; a literal string opens and closes with a single quote",
+        ),
         ("invalid string", "that string is not well formed"),
-        ("unterminated", "that value is never closed"),
+        // Structure.
+        (
+            "invalid table header",
+            "that table header is not well formed; a header is a name in square brackets, like [provider], or double brackets for an array of tables, like [[resolution.field]]",
+        ),
+        (
+            "invalid key",
+            "that line does not begin with a key TOML can read; a bare key is letters, digits, underscores and dashes, and anything else has to be quoted",
+        ),
+        (
+            "invalid array",
+            "that array is never closed, or holds something TOML cannot put in one",
+        ),
+        (
+            "invalid inline table",
+            "that inline table is never closed, or holds something TOML cannot put in one",
+        ),
+        // Numbers.
+        (
+            "invalid hexadecimal integer",
+            "that is not a hexadecimal integer; after 0x TOML wants hex digits and nothing else",
+        ),
+        (
+            "invalid octal integer",
+            "that is not an octal integer; after 0o TOML wants digits 0 to 7",
+        ),
+        (
+            "invalid binary integer",
+            "that is not a binary integer; after 0b TOML wants 0 or 1",
+        ),
+        (
+            "invalid integer",
+            "that is not an integer TOML can read; it wants digits, optionally separated by single underscores, and no leading zero",
+        ),
+        (
+            "invalid floating-point number",
+            "that is not a number TOML can read; it wants digits, at most one decimal point, and an optional exponent",
+        ),
+        (
+            "number too large",
+            "that number is too large for the type this field takes",
+        ),
+        (
+            "value is out of range",
+            "that value is outside the range TOML allows for its type",
+        ),
+        // Dates and times. "invalid time offset" precedes "invalid time".
+        (
+            "invalid date-time",
+            "that is not a date-time TOML can read; it wants RFC 3339, like 1979-05-27T07:32:00Z",
+        ),
+        (
+            "invalid time offset",
+            "that time offset is not one TOML can read; it wants Z, or +HH:MM, or -HH:MM",
+        ),
+        (
+            "invalid time",
+            "that is not a time TOML can read; it wants HH:MM:SS",
+        ),
+        (
+            "recursion limit exceeded",
+            "that value nests deeper than this build will follow",
+        ),
+        // Syntax, where the parser had no label to give. `unterminated` and
+        // `trailing` used to sit here and matched nothing in this version of
+        // `toml`: an unclosed string is reported against its own kind above,
+        // and text after a value comes out as "expected newline".
         ("expected", "the syntax there is not valid TOML"),
         ("unexpected", "the syntax there is not valid TOML"),
-        ("trailing", "there is more text after the end of that value"),
     ];
     for (prefix, ours) in KINDS {
         if message.starts_with(prefix) {
@@ -942,6 +1040,85 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             text.contains("embedding_model") && text.contains("base_url"),
             "and the fields that would have been valid: {text}"
         );
+    }
+
+    #[test]
+    fn every_toml_message_kind_has_a_sentence_of_our_own() {
+        // One input per message kind this version of `toml` can produce,
+        // enumerated from its parser's labels, its custom errors and serde's
+        // -- not invented. The assertion is that none of them reaches the
+        // fallback, because the fallback says only "not valid TOML" and the
+        // kinds below are ones where knowing *what* is wrong is the repair:
+        // `"\u12"` is four hex digits short, and being told the file is not
+        // valid TOML does not say so.
+        //
+        // Each case also asserts the canary is absent, since several of these
+        // messages quote the offending text and this is the guard that they
+        // never arrive quoted.
+        const FALLBACK: &str = "it is not valid TOML";
+        const CANARY: &str = "REALSECRETabc123DEF456";
+        let cases: &[(&str, &str)] = &[
+            ("table header", "[REALSECRETabc123DEF456 x\nx = 1\n"),
+            ("key", "= \"REALSECRETabc123DEF456\"\n"),
+            ("integer", "x = 12__3\n"),
+            ("hexadecimal integer", "x = 0xZZ\n"),
+            ("octal integer", "x = 0o99\n"),
+            ("binary integer", "x = 0b22\n"),
+            ("floating-point number", "x = 1.2e\n"),
+            ("number too large", "x = 999999999999999999999999999\n"),
+            ("date-time", "x = 2020-13-45T99:99:99Z\n"),
+            ("time offset", "x = 2020-01-01T00:00:00+99:99\n"),
+            ("unicode 4-digit", "x = \"\\u12\"\n"),
+            ("unicode 8-digit", "x = \"\\U1234\"\n"),
+            ("escape sequence", "x = \"REALSECRETabc123DEF456\\q\"\n"),
+            ("basic string", "x = \"REALSECRETabc123DEF456\n"),
+            ("literal string", "x = 'REALSECRETabc123DEF456\n"),
+            (
+                "multiline basic string",
+                "x = \"\"\"REALSECRETabc123DEF456\n",
+            ),
+            ("array", "x = [1, 2\n"),
+            ("inline table", "x = { a = 1\n"),
+            ("string", "x = = 1\n"),
+            ("duplicate key", "x = 1\nx = 2\n"),
+            ("dotted key", "x = 1\nx.y = 2\n"),
+            ("expected", "x = 1 y = 2\n"),
+        ];
+
+        for (kind, text) in cases {
+            let Err(e) = toml::from_str::<toml::Value>(text) else {
+                panic!("{kind}: the fixture stopped being a parse error");
+            };
+            let ours = our_reason(e.message());
+            assert_ne!(
+                ours,
+                FALLBACK,
+                "{kind} degrades to the fallback; toml said {:?}",
+                e.message()
+            );
+            assert!(
+                !ours.contains(CANARY),
+                "{kind}: our own literal cannot contain the file, so this is impossible"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_table_header_says_what_a_header_looks_like() {
+        use crate::testing::TempDir;
+
+        // The weakest output before this: `[provider` gave "it is not valid
+        // TOML" and `table_hint` had no header to work from either, so the
+        // whole message was a location. It is the one case where both halves
+        // of the message went missing at once.
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        std::fs::write(&path, TEMPLATE.replace("[provider]", "[provider")).unwrap();
+
+        let text = Config::load(&path).unwrap_err().to_string();
+        assert!(text.contains("table header"), "{text}");
+        assert!(text.contains("[[resolution.field]]"), "{text}");
+        assert!(text.contains("line"), "{text}");
     }
 
     #[test]
