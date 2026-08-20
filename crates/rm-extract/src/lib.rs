@@ -37,7 +37,7 @@ mod prompt;
 pub use prompt::prompt;
 
 use rm_core::Timestamp;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// One line of dialogue to extract from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,7 +57,14 @@ pub struct Turn {
 ///
 /// Its position in [`Extraction::mentions`] is its local index, and every other
 /// part of an extraction refers to it by that.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Deserialize` only. A mention is the one public type the wire format hands
+/// back unchanged, so it is read from JSON; nothing in this workspace ever
+/// writes one back out. `Serialize` was derived alongside it and used by
+/// nothing -- and a derive kept for a caller who might would put this crate's
+/// field names into someone else's persisted format, where renaming one here
+/// becomes their breaking change rather than a rename.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Mention {
     pub kind: String,
     /// The identifying field, used for entity resolution.
