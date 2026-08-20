@@ -184,12 +184,34 @@ pub fn render(outcome: &Outcome) -> Rendered {
         // is rendered rather than panicked on because a server that aborts on
         // an unexpected value takes the whole conversation with it, and this
         // one is trivially renderable.
-        Outcome::Initialised { path, dimension } => Rendered {
-            text: format!(
-                "Wrote a configuration at {} with embedding dimension {dimension}.",
-                path.display()
-            ),
-            structured: json!({"dimension": dimension}),
+        Outcome::Initialised {
+            path,
+            dimension,
+            replaced_unparsable,
+        } => Rendered {
+            // The notice leads, for the same reason it leads in `rmem`'s own
+            // rendering: a file the user wrote is gone, and that is the part
+            // they need first. It is `command::init`'s words verbatim, which
+            // name a location in the old file and never a value out of it.
+            text: match replaced_unparsable {
+                Some(why) => format!(
+                    "The existing configuration could not be parsed, and was replaced because --force was passed: {why}
+
+Wrote a configuration at {} with embedding dimension {dimension}.",
+                    path.display()
+                ),
+                None => format!(
+                    "Wrote a configuration at {} with embedding dimension {dimension}.",
+                    path.display()
+                ),
+            },
+            // Present as `null` rather than omitted when nothing was replaced,
+            // so a client reading `structuredContent` can tell "nothing was
+            // overwritten" from "this server is too old to say".
+            structured: json!({
+                "dimension": dimension,
+                "replaced_unparsable": replaced_unparsable,
+            }),
         },
     }
 }

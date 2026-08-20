@@ -36,6 +36,13 @@ pub enum Outcome {
     Initialised {
         path: PathBuf,
         dimension: usize,
+        /// Set when `init --force` replaced a file that existed but did not
+        /// parse, so the reader learns their old file is gone and why rather
+        /// than only seeing a fresh one appear. Carries the same words
+        /// [`HostError::Config`] would have refused with -- built entirely by
+        /// this crate, so it names a location and never a value out of the
+        /// file it describes.
+        replaced_unparsable: Option<String>,
     },
     Remembered {
         ingested: Ingested,
@@ -63,12 +70,24 @@ pub enum Outcome {
 ///
 /// Probing before writing is deliberate. Half a config is worse than none: the
 /// next command would read it and fail somewhere further from the cause.
+///
+/// `replaced_unparsable` says whether `run` already decided, before calling
+/// this, that an existing file could not be parsed and is being replaced
+/// under `--force`. When it is `Some`, the existence check below is skipped
+/// deliberately rather than merely made moot by `force` being `true`: a file
+/// that failed to parse can still fail `Path::exists` on some errors it does
+/// not represent (permission, a directory in the way), and this function has
+/// no way to tell those apart from `force` alone. The caller already did that
+/// work in `Config::read_for_init`, and repeating a weaker
+/// version of it here would be the same drift `deny_unknown_fields` exists to
+/// stop elsewhere in this crate.
 pub fn init(
     config_path: &Path,
     force: bool,
+    replaced_unparsable: Option<String>,
     probe: &dyn Fn() -> Result<usize, String>,
 ) -> Result<Outcome, HostError> {
-    if config_path.exists() && !force {
+    if replaced_unparsable.is_none() && config_path.exists() && !force {
         return Err(HostError::Config(format!(
             "{} already exists, and it may have been edited -- pass --force to replace it",
             config_path.display()
@@ -89,6 +108,7 @@ pub fn init(
     Ok(Outcome::Initialised {
         path: config_path.to_path_buf(),
         dimension,
+        replaced_unparsable,
     })
 }
 
@@ -211,13 +231,14 @@ mod tests {
         // nothing reports it.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
-        let out = init(&path, false, &|| Ok(1536)).unwrap();
+        let out = init(&path, false, None, &|| Ok(1536)).unwrap();
 
         assert_eq!(
             out,
             Outcome::Initialised {
                 path: path.clone(),
-                dimension: 1536
+                dimension: 1536,
+                replaced_unparsable: None,
             }
         );
         let written = std::fs::read_to_string(&path).unwrap();
@@ -231,7 +252,7 @@ mod tests {
         // silently produce a broken store.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
-        init(&path, false, &|| Ok(3072)).unwrap();
+        init(&path, false, None, &|| Ok(3072)).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("dimension = 3072"), "{written}");
         assert!(!written.contains("dimension = 1536"), "{written}");
@@ -243,7 +264,7 @@ mod tests {
         let path = dir.path().join("rmem.toml");
         std::fs::write(&path, "# hand-edited, do not lose").unwrap();
 
-        let err = init(&path, false, &|| Ok(1536)).unwrap_err();
+        let err = init(&path, false, None, &|| Ok(1536)).unwrap_err();
         assert!(err.to_string().contains("--force"), "{err}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -265,7 +286,7 @@ mod tests {
         let path = dir.path().join("rmem.toml");
         std::fs::write(&path, "# hand-edited, do not lose").unwrap();
 
-        let err = init(&path, false, &|| panic!("the probe must not run")).unwrap_err();
+        let err = init(&path, false, None, &|| panic!("the probe must not run")).unwrap_err();
         assert!(err.to_string().contains("--force"), "{err}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -279,10 +300,37 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
         std::fs::write(&path, "# old").unwrap();
-        init(&path, true, &|| Ok(768)).unwrap();
+        init(&path, true, None, &|| Ok(768)).unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("dimension = 768"));
+    }
+
+    #[test]
+    fn a_replaced_unparsable_notice_skips_the_exists_check_and_rides_along_in_the_outcome() {
+        // `run` is what decides a file could not be parsed and passes that
+        // decision down as `Some(..)`; this only has to honour it once it
+        // arrives, both by writing over the file without demanding `force`
+        // *and* by carrying the notice into the `Outcome` so `format` has
+        // something to show.
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        std::fs::write(&path, "# not valid toml at all [[[").unwrap();
+
+        let notice = "rmem.toml is not valid: that is not valid TOML (line 1, column 1)";
+        let out = init(&path, false, Some(notice.to_string()), &|| Ok(1536)).unwrap();
+
+        assert_eq!(
+            out,
+            Outcome::Initialised {
+                path: path.clone(),
+                dimension: 1536,
+                replaced_unparsable: Some(notice.to_string()),
+            }
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("dimension = 1536"));
     }
 
     #[test]
@@ -291,7 +339,7 @@ mod tests {
         // fail somewhere less obvious.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
-        let err = init(&path, false, &|| Err("quota exceeded".to_string())).unwrap_err();
+        let err = init(&path, false, None, &|| Err("quota exceeded".to_string())).unwrap_err();
         assert!(err.to_string().contains("quota exceeded"), "{err}");
         assert!(!path.exists(), "no config may be left behind");
     }
@@ -300,7 +348,7 @@ mod tests {
     fn what_init_writes_is_what_the_config_loader_reads() {
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
-        init(&path, false, &|| Ok(1536)).unwrap();
+        init(&path, false, None, &|| Ok(1536)).unwrap();
         let config = crate::config::Config::load(&path).unwrap();
         assert_eq!(config.provider.dimension, 1536);
         config.ruleset().unwrap();

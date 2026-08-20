@@ -158,6 +158,20 @@ pub struct PolicyConfig {
     pub attribute: BTreeMap<String, String>,
 }
 
+/// What [`Config::read_for_init`] found at `rmem.toml`'s path.
+pub enum InitConfig {
+    /// No file was there yet -- the ordinary first run.
+    Absent(Config),
+    /// A file was there, and it parsed.
+    Loaded(Config),
+    /// A file was there and did not parse. Carries the same
+    /// [`HostError::Config`] [`Config::load`] would have returned, so a caller
+    /// that decides to refuse can hand it straight back, and a caller that
+    /// decides to proceed anyway -- `init --force` -- still has its words to
+    /// show rather than inventing new ones.
+    Unparsable(HostError),
+}
+
 impl Config {
     /// Read a config file.
     pub fn load(path: &Path) -> Result<Config, HostError> {
@@ -182,10 +196,35 @@ impl Config {
     /// whoever wrote that file with no way to learn it never took effect,
     /// and the `--force` overwrite that follows a successful probe would
     /// then throw the broken file away without them ever seeing why.
+    ///
+    /// `init --force` is the one caller that may want the fallback anyway --
+    /// see `Config::read_for_init`, which this is now built on top of and
+    /// which draws that distinction explicitly rather than leaving it to a
+    /// second, diverging copy of this match.
     pub fn load_or_template(path: &Path) -> Result<Config, HostError> {
+        match Self::read_for_init(path)? {
+            InitConfig::Absent(config) | InitConfig::Loaded(config) => Ok(config),
+            InitConfig::Unparsable(e) => Err(e),
+        }
+    }
+
+    /// What trying to read a config for `rmem init` turned up.
+    ///
+    /// Three outcomes rather than two, because `init` and `init --force` need
+    /// to tell them apart and a plain `Result` cannot: [`InitConfig::Absent`]
+    /// and [`InitConfig::Unparsable`] both end in a template-backed
+    /// [`Config`], but only one of them is silent about it, and which one is
+    /// silent depends on whether the caller passed `--force`. That decision
+    /// belongs to the caller, not here -- this only reports what was found.
+    pub fn read_for_init(path: &Path) -> Result<InitConfig, HostError> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(path, &text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::from_template()),
+            Ok(text) => match Self::parse(path, &text) {
+                Ok(config) => Ok(InitConfig::Loaded(config)),
+                Err(e) => Ok(InitConfig::Unparsable(e)),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(InitConfig::Absent(Config::from_template()))
+            }
             Err(e) => Err(HostError::Config(format!(
                 "could not read {}: {e}",
                 path.display()
