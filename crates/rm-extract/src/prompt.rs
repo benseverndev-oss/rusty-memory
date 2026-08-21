@@ -72,8 +72,12 @@ Rules:
   may be a mention; "pottery" is not.
 - "text" on a mention is the phrasing the turn used. "text" on a fact is a short
   sentence stating that fact on its own, because it is searched for separately.
-- "value" may be null to say an attribute has no value — "he is between jobs"
-  is a fact with a null value, not a missing fact.
+- Every fact\'s "subject" must be an index into "mentions". If the turn has
+  nothing worth listing as a mention, emit no facts either: a fact with nothing
+  to attach to cannot be stored, and it is dropped rather than guessed at.
+- "value" is a string, or null. Never a number and never true or false — write
+  "2" and "true" if those are the values. Null means the attribute has no
+  value: "he is between jobs" is a fact with a null value, not a missing fact.
 - "days_ago" is how long before now the thing began or ended, as a whole number
   of days, or null if it is happening now. It is never negative: nothing here
   is in the future. Do not output dates or timestamps.
@@ -225,6 +229,38 @@ mod tests {
             );
         }
         assert!(p.contains("recognised again"));
+    }
+
+    #[test]
+    fn the_prompt_says_a_fact_needs_a_subject_that_exists() {
+        // Measured: 178 facts in 419 turns named mention 0 of a list with none
+        // in it, after the rules above told the model to stop emitting mentions
+        // for unnamed groups. It complied and kept writing the facts that
+        // referred to them. Removing the mentions without saying what becomes
+        // of their facts was half a rule.
+        let p = prompt(&turn("anything", None));
+        assert!(
+            p.contains("must be an index into \"mentions\""),
+            "the prompt must constrain a fact's subject, not just describe it"
+        );
+        assert!(
+            p.contains("emit no facts either"),
+            "and must say what to do when there is nothing to attach one to"
+        );
+    }
+
+    #[test]
+    fn the_prompt_says_a_value_is_a_string_or_null() {
+        // Measured: 49 facts answered a yes/no-flavoured attribute with the
+        // JSON literal `true`, and 4 more with a number. The schema has always
+        // wanted a string; the prompt never said so, and "may be null" reads as
+        // the only constraint on the field.
+        let p = prompt(&turn("anything", None));
+        assert!(p.contains("\"value\" is a string, or null"), "{p}");
+        assert!(
+            p.contains("never true or false"),
+            "the shape the model actually produced has to be named to be excluded"
+        );
     }
 
     /// Find the JSON example embedded in the prompt's instructions.
