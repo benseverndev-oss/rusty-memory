@@ -14,3 +14,6 @@ rm-extract = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+webpki-roots = { workspace = true }

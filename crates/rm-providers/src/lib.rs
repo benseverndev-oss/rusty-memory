@@ -30,11 +30,13 @@
 //! have. What a real success response looks like is still uncovered here;
 //! that surface is small, boring, and fails loudly.
 
+pub mod network;
 mod wire;
 
 use rm_engine::{Embedder, EmbedderError};
 use rm_extract::{Completer, CompleterError};
 
+use network::Network;
 use wire::{completion_body, embedding_body, parse_completion, parse_embedding};
 
 /// # One thing this cannot promise
@@ -97,6 +99,18 @@ pub struct HttpProvider {
     api_key: String,
     completion_model: String,
     embedding_model: String,
+    /// Built once, from the environment, in [`HttpProvider::new`].
+    ///
+    /// A `Result` in a field rather than a fallible constructor. Building it
+    /// reads a file that may not be there and parses a proxy URL that may not
+    /// be one, and both are worth refusing over -- but `new` is called from
+    /// four places including a config loader that has no better answer than
+    /// passing the error along, and every request already returns
+    /// `Result<_, ProviderError>` where a transport problem is exactly what a
+    /// caller is prepared for. So the failure is kept and returned by whichever
+    /// request comes first. In practice that is `rmem init`'s dimension probe,
+    /// which runs before anything is written.
+    agent: Result<ureq::Agent, ProviderError>,
 }
 
 impl HttpProvider {
@@ -106,13 +120,17 @@ impl HttpProvider {
         completion_model: String,
         embedding_model: String,
     ) -> Self {
+        // Stored without the trailing slash so `url` can join with exactly
+        // one. A config file will contain both spellings.
+        let base_url = base_url.trim_end_matches('/').to_string();
+        let agent = Network::from_env(|name| std::env::var(name).ok()).agent(&base_url);
+
         HttpProvider {
-            // Stored without the trailing slash so `url` can join with exactly
-            // one. A config file will contain both spellings.
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url,
             api_key,
             completion_model,
             embedding_model,
+            agent,
         }
     }
 
@@ -126,7 +144,16 @@ impl HttpProvider {
     /// possibly an issue tracker, and a key that reaches any of those has to be
     /// rotated.
     fn post(&self, path: &str, body: String) -> Result<String, ProviderError> {
-        let response = ureq::post(&self.url(path))
+        // Not `ureq::post`, which is a free function over a default agent that
+        // reads no environment: no proxy, and the compiled-in Mozilla roots
+        // whatever the machine is configured to trust.
+        let agent = match &self.agent {
+            Ok(agent) => agent,
+            Err(e) => return Err(e.clone()),
+        };
+
+        let response = agent
+            .post(&self.url(path))
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .set("Content-Type", "application/json")
             .send_string(&body);

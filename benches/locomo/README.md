@@ -49,9 +49,9 @@ asked. Scoring the rest would measure the turn budget rather than the store.
 answer is that it is unanswerable. Those are reported separately and never
 counted as retrieval failures — a store that surfaces nothing for them is right.
 
-## Two gaps this hit before it could run at all
+## Two gaps this hit before it could run at all — both now closed
 
-`rm-providers` cannot reach a network whose egress is a proxy:
+`rm-providers` could not reach a network whose egress is a proxy:
 
 - `ureq` 2's free functions (`ureq::post`) do not read `HTTPS_PROXY`. Only an
   `Agent` built with a `Proxy` does.
@@ -59,17 +59,28 @@ counted as retrieval failures — a store that surfaces nothing for them is righ
   `SSL_CERT_FILE`, so a proxy substituting its own certificate is rejected.
 
 Every corporate network and most CI sandboxes are one or both of those, so this
-is a real deployment limitation rather than a quirk of one machine. It is not
-this harness's to fix, so the harness takes `LOCOMO_BASE_URL` and
-`proxy-shim.py` goes in front:
+was a deployment limitation rather than a quirk of one machine. For most of this
+file's history the workaround was `proxy-shim.py`, a plain-HTTP forwarder on
+localhost with `LOCOMO_BASE_URL` pointing at it.
 
-```sh
-python3 benches/locomo/proxy-shim.py &          # honours HTTPS_PROXY and SSL_CERT_FILE
-LOCOMO_BASE_URL=http://127.0.0.1:8731/v1 cargo run --release ...
-```
+`rm_providers::network` fixed it, and the shim is gone. Measured on this
+machine, against the real `api.openai.com`, as a 2×2:
 
-The shim exists only for that reason and should be deleted when
-`rm-providers` learns to use a proxy.
+| | webpki roots | `SSL_CERT_FILE` bundle |
+|---|---|---|
+| direct | **fails** | works |
+| through the proxy | works | works |
+
+The failing cell is exactly what the old code did. Direct connections here are
+transparently intercepted and answered with a substituted certificate that no
+Mozilla root vouches for; the proxy's `CONNECT` tunnel instead carries end-to-end
+TLS to OpenAI, whose certificate the built-in roots do vouch for. So on this
+machine either half of the fix is sufficient on its own — which is luck, not
+design. A proxy that terminates TLS itself, which is the corporate norm and what
+the sandbox README describes, needs the CA half too.
+
+`LOCOMO_BASE_URL` survives the shim's deletion, because pointing the harness at
+a local model is worth being able to do for its own sake.
 
 ## A third gap, in the library rather than around it
 

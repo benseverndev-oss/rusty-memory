@@ -73,12 +73,13 @@ fn main() {
     let sample = &corpus.as_array().expect("a list of conversations")[which];
 
     let config = Config::from_template();
-    // Overridable because `rm-providers` cannot reach a network whose egress
-    // is a proxy: `ureq`'s free functions ignore `HTTPS_PROXY`, and its
-    // webpki-roots build ignores `SSL_CERT_FILE`, so a proxy substituting its
-    // own certificate is rejected. Both are real gaps for anyone behind a
-    // corporate proxy; neither is this harness's to fix, so it takes a base
-    // URL and a plain-HTTP forwarder goes in front.
+    // Overridable so the harness can be pointed at a local model, or at a
+    // recording, without editing the template.
+    //
+    // It used to exist for a worse reason: `rm-providers` read no proxy
+    // configuration at all, so every run went through `proxy-shim.py`, a
+    // forwarder on localhost. `rm_providers::network` reads the environment
+    // now and the shim is deleted.
     let base_url = std::env::var("LOCOMO_BASE_URL").unwrap_or(config.provider.base_url.clone());
     let provider = HttpProvider::new(
         base_url,

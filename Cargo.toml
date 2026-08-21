@@ -41,6 +41,12 @@ rm-mcp = { path = "crates/rm-mcp" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# Pinned to the versions `ureq` itself resolves, so the `ClientConfig` handed to
+# `AgentBuilder::tls_config` is the same type `ureq` expects rather than a
+# same-named type from a second copy of the crate.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 toml = "0.8"
 
 [profile.release]
