@@ -31,11 +31,24 @@ pub struct MentionLanding {
 }
 
 /// One open question, as a caller sees it.
+///
+/// Carries what each side is *called*, not just its id. "review 4: entity 3 vs
+/// entity 11 (5.03 bits)" is not a question anyone can answer -- answering it
+/// meant running `about` twice per pair first, which is enough friction that
+/// the queue goes unread, and an unread queue is the same as no queue.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReviewLine {
     pub id: ReviewId,
     pub a: StableId,
     pub b: StableId,
+    /// What `a` resolved on, when it still has an identity to read.
+    pub a_name: Option<String>,
+    pub b_name: Option<String>,
+    /// What each side is, which is often the whole answer: measured on a real
+    /// corpus, about half the band pairs an entity with one of a different
+    /// kind, and "a person and a place" settles the question on sight.
+    pub a_kind: String,
+    pub b_kind: String,
     pub score: f64,
 }
 
@@ -207,17 +220,40 @@ pub fn about(
         .map_err(|e| HostError::Refused(e.to_string()))
 }
 
+/// What an entity currently says it is.
+///
+/// The kind is stored as an ordinary attribute -- `ingest` asserts it like any
+/// other fact -- so reading it means reading the latest version, not a field.
+fn kind_of(engine: &Engine, entity: StableId) -> String {
+    engine
+        .store_history(entity, "kind")
+        .last()
+        .and_then(|v| v.value.clone())
+        .unwrap_or_else(|| "?".to_string())
+}
+
 /// The open questions.
 pub fn review_list(engine: &Engine) -> Result<Outcome, HostError> {
     Ok(Outcome::Reviews(
         engine
             .pending_review()
             .into_iter()
-            .map(|p| ReviewLine {
-                id: p.id,
-                a: p.a,
-                b: p.b,
-                score: p.score,
+            .map(|p| {
+                let name = |e| {
+                    engine
+                        .identity_of(e)
+                        .and_then(|r| r.get("name").map(str::to_string))
+                };
+                ReviewLine {
+                    id: p.id,
+                    a: p.a,
+                    b: p.b,
+                    a_name: name(p.a),
+                    b_name: name(p.b),
+                    a_kind: kind_of(engine, p.a),
+                    b_kind: kind_of(engine, p.b),
+                    score: p.score,
+                }
             })
             .collect(),
     ))
@@ -546,6 +582,41 @@ mod tests {
         assert!(
             lines[0].score > 0.0,
             "a review pair has real evidence behind it"
+        );
+    }
+
+    #[test]
+    fn a_review_line_says_what_the_two_entities_are_called_and_what_they_are() {
+        let mut e = engine();
+        let a = StubProvider::new(vec![
+            r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"}],
+                "facts":[],"relations":[],"closures":[]}"#,
+        ]);
+        remember(&mut e, "Ben", 100, "cli", None, &a, &a).unwrap();
+        let b = StubProvider::new(vec![
+            r#"{"mentions":[{"kind":"person","name":"Ben Sanderson","text":"Ben"}],
+                "facts":[],"relations":[],"closures":[]}"#,
+        ]);
+        remember(&mut e, "Ben again", 200, "cli", None, &b, &b).unwrap();
+
+        let Outcome::Reviews(lines) = review_list(&e).unwrap() else {
+            panic!()
+        };
+        let line = &lines[0];
+        // The names are the question. Without them the line asks whether two
+        // integers are the same thing, which nobody can answer.
+        let mut names = [line.a_name.clone(), line.b_name.clone()];
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                Some("Ben Sanderson".to_string()),
+                Some("Ben Severn".to_string())
+            ]
+        );
+        assert_eq!(
+            (line.a_kind.as_str(), line.b_kind.as_str()),
+            ("person", "person")
         );
     }
 }

@@ -134,7 +134,10 @@ fn main() {
         })
         .collect();
     let prompts: Vec<String> = prepared.iter().map(rm_extract::prompt).collect();
-    eprintln!("  pre-fetching {} extractions on {workers} threads ...", prompts.len());
+    eprintln!(
+        "  pre-fetching {} extractions on {workers} threads ...",
+        prompts.len()
+    );
     let started = std::time::Instant::now();
     cache::prewarm(&prompts, &provider, &cache, workers);
     eprintln!("  extraction pass took {:.1?}", started.elapsed());
@@ -240,6 +243,55 @@ fn main() {
     println!("\nrefusals by shape:");
     for (why, n) in &shapes {
         println!("  {n:>3}x {why}");
+    }
+
+    // What the band actually holds, not just how many pairs are in it.
+    //
+    // "review band 62 pairs" is the least informative number this harness
+    // prints. Sixty-two questions a person would answer "yes, same" to means
+    // resolution is working and the band is a queue; sixty-two it would answer
+    // "those are not remotely alike" to means the band is noise, and a queue
+    // nobody can face is worse than no queue. The count reads identically
+    // either way, so print the pairs.
+    //
+    // Each line carries both kinds because a pair whose kinds differ is one
+    // resolution should not have raised: `Record` holds only `name`, so a
+    // person and a place are compared on their names alone and nothing
+    // downweights the fact that one is a person and the other is a place.
+    let mut band: Vec<_> = engine
+        .pending_review()
+        .into_iter()
+        .map(|r| {
+            let name = |e| {
+                engine
+                    .identity_of(e)
+                    .and_then(|rec| rec.get("name").map(str::to_string))
+            };
+            let kind = |e: rm_engine::StableId| {
+                engine
+                    .store_history(e, "kind")
+                    .last()
+                    .and_then(|v| v.value.clone())
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            (
+                r.score,
+                name(r.a).unwrap_or_default(),
+                kind(r.a),
+                name(r.b).unwrap_or_default(),
+                kind(r.b),
+            )
+        })
+        .collect();
+    band.sort_by(|x, y| y.0.total_cmp(&x.0).then_with(|| x.1.cmp(&y.1)));
+    let mismatched = band.iter().filter(|(_, _, ka, _, kb)| ka != kb).count();
+    println!(
+        "\nreview band, every pair ({} of {} disagree on kind):",
+        mismatched,
+        band.len()
+    );
+    for (score, a, ka, b, kb) in &band {
+        println!("  {score:5.2}  {a:?} [{ka}]  ~  {b:?} [{kb}]");
     }
 
     // ---- retrieval ---------------------------------------------------------

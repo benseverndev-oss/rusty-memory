@@ -104,9 +104,19 @@ pub fn render(outcome: &Outcome) -> String {
         Outcome::Reviews(lines) => {
             let mut out = String::new();
             for l in lines {
+                // Name and kind on the line itself. The pair is a question, and
+                // a question whose subjects are two integers cannot be answered
+                // without two more commands per pair.
+                let side = |name: &Option<String>, id, kind: &str| match name {
+                    Some(n) => format!("{n:?} [{kind}] (entity {id})"),
+                    None => format!("entity {id} [{kind}]"),
+                };
                 out.push_str(&format!(
-                    "review {}  entity {} vs entity {}  ({:.2} bits)\n",
-                    l.id, l.a, l.b, l.score
+                    "review {}  {}  vs  {}  ({:.2} bits)\n",
+                    l.id,
+                    side(&l.a_name, l.a, &l.a_kind),
+                    side(&l.b_name, l.b, &l.b_kind),
+                    l.score
                 ));
             }
             out
