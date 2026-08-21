@@ -212,3 +212,71 @@ Two runs of one conversation with one model. Retrieval is not the quantity
 LoCoMo's published baselines report, so the numbers must not be read against
 them.
 
+
+## Third run: salvage, conversation 0, 419 turns
+
+Same corpus and model, after `rm-extract` learned to drop the offending item
+instead of refusing the turn (and after the prompt change that preceded it).
+
+| | before the prompt change | prompt, no salvage | prompt + salvage |
+|---|---:|---:|---:|
+| turns ingested | 381 | 284 | **389** |
+| turns refused | 38 (9.1%) | 135 (32%) | **30 (7.2%)** |
+| entities | 138 | 89 | 92 |
+| review band | 95 | 38 | 48 |
+| relations | 16 | 15 | **15** |
+| **overall recall@10** | 0.289 | 0.342 | **0.376** |
+| temporal | 0.486 | 0.405 | 0.486 |
+| single-hop | 0.229 | 0.386 | 0.371 |
+| multi-hop | 0.258 | 0.194 | 0.226 |
+| open-domain | 0.091 | 0.273 | 0.455 |
+
+### Salvage did what it was predicted to
+
+The prediction was that refusals would fall to around 26 — the count of
+responses that were not JSON at all, the one shape with no parsed half to keep.
+They fell to 30, of which **28 are exactly that shape**. The rest of the 135
+became per-item drops on turns that were otherwise kept.
+
+The overall retrieval figure is the one worth reading. It was stable to within
+0.006 across two identical runs, so a move from 0.289 to 0.376 is well outside
+that noise. The per-category figures still are not: they swung 7 to 18 points
+between identical runs, and open-domain has 11 questions in it.
+
+### And it made the real problem visible instead of fatal
+
+239 items were dropped from turns that were otherwise kept:
+
+```
+178x  fact -- it names mention 0, but the response listed 0
+ 49x  fact -- invalid type: boolean `true`, expected a string
+  6x  relation -- it runs from mention 0 to itself
+  4x  fact -- an integer where a string belongs
+  2x  relation -- it names mention 2, but the response listed 2
+```
+
+**The prompt regression is still entirely present.** 178 facts naming a mention
+that was not listed is the same failure that cost 76 whole turns before; salvage
+converted a catastrophic loss into a large contained one, and did not fix it.
+The prompt still tells the model to stop emitting mentions for unnamed groups
+without saying what to do with the facts that referred to them.
+
+The 49 booleans are a second, independent shape: a yes/no-flavoured attribute
+answered `true` rather than `"true"`. Neither is addressed yet.
+
+### Relations have now not moved four times
+
+17, 16, 15, 15 — across a prompt change that explicitly told the model to prefer
+a relation over a possessive, and a salvage change that stopped relations being
+discarded with their turns. Six were dropped this run for running from a mention
+to itself, which is not enough to explain anything.
+
+The possessive theory is dead. Whatever starves `rm-graph`, none of the work so
+far has touched it, and no further guess should be reported as a diagnosis
+before it is measured.
+
+### Speed
+
+The extraction pass took **68 seconds**, against roughly twelve minutes in
+series. The cache holds 419 completions and 364 embeddings, so a re-run that
+does not change the prompt pays for neither.
