@@ -171,9 +171,20 @@ pub fn render(outcome: &Outcome) -> Rendered {
         Outcome::Reviews(lines) => {
             let mut text = format!("{} open question(s), nothing merged:\n", lines.len());
             for l in lines {
+                // A model deciding this needs the same thing a person does:
+                // what the two are called and what they are. Two ids and a
+                // score are not enough to answer on, and a caller that cannot
+                // answer will either guess or ignore the queue.
+                let side = |name: &Option<String>, id, kind: &str| match name {
+                    Some(n) => format!("{n:?} [{kind}] (entity {id})"),
+                    None => format!("entity {id} [{kind}]"),
+                };
                 text.push_str(&format!(
-                    "  review {}: entity {} against entity {} ({:.2} bits of evidence)\n",
-                    l.id, l.a, l.b, l.score
+                    "  review {}: {} against {} ({:.2} bits of evidence)\n",
+                    l.id,
+                    side(&l.a_name, l.a, &l.a_kind),
+                    side(&l.b_name, l.b, &l.b_kind),
+                    l.score
                 ));
             }
             Rendered {
@@ -181,7 +192,11 @@ pub fn render(outcome: &Outcome) -> Rendered {
                 structured: json!({"reviews": lines.iter().map(|l| json!({
                     "id": l.id,
                     "a": l.a,
+                    "a_name": l.a_name,
+                    "a_kind": l.a_kind,
                     "b": l.b,
+                    "b_name": l.b_name,
+                    "b_kind": l.b_kind,
                     "score": l.score,
                 })).collect::<Vec<_>>()}),
             }
@@ -432,11 +447,22 @@ mod tests {
             id: 4,
             a: 1,
             b: 2,
+            a_name: Some("Mel".to_string()),
+            b_name: Some("Melanie".to_string()),
+            a_kind: "person".to_string(),
+            b_kind: "person".to_string(),
             score: 4.98,
         }]));
         assert!(out.text.contains("review 4"), "{}", out.text);
         assert!(out.text.contains("4.98"), "{}", out.text);
         assert_eq!(out.structured["reviews"][0]["id"], json!(4));
+        // The evidence is the pair, not the ids: a caller must be able to see
+        // that this asks whether "Mel" and "Melanie" are one person.
+        assert!(out.text.contains("Mel"), "{}", out.text);
+        assert!(out.text.contains("Melanie"), "{}", out.text);
+        assert!(out.text.contains("person"), "{}", out.text);
+        assert_eq!(out.structured["reviews"][0]["a_name"], json!("Mel"));
+        assert_eq!(out.structured["reviews"][0]["b_kind"], json!("person"));
     }
 
     #[test]

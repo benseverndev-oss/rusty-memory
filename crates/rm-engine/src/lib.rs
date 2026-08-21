@@ -714,6 +714,19 @@ impl Engine {
         self.review.values().collect()
     }
 
+    /// The identity fields an entity resolved on.
+    ///
+    /// Exists because [`pending_review`](Self::pending_review) returns two ids
+    /// and a score, and nobody can answer "are entity 3 and entity 11 the same"
+    /// from that. The question is only askable if the asker can see what the
+    /// two entities are called -- which is exactly this record, the one
+    /// resolution scored to raise the question in the first place.
+    ///
+    /// Returns `None` for an id no entity holds.
+    pub fn identity_of(&self, entity: StableId) -> Option<&Record> {
+        self.identity.get(&entity)
+    }
+
     /// Create an entity and register its identity fields.
     fn create_entity(&mut self, obs: &Observation) -> StableId {
         let id = self
@@ -2549,6 +2562,23 @@ mod tests {
             Err(EngineError::UnknownEntity(9999)),
             "the write path names the missing entity itself, not through a wrapper"
         );
+    }
+
+    #[test]
+    fn identity_of_names_a_review_pair_and_is_none_for_an_id_nothing_holds() {
+        let mut e = engine();
+        let obs = observation("Ben Severn", "employer", "Globex", 100);
+        let id = match e.remember(obs).unwrap() {
+            Remembered::Created { entity, .. } => entity,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            e.identity_of(id).and_then(|r| r.get("name")),
+            Some("Ben Severn")
+        );
+        // An id nothing holds is an absence, not a panic and not a blank
+        // record: a caller rendering a review needs to tell those apart.
+        assert!(e.identity_of(id + 999).is_none());
     }
 
     #[test]

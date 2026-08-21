@@ -158,7 +158,7 @@ pub fn prewarm(prompts: &[String], provider: &HttpProvider, cache: &Cache, worke
                     let Some(prompt) = prompts.get(i) else { return };
                     let _ = cached.complete(prompt);
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n % 50 == 0 {
+                    if n.is_multiple_of(50) {
                         eprintln!("  extracted {n}/{}", prompts.len());
                     }
                 }

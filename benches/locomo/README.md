@@ -489,3 +489,97 @@ Every earlier section reasoned from run metrics and got two hypotheses wrong.
 This one came from `analyse-cache.py` reading what the model actually said, and
 the answer — 45% of responses listing nothing — was not a quantity any run
 metric reported. Structural counts first, metrics second.
+
+## The review band, read at last
+
+The previous section ended by saying the band's contents were "a question for
+the store, which each run writes, and it has not been asked yet". This asks it,
+over four written stores: the three speaker runs and one further run.
+
+The answer is that the band is mostly noise. Roughly three quarters of the
+pairs are ones resolution should never have raised.
+
+| store | pairs | kinds differ | possessive | both start a stopword | union |
+|---|---|---|---|---|---|
+| speaker run 1 | 66 | 37 (56%) | 9 (14%) | 13 (20%) | 47 (71%) |
+| speaker run 2 | 56 | 28 (50%) | 10 (18%) | 8 (14%) | 41 (73%) |
+| speaker run 3 | 65 | 36 (55%) | 10 (15%) | 5 (8%) | 46 (71%) |
+| instrumented run | 99 | 57 (58%) | 12 (12%) | 21 (21%) | 74 (75%) |
+
+Four runs, four different band sizes, and the proportion barely moves: 71–75%.
+
+### Why, mechanically
+
+`Engine::ingest` resolves a mention on `Record::new().with("name", ...)` — one
+field, scored by `jaro_winkler`, at `m = 0.9` and `u = 0.01`. Those probabilities
+give agreement a weight of `log2(0.9/0.01)` = +6.49 bits and disagreement
+`log2(0.1/0.99)` = −3.31, and `Ruleset::score` interpolates between them, so the
+score is `-3.31 + 9.80 * similarity` and nothing else. Inverting it: the band —
+4.0 to 6.0 bits — is exactly name similarity 0.746 to 0.950.
+
+So every question in the queue is "these two strings are between 75% and 95%
+alike". Three things land in that window that are not near-duplicate names:
+
+- **Different kinds** (50–58%). `"the agency" [organisation] ~ "the beach" [place]`,
+  `"the kids" [person] ~ "the book" [work]`, `"mentee" [person] ~ "mentors" [thing]`.
+  The kind is *recorded on every entity* — `ingest` asserts it as an attribute —
+  and resolution never sees it, because the `Record` holds only `name`.
+- **Possessives** (12–18%). `"Melanie" ~ "Melanie's son"`,
+  `"Caroline" ~ "Caroline's dad"`, `"you" ~ "your son"`. A name of the form
+  *X's Y* contains all of X, so Jaro-Winkler scores it high, and the Winkler
+  prefix bonus is precisely a bonus for that shared prefix. These are guaranteed
+  non-matches — an entity named by its relation to X is definitionally not X.
+- **Shared leading stopword** (8–21%). `"the beach" ~ "the book"`,
+  `"Pride fest" ~ "priceless items"`. `[[resolution.blocking]] prefix n = 3`
+  buckets every name beginning "the" together — "the" is three characters — and
+  Winkler then rewards the same prefix a second time in the score.
+
+The largest blocking buckets in these stores are `lgb` (10–12 entities), `the`
+(6–10) and `mel` (5–6). A bucket of 12 is 66 comparisons among things whose only
+established commonality is three characters.
+
+### The obvious fix is a trap
+
+`kind` is right there, so adding it as a second field looks like a one-line
+config change. Measured against the real comparator (`Ruleset::score`, not
+arithmetic on paper), with `Exact`, `m = 0.9` and `u = 0.38` — `u` estimated from
+these stores as the rate at which two *blocked* entities happen to share a kind:
+
+| pair | name only | with kind |
+|---|---|---|
+| `"the agency" [organisation] ~ "the beach" [place]` | 5.19 Review | 2.56 NonMatch |
+| `"the kids" [person] ~ "the book" [work]` | 5.02 Review | 2.39 NonMatch |
+| `"Mel" [person] ~ "Melanie" [person]` | 5.19 Review | 6.43 **Match** |
+| `"Caroline" [person] ~ "Caroline's dad" [person]` | 5.74 Review | 6.98 **Match** |
+| `"Melanie" [person] ~ "Melanie's son" [person]` | 5.68 Review | 6.92 **Match** |
+
+It clears out the kind-mismatch half exactly as intended. It also promotes the
+possessive pairs — which are same-kind, person against person — from a question
+someone would have answered "no" into a silent automatic merge. Caroline would
+be merged with her father.
+
+That is worse than the noise it removes. A cluttered queue wastes attention; a
+false merge corrupts the store and there is no signal that it happened. So the
+kind field cannot ship on its own: it needs the possessive case handled first,
+and that belongs either in extraction (which already forbids possessive names
+and does not achieve it) or in a comparator that treats *X's Y* as disqualifying
+rather than as 90% similar.
+
+Both are real changes with their own measurements to make. Neither is made here.
+
+### What this run does change
+
+Two things, both about being able to see the band rather than about resolution:
+
+- The harness prints every pair with both names and both kinds, and counts the
+  kind disagreements. `review band 99 pairs` reads identically whether the queue
+  is a working backlog or garbage; the pairs do not.
+- `rmem review` and the MCP `review` tool print the names and kinds too. They
+  used to emit `review 0  entity 0 vs entity 3  (5.19 bits)`, which is not a
+  question anyone can answer — it cost two `about` calls per pair to find out
+  what was even being asked. It now reads
+  `review 0  "Melanie" [person] (entity 0)  vs  "Mel" [person] (entity 3)`.
+
+The second is the more useful of the two. The review band is the project's
+answer to "refuse rather than guess", and the refusal was being handed over in a
+form nobody could act on.
