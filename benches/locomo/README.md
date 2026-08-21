@@ -83,74 +83,132 @@ pipeline nobody would deploy. That means **its numbers are an upper bound on
 what `rmem` and `rmem-mcp` can currently do** on dialogue, not a measurement of
 them.
 
-## First run: conversation 0, 419 turns
+## Two runs: conversation 0, 419 turns
 
-`gpt-4o-mini` extraction, `text-embedding-3-small`, 2026-08-21.
+`gpt-4o-mini` extraction, `text-embedding-3-small`, 2026-08-21. Same input,
+same config, two runs — reported together because the difference between them
+is itself a result.
 
 ### Ingestion
 
-| | |
-|---|---:|
-| turns ingested | 379 |
-| turns refused | 40 (9.5%) |
-| entities | 148 |
-| assertions | 543 |
-| relations | **17** |
-| review band | **117 pairs** (27.9 per 100 turns) |
+| | run 1 | run 2 |
+|---|---:|---:|
+| turns ingested | 379 | 381 |
+| turns refused | 40 (9.5%) | 38 (9.1%) |
+| entities | 148 | 138 |
+| assertions | 543 | 554 |
+| relations | **17** | **16** |
+| review band | 117 | 95 |
 
 ### Retrieval, recall@10 against LoCoMo evidence turns
 
-| category | | |
-|---|---:|---:|
-| **overall** | 44/149 | **0.295** |
-| temporal | 15/37 | 0.405 |
-| single-hop | 21/70 | 0.300 |
-| open-domain | 3/11 | 0.273 |
-| multi-hop | 5/31 | 0.161 |
+| category | n | run 1 | run 2 |
+|---|---:|---:|---:|
+| **overall** | 149 | **0.295** | **0.289** |
+| temporal | 37 | 0.405 | 0.486 |
+| single-hop | 70 | 0.300 | 0.229 |
+| multi-hop | 31 | 0.161 | 0.258 |
+| open-domain | 11 | 0.273 | 0.091 |
 
-Adversarial: 11 of 47 surfaced something for a question the conversation does
-not answer; 36 correctly surfaced nothing.
+Adversarial: 11 then 7 of 47 surfaced something for a question the conversation
+does not answer.
 
-### What this says
+### Single-run category numbers do not replicate
 
-**Retrieval is weak, and the shape of the weakness is diagnosable.**
+The overall figure is stable to within 0.006. Every category moved by 7 to 18
+points on identical input, and two of them changed rank: run 1 said multi-hop
+was the worst category at 0.161, run 2 says it is 0.258 and single-hop is worst.
 
-**Temporal is the strongest category.** That is the thesis doing what it was
-built for: questions about when something was true are exactly where a
-bi-temporal store should beat a flat vector index, and it is the one category
-above 0.4. It is the only encouraging number here and it is a real one.
+The first run of this harness was reported with a per-category reading built on
+exactly that. **It was not a finding.** With 11 to 70 questions in a bucket and
+a non-deterministic extractor upstream, one run cannot separate a category from
+noise, and the honest floor for any claim at this granularity is several runs
+with the spread shown.
 
-**Multi-hop is the worst, and 17 relations explains it.** Four hundred turns of
-two people discussing their lives produced seventeen relationships. There is
-essentially no graph, so there is nothing to hop over, and `rm-graph` — a whole
-crate — is being fed almost nothing. Extraction is not finding relations.
+What survives both runs: overall retrieval near 0.29, and **temporal as the
+strongest category** — the only one above 0.4 in either run, and the one the
+bi-temporal store exists to serve. That one is worth believing. The rest of the
+table is not yet evidence of anything.
 
-**148 entities is too many.** Two named speakers across nineteen sessions;
-even counting every person, place, employer and pet, this should be a few dozen.
-Together with 117 review pairs — nearly one per entity — the likely reading is
-that resolution is *under*-merging: the same person arriving repeatedly as new
-entities, each near-duplicate then generating review questions. That is an
-inference from two aggregates, not a measurement, which is why the harness now
-writes its store: the next run can confirm or refute it by looking.
+### What the store actually contains
 
-**The review band is impractical at this rate.** 117 questions for a human, from
-one conversation. The band is not dead — it fires on real ambiguity — but at
-27.9 per 100 turns it is asking more than anyone will answer. If the
-under-merging reading is right, most of these are the same question about the
-same person, and fixing resolution shrinks this without touching the thresholds.
+Run 2 wrote its store, so the aggregates could be explained rather than
+inferred. The explanation contradicts the inference drawn from run 1.
 
-**9.5% of turns were dropped.** The refusals are correct — they are the
-discipline working — but a tenth of a real conversation never entering the store
-is a quality problem, not a robustness success. The dominant shape is the model
-naming a mention index that does not exist.
+**Resolution is not the problem.** Run 1's reading was that 148 entities and 117
+review pairs meant the resolver was under-merging the same person repeatedly.
+It is not: `Caroline` is one entity with 184 assertions, `Melanie` one with 111,
+and there are zero duplicate names across all 138 entities.
+
+**Extraction is emitting relationships as entity names.** The review band asks
+about these:
+
+```
+5.59  'Melanie'      vs  "Melanie's kids"
+5.45  'Melanie'      vs  "Melanie's family"
+5.34  'Melanie'      vs  "Melanie's children"
+5.39  "Melanie's family" vs "Melanie's kids"
+5.68  'camping'      vs  'camping site'
+5.39  'pottery'      vs  'pottery workshop'
+5.05  'LGBTQ support group' vs 'LGBTQ+'
+```
+
+`Melanie`, `Melanie's family`, `Melanie's kids`, `Melanie's children` and
+`Melanie's son` are five separate entities generating review pairs against each
+other. The resolver is being asked "are these the same entity?" about things
+whose true relationship is *possession* — and its answer, "I cannot tell", is
+correct. The question is wrong.
+
+**This is also why there are 16 relations.** A possessive is a relationship, and
+extraction is encoding it in a name instead of emitting it as a relation.
+`Melanie's son` should be an edge from Melanie to a person; instead it is an
+entity literally called "Melanie's son". `rm-graph` is starved because the
+relations are being spent on entity names.
+
+So one chain produces three of the four bad numbers:
+
+1. extraction emits possessive and compound noun phrases as entity names
+2. those names share tokens with the real entity, so the resolver scores them
+   as near-matches
+3. near-matches land in the review band
+4. and the relationship they encode is never emitted as a relation
+
+138 entities, 95 review pairs and 16 relations are one bug, not three.
+
+**A real and separate resolution gap.** `Melanie` vs `Mel` (5.19) and `Caroline`
+vs `Caro` (5.51) are true matches the resolver missed — `Mel` is its own entity
+with 29 assertions that belong to Melanie. Nicknames are exactly what the
+deferred phonetic comparison is for. Small next to the extraction problem: two
+pairs of ninety-five.
+
+**Entity kinds are invented freely.** `abstract`, `concept`, `thing`, `object`,
+`item`, `value`, `symbol` and `process` are eight near-synonymous kinds holding
+23 entities between them. Nothing constrains the vocabulary.
+
+**Refusals, by shape** (run 2, 38 of 419 turns):
+
+```
+16x  the model's response was not the JSON this crate asked for
+14x  a fact names mention 0, but the response listed 0
+ 6x  a field was the wrong JSON type (boolean, integer, null, sequence for a string)
+ 1x  a relation runs from a mention to itself
+```
+
+Two thirds are the model failing to produce the requested shape at all. That is
+a prompt and schema problem, not a parser problem.
+
+### Where this points
+
+Fix extraction first. It is upstream of the entity count, the review-band load
+and the empty relation graph, and no threshold change touches any of them.
+Resolution is working on the cases it is given.
 
 ### What this does not say
 
 These numbers came from a pipeline that sets the speaker, which `rmem` and
-`rmem-mcp` cannot do. They are an upper bound on the shipped tools, not a
-measurement of them.
+`rmem-mcp` cannot. They are an upper bound on the shipped tools.
 
-One conversation, one model, one run. Nothing here is a published-baseline
-comparison: LoCoMo's own baselines answer questions, and this measures
-retrieval, so the numbers are not the same quantity and must not be read
-against each other.
+Two runs of one conversation with one model. Retrieval is not the quantity
+LoCoMo's published baselines report, so the numbers must not be read against
+them.
+
