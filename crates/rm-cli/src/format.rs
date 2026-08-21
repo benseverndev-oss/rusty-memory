@@ -18,6 +18,7 @@ pub fn render(outcome: &Outcome) -> String {
             ingested,
             landings,
             relations,
+            dropped,
         } => {
             // The counts the spec's worked example shows, and the three it
             // shows: mentions, facts, relationships. `assertions` is not one
@@ -53,6 +54,17 @@ pub fn render(outcome: &Outcome) -> String {
                         named(c.object, landings),
                         c.because
                     ));
+                }
+            }
+            // Its own heading, for the same reason closures get one: this is
+            // the turn saying less than the model described, and a reader who
+            // cannot see it has no way to tell that from a turn that said
+            // less. `extract` salvages instead of refusing precisely because
+            // this line exists.
+            if !dropped.is_empty() {
+                out.push_str("not remembered from this turn:\n");
+                for d in dropped {
+                    out.push_str(&format!("  {} {} — {}\n", d.what, d.index, d.why));
                 }
             }
             if !ingested.reviews.is_empty() {
@@ -145,6 +157,7 @@ mod tests {
     // it more worth keeping, not less: nothing on the `rm-host` side can see
     // this text at all.
     use rm_engine::{Engine, Metric, VectorIndex};
+    use rm_host::command::Dropped;
     use rm_host::command::Outcome as HostOutcome;
     use rm_host::testing::StubProvider;
 
@@ -289,6 +302,7 @@ mod tests {
             ingested,
             landings,
             relations: 1,
+            dropped: Vec::new(),
         });
 
         // Tied to the entity, not merely present anywhere in the output.
@@ -353,6 +367,7 @@ mod tests {
             ingested,
             landings,
             relations: 0,
+            dropped: Vec::new(),
         });
         assert!(text.contains('4'), "the id has to be actionable: {text}");
         assert!(text.to_lowercase().contains("review"), "{text}");
@@ -371,5 +386,59 @@ mod tests {
     fn an_empty_recall_says_so_rather_than_printing_nothing() {
         let text = render(&Outcome::Recalled(vec![]));
         assert!(!text.trim().is_empty(), "silence is not an answer");
+    }
+
+    #[test]
+    fn what_was_not_remembered_is_printed_under_its_own_heading() {
+        // Kept apart from the facts for the same reason closures are: this is
+        // the turn having said less than the model described, and a reader who
+        // cannot see it has no way to tell that from a turn that said less.
+        let text = render(&Outcome::Remembered {
+            ingested: Ingested {
+                entities: vec![0],
+                assertions: vec![0, 1],
+                reviews: vec![],
+                closed: vec![],
+            },
+            landings: vec![MentionLanding {
+                name: "Ben Severn".into(),
+                entity: 0,
+                was_new: true,
+            }],
+            relations: 0,
+            dropped: vec![Dropped {
+                what: "fact",
+                index: 1,
+                why: "it names mention 9, but the response listed 1".to_string(),
+            }],
+        });
+        assert!(text.contains("not remembered from this turn:"), "{text}");
+        assert!(text.contains("fact 1 — it names mention 9"), "{text}");
+        // And the turn's own content is still reported: the point is that both
+        // are true at once.
+        assert!(text.contains("Ben Severn"), "{text}");
+    }
+
+    #[test]
+    fn a_clean_turn_prints_no_such_heading() {
+        let text = render(&Outcome::Remembered {
+            ingested: Ingested {
+                entities: vec![0],
+                assertions: vec![0],
+                reviews: vec![],
+                closed: vec![],
+            },
+            landings: vec![MentionLanding {
+                name: "Ben Severn".into(),
+                entity: 0,
+                was_new: true,
+            }],
+            relations: 0,
+            dropped: Vec::new(),
+        });
+        assert!(
+            !text.contains("not remembered"),
+            "an empty list must say nothing at all: {text}"
+        );
     }
 }

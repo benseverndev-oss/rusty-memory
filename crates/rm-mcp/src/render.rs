@@ -28,6 +28,7 @@ pub fn render(outcome: &Outcome) -> Rendered {
             ingested,
             landings,
             relations,
+            dropped,
         } => {
             // Mentions first, then facts: `Ingested::assertions` documents one
             // assertion per mention followed by one per fact, which is the
@@ -61,6 +62,17 @@ pub fn render(outcome: &Outcome) -> Rendered {
                     ));
                 }
             }
+            // Under its own heading, as the closures are, and for a sharper
+            // reason: the model on the other end of this is the one that wrote
+            // the turn. Told what was not kept and why, it can say the same
+            // thing again in a shape that is -- which is the whole point of
+            // returning the library's own words rather than a code.
+            if !dropped.is_empty() {
+                text.push_str("Not remembered from this turn:\n");
+                for d in dropped {
+                    text.push_str(&format!("  {} {} -- {}\n", d.what, d.index, d.why));
+                }
+            }
             if !ingested.reviews.is_empty() {
                 text.push_str(&format!(
                     "Open questions (nothing was merged): {}. Call reviews to see them.\n",
@@ -89,6 +101,11 @@ pub fn render(outcome: &Outcome) -> Rendered {
                         "because": c.because,
                     })).collect::<Vec<_>>(),
                     "reviews": ingested.reviews,
+                    "dropped": dropped.iter().map(|d| json!({
+                        "what": d.what,
+                        "index": d.index,
+                        "why": d.why,
+                    })).collect::<Vec<_>>(),
                 }),
             }
         }
@@ -355,6 +372,7 @@ mod tests {
             ingested,
             landings: vec![landing("Ben Severn", 0, false), landing("Globex", 1, true)],
             relations: 1,
+            dropped: Vec::new(),
         });
 
         let heading = out
@@ -388,6 +406,7 @@ mod tests {
             },
             landings: vec![landing("Ben Severn", 0, false), landing("Globex", 1, true)],
             relations: 0,
+            dropped: Vec::new(),
         });
         assert!(
             out.text.contains("Ben Severn -> entity 0 (recognised)"),
@@ -435,5 +454,60 @@ mod tests {
         // part: "crm" and "calendar" are different provenance, and collapsing
         // both to "external" would lose the only thing they carry.
         assert_eq!(source_name(&Source::External("crm".into())), "external:crm");
+    }
+
+    #[test]
+    fn what_was_not_remembered_reaches_both_halves_of_the_result() {
+        // Both, deliberately. This module's own rule is that anything true only
+        // of the structured half is, for a client that cannot read it, not
+        // said -- and the client here is a model that wrote the turn and could
+        // say it again in a shape that survives.
+        let out = render(&Outcome::Remembered {
+            ingested: Ingested {
+                entities: vec![0],
+                assertions: vec![0, 1],
+                reviews: vec![],
+                closed: vec![],
+            },
+            landings: vec![landing("Ben Severn", 0, true)],
+            relations: 0,
+            dropped: vec![rm_host::command::Dropped {
+                what: "fact",
+                index: 1,
+                why: "it names mention 9, but the response listed 1".to_string(),
+            }],
+        });
+        assert!(
+            out.text.contains("Not remembered from this turn:"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("fact 1 -- it names mention 9"),
+            "{}",
+            out.text
+        );
+        assert_eq!(out.structured["dropped"][0]["what"], json!("fact"));
+        assert_eq!(out.structured["dropped"][0]["index"], json!(1));
+
+        // What was kept is still reported: both are true at once.
+        assert!(out.text.contains("Ben Severn"), "{}", out.text);
+    }
+
+    #[test]
+    fn a_clean_turn_reports_nothing_dropped() {
+        let out = render(&Outcome::Remembered {
+            ingested: Ingested {
+                entities: vec![0],
+                assertions: vec![0],
+                reviews: vec![],
+                closed: vec![],
+            },
+            landings: vec![landing("Ben Severn", 0, true)],
+            relations: 0,
+            dropped: Vec::new(),
+        });
+        assert!(!out.text.contains("Not remembered"), "{}", out.text);
+        assert_eq!(out.structured["dropped"], json!([]));
     }
 }

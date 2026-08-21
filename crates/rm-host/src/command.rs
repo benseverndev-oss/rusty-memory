@@ -5,6 +5,15 @@ use std::path::{Path, PathBuf};
 use rm_engine::{Believed, Embedder, Engine, Ingested, Query, Recalled, ReviewId, StableId};
 use rm_extract::{Completer, Turn};
 
+/// Re-exported because [`Outcome::Remembered`] carries these and a host has to
+/// be able to name them.
+///
+/// `rm-cli` depends on this crate and `rm-engine`, and on nothing else — that
+/// narrowing is the point of `rm-host` existing. A host forced to add
+/// `rm-extract` to its manifest just to read a field of an `Outcome` this crate
+/// hands it would give that back.
+pub use rm_extract::Dropped;
+
 use crate::config::TEMPLATE;
 use crate::HostError;
 
@@ -46,6 +55,14 @@ pub enum Outcome {
         /// assertions, reviews and closures, but nothing about relations --
         /// `relate` returns no id -- and the spec's worked output counts them.
         relations: usize,
+        /// What the model described that `rm_extract` would not keep.
+        ///
+        /// Carried all the way to the surface on purpose. `extract` salvages a
+        /// turn rather than refusing it whole, and the only thing that makes
+        /// that defensible instead of silent data loss is that the loss is
+        /// reported. A field nothing renders would leave it silent for every
+        /// person actually using this, whatever the type says.
+        dropped: Vec<rm_extract::Dropped>,
     },
     Recalled(Vec<Recalled>),
     About(Believed),
@@ -134,6 +151,7 @@ pub fn remember(
         ingested,
         landings,
         relations: extraction.relations.len(),
+        dropped: extraction.dropped,
     })
 }
 
@@ -343,6 +361,33 @@ mod tests {
         assert_eq!(landings[0].name, "Ben Severn");
         assert!(landings[0].was_new, "the first turn creates everyone");
         assert_eq!(ingested.entities.len(), 2);
+    }
+
+    #[test]
+    fn remembering_carries_what_extraction_would_not_keep() {
+        // The wiring the whole salvage rests on. `rm_extract` drops a bad item
+        // instead of refusing the turn, which is only defensible because the
+        // drop is reported -- and a field that reaches `Outcome` but no
+        // further would be a report nobody receives.
+        let mut e = engine();
+        let stub = StubProvider::new(vec![
+            r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"I"}],
+                "facts":[{"subject":0,"attribute":"employer","value":"Globex","text":"Ben works at Globex","days_ago":null},
+                         {"subject":9,"attribute":"city","value":"London","text":"x","days_ago":null}],
+                "relations":[],"closures":[]}"#,
+        ]);
+        let out = remember(&mut e, "I work at Globex", 100, "cli", &stub, &stub).unwrap();
+
+        let Outcome::Remembered {
+            landings, dropped, ..
+        } = out
+        else {
+            panic!("{out:?}")
+        };
+        assert_eq!(landings.len(), 1, "the turn was kept, not refused");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].what, "fact");
+        assert!(dropped[0].why.contains("names mention 9"), "{}", dropped[0]);
     }
 
     #[test]

@@ -1,0 +1,16 @@
+[package]
+name = "locomo"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Runs rusty-memory over a real multi-session conversation corpus and reports what it does"
+
+[dependencies]
+rm-engine = { path = "../../crates/rm-engine" }
+rm-extract = { path = "../../crates/rm-extract" }
+rm-host = { path = "../../crates/rm-host" }
+rm-providers = { path = "../../crates/rm-providers" }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3

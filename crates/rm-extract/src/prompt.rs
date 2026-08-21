@@ -11,9 +11,55 @@ use crate::Turn;
 /// Public so a host can read it, log it, diff it across versions, or build a
 /// few-shot variant on top of it. The crate owning the contract does not mean
 /// the contract has to be a secret.
+///
+/// # What 1,165 real responses said
+///
+/// Reading the cached responses from a corpus run, rather than guessing from
+/// the counts they produced: **45% of responses listed no mentions at all**,
+/// 40% listed exactly one, and only 15% listed two or more.
+///
+/// That single number explains the two failures that had resisted every
+/// instruction. A relation names two mention indices, so only 15% of turns
+/// *could* carry one — and when the model did list two things it related them
+/// 26% of the time, which is not the problem. And 258 responses carried facts
+/// with no mentions at all, every sampled one of them about the speaker:
+///
+/// ```text
+/// subject=0  text="Melanie enjoys family camping trips"
+/// subject=0  text="Caroline went to a pride parade a few weeks ago"
+/// ```
+///
+/// The model was treating the speaker as an implicit mention 0 — writing
+/// `subject: 0` while listing nobody. Those were never the model ignoring an
+/// instruction; they were it assuming something the schema never granted.
+///
+/// So the speaker line now asks for the speaker *as a mention*. It had always
+/// said "resolve I, me and my to them", which tells the model who the pronouns
+/// mean and not that the person is a thing to list.
+///
+/// # A rule that was tried and removed
+///
+/// The commonest thing this prompt gets back is a fact whose `subject` names a
+/// mention the same response did not list — 178 of them in 419 turns. The
+/// obvious rule was added: *every fact\'s subject must be an index into
+/// mentions; if the turn has nothing worth listing, emit no facts either.*
+///
+/// It did nothing to the count (178 to 170) and cost 0.047 of overall recall,
+/// with facts stored falling from 574 to 498. Removing it recovered both. The
+/// reading that survives is that a model told to withhold facts when it is
+/// unsure has an easy way to comply, and it complies with the good ones too.
+///
+/// So the shape is still there and is handled where it can be handled without
+/// side effects: `extract` drops the unanchored fact and keeps the turn. Do not
+/// re-add the rule without measuring it — it has been measured once and it lost.
 pub fn prompt(turn: &Turn) -> String {
     let speaker = match &turn.speaker {
-        Some(name) => format!("The speaker is {name}. Resolve \"I\", \"me\" and \"my\" to them."),
+        Some(name) => format!(
+            "The speaker is {name}. Resolve \"I\", \"me\" and \"my\" to them, and list \
+             {name} in \"mentions\" whenever the turn says anything about them. A fact \
+             about the speaker needs a mention to point at, exactly like a fact about \
+             anyone else."
+        ),
         // Stated rather than omitted: a prompt with a blank where the speaker
         // should be reads as a template that failed to render, and a model will
         // fill it. Saying the speaker is unknown is an instruction.
@@ -21,7 +67,7 @@ pub fn prompt(turn: &Turn) -> String {
     };
 
     format!(
-        r#"Extract what this turn of dialogue says about people, organisations and places, as JSON.
+        r#"Extract what this turn of dialogue says about the people, organisations, places and other things it names, as JSON.
 
 {speaker}
 
@@ -50,19 +96,37 @@ Reply with only a JSON object of this shape, and nothing else:
 
 Rules:
 
-- "mentions" lists every distinct thing the turn refers to. "subject" and
-  "object" everywhere else are indices into it, starting at 0.
-- "kind" is what sort of thing it is: person, organisation, place, or another
-  word that fits.
+- "mentions" lists the things the turn refers to that could be recognised again
+  in a later turn. "subject" and "object" everywhere else are indices into it,
+  starting at 0.
+- "kind" must be exactly one of: person, organisation, place, event, work,
+  animal, thing. Use "thing" when none of the others fit. Do not use any other
+  word.
 - "name" is what to call it, used to recognise it again in later turns. Use the
   fullest form the turn gives.
+- A name must be able to identify something on its own. Do not emit a mention
+  whose name is built out of another mention's name: "Melanie's son" and "my
+  daughter" describe a relationship, not a name. If the turn also gives that
+  person's name, emit them as their own mention and a relation from Melanie to
+  them. If it does not, emit neither — there is nothing to recognise later.
+- Do not emit a mention for an unnamed group: "the kids", "my family",
+  "friends", "people at work". Say what the turn says about them as a fact
+  about someone who is named.
+- Do not emit a mention for an activity, a feeling or an idea: "camping",
+  "pottery", "self-care", "happiness". Those are facts about a person, not
+  things in their own right. "the pottery studio on Vine Street" is a place and
+  may be a mention; "pottery" is not.
 - "text" on a mention is the phrasing the turn used. "text" on a fact is a short
   sentence stating that fact on its own, because it is searched for separately.
-- "value" may be null to say an attribute has no value — "he is between jobs"
-  is a fact with a null value, not a missing fact.
+- "value" is a string, or null. Never a number and never true or false — write
+  "2" and "true" if those are the values. Null means the attribute has no
+  value: "he is between jobs" is a fact with a null value, not a missing fact.
 - "days_ago" is how long before now the thing began or ended, as a whole number
   of days, or null if it is happening now. It is never negative: nothing here
   is in the future. Do not output dates or timestamps.
+- "relations" is how two mentions stand to each other: employment, family,
+  membership, ownership. A possessive in the turn is usually a relation --
+  prefer one over inventing a mention that spells out the possession.
 - "closures" is for relationships that have ended. If the turn says someone
   started a new job, their previous employment ended: emit a closure naming the
   subject and the predicate, and say why in "because". Do not name what it
@@ -99,6 +163,24 @@ mod tests {
         // can be resolved against, and every turn invents a new person.
         let p = prompt(&turn("I started at Globex", Some("Ben Severn")));
         assert!(p.contains("Ben Severn"));
+    }
+
+    #[test]
+    fn the_prompt_asks_for_the_speaker_as_a_mention_not_just_as_a_referent() {
+        // Measured over 1,165 real responses: 45% listed no mentions at all,
+        // and 258 carried facts about the speaker with nobody listed to attach
+        // them to -- `subject: 0` against an empty list. The old line said
+        // "resolve I, me and my to them", which says who the pronouns mean and
+        // not that the person is a thing to list.
+        let p = prompt(&turn("I started at Globex", Some("Ben Severn")));
+        assert!(
+            p.contains("list Ben Severn in \"mentions\""),
+            "the speaker has to be asked for as a mention: {p}"
+        );
+        assert!(
+            p.contains("needs a mention to point at"),
+            "and the reason has to be given, or it reads as an aside"
+        );
     }
 
     #[test]
@@ -142,6 +224,102 @@ mod tests {
         }
     }
 
+    /// The kinds the prompt allows, in the order it lists them.
+    const KINDS: [&str; 7] = [
+        "person",
+        "organisation",
+        "place",
+        "event",
+        "work",
+        "animal",
+        "thing",
+    ];
+
+    #[test]
+    fn the_kind_vocabulary_is_closed_and_the_example_stays_inside_it() {
+        // A real consistency check rather than a substring assertion: the
+        // example is what a model copies, so an example using a kind the rules
+        // forbid teaches the opposite of what the rules say. This is the same
+        // failure the round-trip test below guards against, one level up.
+        let p = prompt(&turn("anything", None));
+        let example = crate::extract(&turn("anything", None), &Echo).expect("the example extracts");
+        for mention in &example.mentions {
+            assert!(
+                KINDS.contains(&mention.kind.as_str()),
+                "the example uses kind {:?}, which its own rules forbid",
+                mention.kind
+            );
+        }
+        for kind in KINDS {
+            assert!(p.contains(kind), "the prompt never lists the kind {kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_prompt_refuses_names_built_out_of_other_names() {
+        // The failure this rule exists for, measured on real dialogue: an
+        // extractor with no such rule emitted "Melanie", "Melanie's family",
+        // "Melanie's kids", "Melanie's children" and "Melanie's son" as five
+        // separate entities, which then generated review-band questions
+        // against each other. Their true relationship is possession, so the
+        // resolver was being asked the wrong question and correctly could not
+        // answer it. The same turns produced 16 relations across 419 turns,
+        // because the relationships were being spent on entity names.
+        let p = prompt(&turn("anything", None));
+        assert!(
+            p.contains("built out of another mention's name"),
+            "the prompt must forbid relationship-shaped names outright"
+        );
+        assert!(
+            p.contains("relations") && p.contains("possessive"),
+            "and must say where a possessive belongs instead"
+        );
+    }
+
+    #[test]
+    fn the_prompt_excludes_what_cannot_be_recognised_again() {
+        // Unnamed groups and bare activities were the other half of the 138
+        // entities one conversation produced: "the kids", "friends",
+        // "camping", "pottery". Nothing can resolve them to anything later,
+        // so each new turn makes another one.
+        let p = prompt(&turn("anything", None));
+        for forbidden in ["the kids", "camping", "pottery"] {
+            assert!(
+                p.contains(forbidden),
+                "the prompt should name {forbidden:?} as an example of what not to emit"
+            );
+        }
+        assert!(p.contains("recognised again"));
+    }
+
+    #[test]
+    fn the_prompt_does_not_tell_the_model_to_withhold_facts() {
+        // The rule that used to sit here told the model to emit no facts when
+        // it had no mentions. It did not reduce the unanchored facts it was
+        // aimed at (178 to 170) and it cost 0.047 of overall recall, because a
+        // model told to withhold when unsure withholds the good ones too. It is
+        // gone, and this is here so that adding it back is a deliberate act.
+        let p = prompt(&turn("anything", None));
+        assert!(
+            !p.contains("emit no facts either"),
+            "the withholding rule was measured and lost; see `prompt`'s documentation"
+        );
+    }
+
+    #[test]
+    fn the_prompt_says_a_value_is_a_string_or_null() {
+        // Measured: 49 facts answered a yes/no-flavoured attribute with the
+        // JSON literal `true`, and 4 more with a number. The schema has always
+        // wanted a string; the prompt never said so, and "may be null" reads as
+        // the only constraint on the field.
+        let p = prompt(&turn("anything", None));
+        assert!(p.contains("\"value\" is a string, or null"), "{p}");
+        assert!(
+            p.contains("never true or false"),
+            "the shape the model actually produced has to be named to be excluded"
+        );
+    }
+
     /// Find the JSON example embedded in the prompt's instructions.
     ///
     /// Panics rather than returning an empty string when the marker or a
@@ -174,29 +352,35 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_s_example_round_trips_through_the_wire_schema() {
+    fn the_prompt_s_example_round_trips_through_the_schema_that_reads_it() {
         // The substring test above catches a field added to the types and
         // never described, but a textual check cannot catch a field dropped
         // from the example while its prose sentence lingers, or one renamed to
-        // a word already present elsewhere. Parsing the example itself as the
-        // schema the parser actually reads catches both: a removed or renamed
-        // field fails to parse, or parses into the wrong shape.
-        let p = prompt(&turn("anything", None));
-        let json = example_json(&p);
-        let wire: crate::WireExtraction = serde_json::from_str(json)
-            .expect("the prompt's own example must parse as the wire schema it teaches");
+        // a word already present elsewhere. Running the example through
+        // `extract` catches both, and catches more than parsing it as the wire
+        // types did: since the wire lists became opaque values parsed one at a
+        // time, a field of the wrong type no longer fails the document -- it
+        // drops that item instead. So a renamed field would have shown up as a
+        // silently empty extraction under the old assertion, and shows up here.
+        let out = crate::extract(&turn("anything", None), &Echo)
+            .expect("the prompt's own example must survive the parser it teaches");
 
-        assert_eq!(wire.mentions.len(), 2);
-        assert_eq!(wire.mentions[0].name, "Alex Chen");
-        assert_eq!(wire.mentions[1].name, "Globex");
-        assert_eq!(wire.facts.len(), 1);
-        assert_eq!(wire.facts[0].attribute, "employer");
-        assert_eq!(wire.facts[0].value.as_deref(), Some("Globex"));
-        assert_eq!(wire.relations.len(), 1);
-        assert_eq!(wire.relations[0].predicate, "employed_by");
-        assert_eq!(wire.closures.len(), 1);
+        assert!(
+            out.dropped.is_empty(),
+            "the prompt's example must not teach a shape this crate discards: {:?}",
+            out.dropped
+        );
+        assert_eq!(out.mentions.len(), 2);
+        assert_eq!(out.mentions[0].name, "Alex Chen");
+        assert_eq!(out.mentions[1].name, "Globex");
+        assert_eq!(out.facts.len(), 1);
+        assert_eq!(out.facts[0].attribute, "employer");
+        assert_eq!(out.facts[0].value.as_deref(), Some("Globex"));
+        assert_eq!(out.relations.len(), 1);
+        assert_eq!(out.relations[0].predicate, "employed_by");
+        assert_eq!(out.closures.len(), 1);
         assert_eq!(
-            wire.closures[0].because,
+            out.closures[0].because,
             "starting a new job ends the previous one"
         );
     }
