@@ -103,6 +103,10 @@ fn main() {
     let mut refused: Vec<(String, String)> = Vec::new();
     let mut assertions = 0usize;
     let mut relations = 0usize;
+    // What `extract` kept the turn for but would not store. The whole argument
+    // for salvaging rather than refusing is that this is visible, so a run that
+    // did not report it would be assuming the thing it is meant to check.
+    let mut dropped: std::collections::BTreeMap<String, usize> = Default::default();
 
     for (i, turn) in turns.iter().take(total).enumerate() {
         if i % 25 == 0 {
@@ -120,13 +124,20 @@ fn main() {
         };
         match rm_engine::extract(&t, &provider) {
             Err(e) => refused.push((turn.id.clone(), e.to_string())),
-            Ok(extraction) => match engine.ingest(&t, &extraction, &provider) {
-                Err(e) => refused.push((turn.id.clone(), e.to_string())),
-                Ok(ingested) => {
-                    assertions += ingested.assertions.len();
-                    relations += extraction.relations.len();
+            Ok(extraction) => {
+                for d in &extraction.dropped {
+                    *dropped
+                        .entry(format!("{} -- {}", d.what, first_line(&d.why)))
+                        .or_default() += 1;
                 }
-            },
+                match engine.ingest(&t, &extraction, &provider) {
+                    Err(e) => refused.push((turn.id.clone(), e.to_string())),
+                    Ok(ingested) => {
+                        assertions += ingested.assertions.len();
+                        relations += extraction.relations.len();
+                    }
+                }
+            }
         }
     }
 
@@ -176,6 +187,12 @@ fn main() {
     for (_, why) in &refused {
         *shapes.entry(first_line(why)).or_default() += 1;
     }
+    let total_dropped: usize = dropped.values().sum();
+    println!("\nitems dropped from turns that were otherwise kept: {total_dropped}");
+    for (what, n) in dropped.iter().take(12) {
+        println!("  {n:>3}x {what}");
+    }
+
     println!("\nrefusals by shape:");
     for (why, n) in &shapes {
         println!("  {n:>3}x {why}");
@@ -186,11 +203,7 @@ fn main() {
     let mut scored: Vec<(u64, bool)> = Vec::new();
     let mut adversarial_hits = 0usize;
     let mut adversarial_total = 0usize;
-    let ingested_ids: BTreeSet<&str> = turns
-        .iter()
-        .take(total)
-        .map(|t| t.id.as_str())
-        .collect();
+    let ingested_ids: BTreeSet<&str> = turns.iter().take(total).map(|t| t.id.as_str()).collect();
 
     let questions = sample["qa"].as_array().cloned().unwrap_or_default();
     let mut asked = 0usize;
@@ -317,7 +330,11 @@ fn turns_of(sample: &Value) -> Vec<Line> {
             .and_then(Value::as_str)
             .and_then(parse_when)
             .unwrap_or(0);
-        for turn in obj[&format!("session_{n}")].as_array().into_iter().flatten() {
+        for turn in obj[&format!("session_{n}")]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
             let (Some(id), Some(speaker), Some(text)) = (
                 turn["dia_id"].as_str(),
                 turn["speaker"].as_str(),

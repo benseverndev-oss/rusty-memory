@@ -120,6 +120,40 @@ pub struct Extraction {
     pub facts: Vec<Fact>,
     pub relations: Vec<Relation>,
     pub closures: Vec<Closure>,
+    /// What the response carried that this crate would not keep, and why.
+    ///
+    /// The reason [`extract`] can salvage at all. Its previous refusal to do so
+    /// rested on a sound argument -- "a turn silently half-remembered, and
+    /// nothing downstream can tell that apart from a turn that genuinely said
+    /// less" -- whose force is entirely in the word *silently*. This field is
+    /// the answer to it: a caller holding an `Extraction` can tell the two
+    /// apart by looking, so keeping the good half stops being a silent loss and
+    /// becomes a reported one.
+    ///
+    /// Empty on a clean response, which is the common case and the one worth
+    /// checking against.
+    pub dropped: Vec<Dropped>,
+}
+
+/// One thing the response described that was not kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dropped {
+    /// Which list it came from: `"mention"`, `"fact"`, `"relation"` or
+    /// `"closure"`.
+    pub what: &'static str,
+    /// Its position in that list, as the model wrote it. Positions are how the
+    /// response refers to mentions, so this is the number that appears in the
+    /// reasons below.
+    pub index: usize,
+    /// Why it was not kept, in the same voice as a refusal: what was wrong,
+    /// not merely that something was.
+    pub why: String,
+}
+
+impl std::fmt::Display for Dropped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {} dropped: {}", self.what, self.index, self.why)
+    }
 }
 
 /// Whatever went wrong reaching the model. Opaque here: the host's transport,
@@ -145,14 +179,21 @@ pub trait Completer {
 }
 
 /// A turn that could not be extracted, and why.
+///
+/// Two variants, not three. `Malformed` — "the response parsed but described
+/// something impossible" — is gone, because after [`extract`] learned to drop
+/// individual items nothing could construct it: everything it used to cover is
+/// now a [`Dropped`] beside a successful extraction. A variant no code path can
+/// produce is a claim about this crate that is not true, and keeping one
+/// because removing it *would* be a breaking change in a published crate is a
+/// reason that does not apply to one that is not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtractError {
     /// The completer failed before a response existed.
     Completer(CompleterError),
-    /// The response was not the JSON this crate asked for.
+    /// The response was not the JSON this crate asked for. The only whole-
+    /// response failure left: there is no parsed half to salvage from.
     Unparsable(String),
-    /// The response parsed but described something impossible.
-    Malformed(String),
 }
 
 impl std::fmt::Display for ExtractError {
@@ -163,9 +204,6 @@ impl std::fmt::Display for ExtractError {
                 f,
                 "the model's response was not the JSON this crate asked for: {why}"
             ),
-            ExtractError::Malformed(why) => {
-                write!(f, "the model described something impossible: {why}")
-            }
         }
     }
 }
@@ -186,14 +224,19 @@ impl From<CompleterError> for ExtractError {
 /// struct doing both would leak the prompt's convenience into the API.
 #[derive(Deserialize)]
 struct WireExtraction {
+    // Held as raw values and parsed one at a time. Typed straight through,
+    // serde fails the whole document over a single field of the wrong type --
+    // which is how 24 turns in 419 were lost to a model answering a yes/no
+    // attribute with `true` instead of `"true"`, taking every correctly
+    // extracted mention beside it.
     #[serde(default)]
-    mentions: Vec<Mention>,
+    mentions: Vec<serde_json::Value>,
     #[serde(default)]
-    facts: Vec<WireFact>,
+    facts: Vec<serde_json::Value>,
     #[serde(default)]
-    relations: Vec<WireRelation>,
+    relations: Vec<serde_json::Value>,
     #[serde(default)]
-    closures: Vec<WireClosure>,
+    closures: Vec<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -244,27 +287,45 @@ const DAY_MS: i64 = 86_400_000;
 /// unable to read a timestamp after the turn as anything but ambiguous -- did
 /// the model mean the future, or did it get the sign wrong? Neither is worth
 /// storing, and `days_ago` has one meaning in the prompt.
-fn resolve(
-    days_ago: Option<i64>,
-    observed_at: Timestamp,
-    what: &str,
-) -> Result<Timestamp, ExtractError> {
+fn resolve(days_ago: Option<i64>, observed_at: Timestamp) -> Result<Timestamp, String> {
     match days_ago {
         None => Ok(observed_at),
-        Some(days) if days < 0 => Err(ExtractError::Malformed(format!(
-            "a {what} gives days_ago as {days}, which is a moment after the turn it came from -- days_ago counts backwards, and a future timestamp on a closure would end edges that have not been asserted yet"
-        ))),
+        Some(days) if days < 0 => Err(format!(
+            "it gives days_ago as {days}, which is a moment after the turn it came from -- days_ago counts backwards, and a future timestamp on a closure would end edges that have not been asserted yet"
+        )),
         Some(days) => Ok(observed_at.saturating_sub(days.saturating_mul(DAY_MS))),
     }
 }
 
 /// Extract one turn.
 ///
-/// Refuses rather than salvages. A response this crate can only partly
-/// understand is a turn silently half-remembered, and nothing downstream can
-/// tell that apart from a turn that genuinely said less -- so a mention with no
-/// name, an index naming a mention that is not there, or a `days_ago` that
-/// counts forwards, fails the whole extraction and says which.
+/// # Salvages, and says what it did not keep
+///
+/// This used to refuse whole. The argument for that was good: "a response this
+/// crate can only partly understand is a turn silently half-remembered, and
+/// nothing downstream can tell that apart from a turn that genuinely said
+/// less". Every word of it holds except *silently*, and [`Extraction::dropped`]
+/// is what removes that word — a caller can tell the two apart by looking.
+///
+/// What made the old behaviour worth changing was measuring it. Over 419 turns
+/// of real dialogue, 135 were refused outright, and the shapes that caused it
+/// were nearly always one bad field beside several good ones: a fact naming a
+/// mention the model had decided not to list (76), an attribute answered `true`
+/// where a string belongs (24), a relation from someone to themselves (5).
+/// Discarding a correctly identified person and a well-formed fact about her
+/// because a *second* fact carried a bad index is not caution. It is a third of
+/// a conversation lost to protect against remembering slightly less of it.
+///
+/// Refusal is kept for the one case where nothing can be salvaged: a response
+/// that is not the JSON object this crate asked for. There is no good half of
+/// that to keep.
+///
+/// # Positions survive dropping
+///
+/// A response refers to mentions by position, so dropping one cannot be allowed
+/// to renumber the rest — a fact naming mention 2 must not silently come to
+/// mean a different mention. Dropped mentions leave a hole that references to
+/// them fall into: anything naming one is itself dropped, saying so.
 ///
 /// No retries. The host owns the [`Completer`], so backoff, retry and provider
 /// failover are its business and it is better placed to do them.
@@ -274,63 +335,142 @@ pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, Ex
     let wire: WireExtraction = serde_json::from_str(response.trim())
         .map_err(|e| ExtractError::Unparsable(e.to_string()))?;
 
-    let n = wire.mentions.len();
-    let names = |i: usize, what: &str| -> Result<(), ExtractError> {
-        if i >= n {
-            return Err(ExtractError::Malformed(format!(
-                "a {what} names mention {i}, but the response listed {n}"
-            )));
-        }
-        Ok(())
-    };
+    let mut out = Extraction::default();
 
-    for (i, mention) in wire.mentions.iter().enumerate() {
-        if mention.name.trim().is_empty() {
-            return Err(ExtractError::Malformed(format!(
-                "mention {i} has no name, and resolution matches on the name -- an entity without one can never be recognised again, so every later turn about it would create another"
-            )));
+    // Mentions first, because everything else indexes into them. `slot[i]` is
+    // where the model's mention `i` ended up, or `None` if it was dropped.
+    let mut slot: Vec<Option<usize>> = Vec::with_capacity(wire.mentions.len());
+    for (i, raw) in wire.mentions.iter().enumerate() {
+        match serde_json::from_value::<Mention>(raw.clone()) {
+            Err(e) => {
+                slot.push(None);
+                out.dropped.push(Dropped {
+                    what: "mention",
+                    index: i,
+                    why: e.to_string(),
+                });
+            }
+            Ok(m) if m.name.trim().is_empty() => {
+                slot.push(None);
+                out.dropped.push(Dropped {
+                    what: "mention",
+                    index: i,
+                    why: "it has no name, and resolution matches on the name -- an entity without one can never be recognised again, so every later turn about it would create another".to_string(),
+                });
+            }
+            Ok(m) => {
+                slot.push(Some(out.mentions.len()));
+                out.mentions.push(m);
+            }
         }
     }
 
-    let mut out = Extraction {
-        mentions: wire.mentions,
-        ..Extraction::default()
+    // Where a reference lands, or why it does not. Separates "there was never a
+    // mention there" from "there was one and it was dropped": the first is the
+    // model miscounting, the second is this function's own doing, and a reader
+    // of `dropped` should not have to guess which.
+    let n = wire.mentions.len();
+    let landing = |i: usize| -> Result<usize, String> {
+        match slot.get(i) {
+            Some(Some(at)) => Ok(*at),
+            Some(None) => Err(format!("it names mention {i}, which was itself dropped")),
+            None => Err(format!("it names mention {i}, but the response listed {n}")),
+        }
     };
 
-    for f in wire.facts {
-        names(f.subject, "fact")?;
+    for (i, raw) in wire.facts.iter().enumerate() {
+        let drop = |why: String| Dropped {
+            what: "fact",
+            index: i,
+            why,
+        };
+        let f: WireFact = match serde_json::from_value(raw.clone()) {
+            Ok(f) => f,
+            Err(e) => {
+                out.dropped.push(drop(e.to_string()));
+                continue;
+            }
+        };
+        let (subject, valid_from) =
+            match (landing(f.subject), resolve(f.days_ago, turn.observed_at)) {
+                (Ok(s), Ok(t)) => (s, t),
+                (Err(why), _) | (_, Err(why)) => {
+                    out.dropped.push(drop(why));
+                    continue;
+                }
+            };
         out.facts.push(Fact {
-            subject: f.subject,
+            subject,
             attribute: f.attribute,
             value: f.value,
             text: f.text,
-            valid_from: resolve(f.days_ago, turn.observed_at, "fact")?,
+            valid_from,
         });
     }
 
-    for r in wire.relations {
-        names(r.subject, "relation")?;
-        names(r.object, "relation")?;
+    for (i, raw) in wire.relations.iter().enumerate() {
+        let drop = |why: String| Dropped {
+            what: "relation",
+            index: i,
+            why,
+        };
+        let r: WireRelation = match serde_json::from_value(raw.clone()) {
+            Ok(r) => r,
+            Err(e) => {
+                out.dropped.push(drop(e.to_string()));
+                continue;
+            }
+        };
         if r.subject == r.object {
-            return Err(ExtractError::Malformed(format!(
-                "a relation runs from mention {} to itself, which rm_store::relate refuses to create",
+            out.dropped.push(drop(format!(
+                "it runs from mention {} to itself, which rm_store::relate refuses to create",
                 r.subject
             )));
+            continue;
         }
+        let (subject, object, valid_from) = match (
+            landing(r.subject),
+            landing(r.object),
+            resolve(r.days_ago, turn.observed_at),
+        ) {
+            (Ok(s), Ok(o), Ok(t)) => (s, o, t),
+            (Err(why), _, _) | (_, Err(why), _) | (_, _, Err(why)) => {
+                out.dropped.push(drop(why));
+                continue;
+            }
+        };
         out.relations.push(Relation {
-            subject: r.subject,
+            subject,
             predicate: r.predicate,
-            object: r.object,
-            valid_from: resolve(r.days_ago, turn.observed_at, "relation")?,
+            object,
+            valid_from,
         });
     }
 
-    for c in wire.closures {
-        names(c.subject, "closure")?;
+    for (i, raw) in wire.closures.iter().enumerate() {
+        let drop = |why: String| Dropped {
+            what: "closure",
+            index: i,
+            why,
+        };
+        let c: WireClosure = match serde_json::from_value(raw.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                out.dropped.push(drop(e.to_string()));
+                continue;
+            }
+        };
+        let (subject, at) = match (landing(c.subject), resolve(c.days_ago, turn.observed_at)) {
+            (Ok(s), Ok(t)) => (s, t),
+            (Err(why), _) | (_, Err(why)) => {
+                out.dropped.push(drop(why));
+                continue;
+            }
+        };
         out.closures.push(Closure {
-            subject: c.subject,
+            subject,
             predicate: c.predicate,
-            at: resolve(c.days_ago, turn.observed_at, "closure")?,
+            at,
             because: c.because,
         });
     }
@@ -495,56 +635,78 @@ mod tests {
     }
 
     #[test]
-    fn a_mention_with_no_name_is_refused() {
+    fn a_mention_with_no_name_is_dropped() {
         // Resolution matches on the name. A mention without one becomes an
         // entity nothing can ever match against again, so every later turn
-        // about it creates another.
-        let err = extract(
+        // about it creates another -- which is why it is not kept. What
+        // changed is the blast radius: the mention goes, not the turn.
+        let out = extract(
             &turn(),
             &Canned(
                 r#"{"mentions":[{"kind":"person","name":"   ","text":"Ben"}],
                     "facts":[],"relations":[],"closures":[]}"#,
             ),
         )
-        .unwrap_err();
-        assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
-        assert!(err.to_string().contains("name"), "{err}");
+        .unwrap();
+        assert!(out.mentions.is_empty());
+        assert_eq!(out.dropped.len(), 1);
+        assert!(out.dropped[0].why.contains("name"), "{}", out.dropped[0]);
     }
 
+    // ---- what used to be a whole-turn refusal -----------------------------
+    //
+    // Each of these asserted that the entire extraction failed. They now
+    // assert what replaced it: the offending item goes, everything else
+    // survives, and `dropped` says which and why. The change is deliberate and
+    // these are where it is visible -- see `extract`'s documentation for the
+    // measurement that motivated it.
+
     #[test]
-    fn a_fact_naming_a_mention_that_does_not_exist_is_refused() {
-        let err = extract(
+    fn a_fact_naming_a_mention_that_does_not_exist_is_dropped_and_the_rest_kept() {
+        let out = extract(
             &turn(),
             &Canned(
                 r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
-                    "facts":[{"subject":7,"attribute":"employer","value":"Globex",
-                              "text":"x","days_ago":null}],
+                    "facts":[{"subject":0,"attribute":"employer","value":"Globex","text":"Ben works at Globex","days_ago":null},
+                             {"subject":9,"attribute":"a","value":"b","text":"c","days_ago":null}],
                     "relations":[],"closures":[]}"#,
             ),
         )
-        .unwrap_err();
-        assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
-        assert!(err.to_string().contains('7'), "{err}");
+        .expect("one bad fact must not discard the turn");
+
+        assert_eq!(out.mentions.len(), 1, "the named person survives");
+        assert_eq!(out.facts.len(), 1, "and so does the fact that was fine");
+        assert_eq!(out.facts[0].attribute, "employer");
+        assert_eq!(out.dropped.len(), 1);
+        assert_eq!(out.dropped[0].what, "fact");
+        assert_eq!(out.dropped[0].index, 1);
+        assert!(
+            out.dropped[0].why.contains("names mention 9"),
+            "{}",
+            out.dropped[0]
+        );
     }
 
     #[test]
-    fn a_relation_naming_a_mention_that_does_not_exist_is_refused() {
-        let err = extract(
+    fn a_relation_naming_a_mention_that_does_not_exist_is_dropped_and_the_rest_kept() {
+        let out = extract(
             &turn(),
             &Canned(
                 r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
                     "facts":[],
-                    "relations":[{"subject":0,"predicate":"knows","object":4,"days_ago":null}],
+                    "relations":[{"subject":0,"predicate":"employed_by","object":9,"days_ago":null}],
                     "closures":[]}"#,
             ),
         )
-        .unwrap_err();
-        assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
+        .unwrap();
+        assert_eq!(out.mentions.len(), 1);
+        assert!(out.relations.is_empty());
+        assert_eq!(out.dropped[0].what, "relation");
     }
 
     #[test]
-    fn a_closure_naming_a_mention_that_does_not_exist_is_refused() {
-        let err = extract(
+    fn a_closure_naming_a_mention_that_does_not_exist_is_dropped_and_the_rest_kept() {
+        let out = extract(
             &turn(),
             &Canned(
                 r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
@@ -553,15 +715,18 @@ mod tests {
                                  "days_ago":null,"because":"x"}]}"#,
             ),
         )
-        .unwrap_err();
-        assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
+        .unwrap();
+        assert_eq!(out.mentions.len(), 1);
+        assert!(out.closures.is_empty());
+        assert_eq!(out.dropped[0].what, "closure");
     }
 
     #[test]
-    fn a_relation_from_a_mention_to_itself_is_refused() {
+    fn a_relation_from_a_mention_to_itself_is_dropped_and_the_rest_kept() {
         // `rm_store::relate` refuses one, so accepting it here only moves the
-        // error to a layer with less context about where it came from.
-        let err = extract(
+        // failure somewhere with less context. Dropping it keeps that property
+        // while letting the turn's other content through.
+        let out = extract(
             &turn(),
             &Canned(
                 r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
@@ -570,65 +735,114 @@ mod tests {
                     "closures":[]}"#,
             ),
         )
-        .unwrap_err();
-        assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
-        assert!(err.to_string().contains("itself"), "{err}");
+        .unwrap();
+        assert!(out.relations.is_empty());
+        assert!(
+            out.dropped[0].why.contains("to itself"),
+            "{}",
+            out.dropped[0]
+        );
     }
 
     #[test]
-    fn a_days_ago_that_counts_forwards_is_refused() {
-        // A negative count reaches the future by arithmetic, which saturation
-        // cannot catch. On a closure that is not merely wrong: `ingest` asks
-        // `edges_from(subject, at, Timestamp::MAX)`, so a future `at` reads a
-        // graph that has not happened and tombstones what it finds -- a live
-        // edge that quietly expires later, with nothing raising an error.
-        let err = extract(
+    fn a_mention_with_no_name_is_dropped_without_renumbering_the_others() {
+        // The hazard dropping a mention creates: positions are how the response
+        // refers to mentions, so removing one must not make a later reference
+        // mean something different. Mention 1 goes; the fact naming mention 2
+        // must still find Ada rather than silently landing on someone else.
+        let out = extract(
+            &turn(),
+            &Canned(
+                r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"},
+                                {"kind":"person","name":"  ","text":"someone"},
+                                {"kind":"person","name":"Ada","text":"Ada"}],
+                    "facts":[{"subject":2,"attribute":"employer","value":"Globex","text":"Ada works at Globex","days_ago":null},
+                             {"subject":1,"attribute":"employer","value":"Acme","text":"someone works at Acme","days_ago":null}],
+                    "relations":[],"closures":[]}"#,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(out.mentions.len(), 2);
+        assert_eq!(out.mentions[0].name, "Ben");
+        assert_eq!(out.mentions[1].name, "Ada");
+        assert_eq!(out.facts.len(), 1);
+        assert_eq!(
+            out.mentions[out.facts[0].subject].name, "Ada",
+            "the surviving fact must still point at the mention the model meant"
+        );
+        // Two drops: the nameless mention, and the fact that referred to it.
+        assert_eq!(out.dropped.len(), 2);
+        assert!(out.dropped[0].why.contains("no name"), "{}", out.dropped[0]);
+        assert!(
+            out.dropped[1].why.contains("itself dropped"),
+            "a reference to a dropped mention should say so, not claim the model miscounted: {}",
+            out.dropped[1]
+        );
+    }
+
+    #[test]
+    fn a_days_ago_that_counts_forwards_drops_only_what_carried_it() {
+        let out = extract(
             &turn(),
             &Canned(
                 r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
-                    "facts":[],"relations":[],
-                    "closures":[{"subject":0,"predicate":"employed_by",
-                                 "days_ago":-30,"because":"x"}]}"#,
+                    "facts":[{"subject":0,"attribute":"employer","value":"Globex","text":"x","days_ago":-3},
+                             {"subject":0,"attribute":"city","value":"London","text":"y","days_ago":2}],
+                    "relations":[],"closures":[]}"#,
             ),
         )
-        .unwrap_err();
-        assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
-        assert!(err.to_string().contains("-30"), "{err}");
-        assert!(err.to_string().contains("days_ago"), "{err}");
+        .unwrap();
+        assert_eq!(out.facts.len(), 1);
+        assert_eq!(out.facts[0].attribute, "city");
+        assert!(
+            out.dropped[0].why.contains("days_ago"),
+            "{}",
+            out.dropped[0]
+        );
     }
 
     #[test]
-    fn a_fact_or_relation_dated_after_its_turn_is_refused_too() {
-        // Refused everywhere `days_ago` appears, not only where it does damage.
-        // The word has one meaning in the prompt, and accepting it backwards in
-        // two places while refusing it in a third would leave a caller unable
-        // to read a timestamp after the turn as anything but ambiguous.
+    fn a_fact_or_relation_dated_after_its_turn_is_dropped_too() {
         for bad in [
+            r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"},{"kind":"organisation","name":"Globex","text":"Globex"}],
+                "facts":[],"relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":-1}],"closures":[]}"#,
             r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
-                "facts":[{"subject":0,"attribute":"employer","value":"Globex",
-                          "text":"x","days_ago":-1}],
-                "relations":[],"closures":[]}"#,
-            r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"},
-                            {"kind":"organisation","name":"Globex","text":"Globex"}],
-                "facts":[],
-                "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":-1}],
-                "closures":[]}"#,
+                "facts":[],"relations":[],"closures":[{"subject":0,"predicate":"employed_by","days_ago":-1,"because":"x"}]}"#,
         ] {
-            let err = extract(&turn(), &Canned(bad)).unwrap_err();
-            assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
+            let out = extract(&turn(), &Canned(bad)).unwrap();
+            assert_eq!(out.dropped.len(), 1, "{bad}");
+            assert!(
+                out.dropped[0].why.contains("days_ago"),
+                "{}",
+                out.dropped[0]
+            );
         }
     }
 
     #[test]
-    fn a_refusal_names_what_was_wrong_rather_than_that_something_was() {
+    fn a_response_that_is_not_the_json_asked_for_is_still_refused_whole() {
+        // The one case with no good half to keep. Salvage needs something
+        // parsed to salvage from.
+        for bad in ["Sure! Here you go: {}", "```json\n{}\n```", "[1,2,3]"] {
+            let err = extract(&turn(), &Canned(bad)).unwrap_err();
+            assert!(matches!(err, ExtractError::Unparsable(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn every_drop_names_what_was_wrong_rather_than_that_something_was() {
         for bad in [
             r#"{"mentions":[{"kind":"person","name":"","text":"Ben"}],"facts":[],"relations":[],"closures":[]}"#,
             r#"{"mentions":[],"facts":[{"subject":0,"attribute":"a","value":"b","text":"c","days_ago":null}],"relations":[],"closures":[]}"#,
+            r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],"facts":[{"subject":0,"attribute":"a","value":true,"text":"c","days_ago":null}],"relations":[],"closures":[]}"#,
         ] {
-            let err = extract(&turn(), &Canned(bad)).unwrap_err();
+            let out = extract(&turn(), &Canned(bad)).unwrap();
+            assert_eq!(out.dropped.len(), 1, "{bad}");
             assert!(
-                err.to_string().len() > 40,
-                "a refusal that does not say what was missing is not much better than a panic: {err}"
+                out.dropped[0].why.len() > 20,
+                "a drop that does not say what was wrong is not much better than losing it silently: {}",
+                out.dropped[0]
             );
         }
     }

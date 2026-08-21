@@ -13,14 +13,19 @@
 //! that is guessing with a delay. These run in milliseconds, are deterministic,
 //! and fail on exactly the thing being edited.
 //!
-//! # These characterise, they do not endorse
+//! # These characterised a cost, and then it was paid down
 //!
-//! Several cases below assert that a whole turn is discarded over one bad
-//! field. That is what the crate does today, and writing it down is how the
-//! cost of it becomes visible: the assertions say what was thrown away, not
-//! merely that something was. A test that only checked `is_err()` would let
-//! that cost stay invisible, which is how it stayed invisible until a real
-//! corpus was run through it.
+//! When written, several of these asserted that a whole turn was discarded over
+//! one bad field — what the crate did at the time — and said so in terms of what
+//! was thrown away rather than merely that something was. A test that only
+//! checked `is_err()` would have let that cost stay invisible, which is how it
+//! stayed invisible until a real corpus went through it.
+//!
+//! `extract` now drops the offending item and keeps the rest, so those
+//! assertions have changed. They are kept in that changed form deliberately:
+//! each one still names the shape, still carries the count it occurred at, and
+//! now states what survives it. Read together they are the measurement of the
+//! change — the same 135 responses, and what is left of them.
 
 use rm_extract::{extract, CompleterError, ExtractError, Turn};
 
@@ -43,13 +48,6 @@ fn turn(text: &str, speaker: &str) -> Turn {
     }
 }
 
-fn malformed(e: ExtractError) -> String {
-    match e {
-        ExtractError::Malformed(why) => why,
-        other => panic!("expected Malformed, got {other:?}"),
-    }
-}
-
 fn unparsable(e: ExtractError) -> String {
     match e {
         ExtractError::Unparsable(why) => why,
@@ -64,9 +62,13 @@ fn unparsable(e: ExtractError) -> String {
 ///
 /// The rule worked — "the kids" is no longer a mention — but the model still
 /// wrote the fact that referred to them, and a fact must index a mention that
-/// exists. The turn is refused whole.
+/// exists.
+///
+/// This response carries nothing else, so nothing survives it. What changed is
+/// that it is no longer an *error*: the turn produced an empty extraction and
+/// said why, which a caller can distinguish from a turn that said nothing.
 #[test]
-fn a_fact_naming_a_mention_that_was_not_listed_discards_the_whole_turn() {
+fn a_fact_naming_a_mention_that_was_not_listed_is_dropped() {
     let response = r#"{
       "mentions": [],
       "facts": [
@@ -80,18 +82,28 @@ fn a_fact_naming_a_mention_that_was_not_listed_discards_the_whole_turn() {
         "Hey Caroline! Good to see you! I'm swamped with the kids & work.",
         "Melanie",
     );
-    let why = malformed(extract(&turn, &Canned(response)).unwrap_err());
-    assert_eq!(why, "a fact names mention 0, but the response listed 0");
+    let out = extract(&turn, &Canned(response)).expect("no longer an error");
+    assert!(out.mentions.is_empty());
+    assert!(out.facts.is_empty());
+    assert_eq!(out.dropped.len(), 1);
+    assert!(
+        out.dropped[0]
+            .why
+            .contains("names mention 0, but the response listed 0"),
+        "{}",
+        out.dropped[0]
+    );
 }
 
 /// The same failure with something worth keeping beside it.
 ///
-/// This is the case that makes the cost legible: the model named Melanie
-/// correctly, and one unanchored fact throws her away too. Across the run that
-/// is 76 turns of a 419-turn conversation reduced to nothing, most of which had
-/// a usable mention in them.
+/// This is the case that made the cost legible, and the one that measures the
+/// change. The model named Melanie correctly and wrote a good fact about her;
+/// under the old behaviour a *second* fact with a bad index threw both away.
+/// Across the run that was 76 turns of 419 reduced to nothing, most with a
+/// usable mention in them.
 #[test]
-fn one_unanchored_fact_discards_the_mentions_that_parsed_cleanly() {
+fn one_unanchored_fact_no_longer_discards_the_mentions_that_parsed_cleanly() {
     let response = r#"{
       "mentions": [
         {"kind": "person", "name": "Melanie", "text": "I"}
@@ -109,21 +121,31 @@ fn one_unanchored_fact_discards_the_mentions_that_parsed_cleanly() {
         "Hey Caroline, since we last chatted, I've had a lot of things happening to me. I ran a charity race.",
         "Melanie",
     );
-    let why = malformed(extract(&turn, &Canned(response)).unwrap_err());
-    assert_eq!(why, "a fact names mention 4, but the response listed 1");
+    let out = extract(&turn, &Canned(response)).expect("one bad fact is not a bad turn");
 
-    // What that costs, stated rather than implied: a named person and a
-    // well-formed fact about her, both discarded over a second fact.
-    // If this crate ever learns to drop the offending fact instead, this
-    // assertion is the one that should change, and it should change loudly.
+    // What used to be lost, now kept.
+    assert_eq!(out.mentions.len(), 1);
+    assert_eq!(out.mentions[0].name, "Melanie");
+    assert_eq!(out.facts.len(), 1);
+    assert_eq!(out.facts[0].attribute, "activity");
+    assert_eq!(out.facts[0].value.as_deref(), Some("charity race"));
+
+    // And what was actually wrong is still reported rather than swallowed.
+    assert_eq!(out.dropped.len(), 1);
+    assert_eq!(out.dropped[0].what, "fact");
+    assert_eq!(out.dropped[0].index, 1);
 }
 
 // ---- responses that are not JSON at all -----------------------------------
 
 /// Observed **26 times in 419 turns**. The prompt says "reply with only a JSON
 /// object ... and nothing else"; the model prefaces it anyway.
+///
+/// The one shape salvage cannot help: there is no parsed half to keep. This
+/// remains the crate's only whole-response refusal, and these 26 are the
+/// residue the change does not touch.
 #[test]
-fn prose_before_the_json_is_unparsable() {
+fn prose_before_the_json_is_still_refused_whole() {
     let response = r#"Sure! Here's the extraction:
 
 {"mentions": [], "facts": [], "relations": [], "closures": []}"#;
@@ -134,7 +156,7 @@ fn prose_before_the_json_is_unparsable() {
 /// The same shape wearing a markdown fence, which is how a chat-tuned model
 /// most often volunteers JSON.
 #[test]
-fn a_markdown_fence_is_unparsable_too() {
+fn a_markdown_fence_is_still_refused_whole_too() {
     let response =
         "```json\n{\"mentions\": [], \"facts\": [], \"relations\": [], \"closures\": []}\n```";
     let why = unparsable(extract(&turn("Hey Mel!", "Caroline"), &Canned(response)).unwrap_err());
@@ -161,13 +183,24 @@ fn a_boolean_where_a_string_belongs_is_unparsable() {
         "I went to a LGBTQ support group yesterday and it was so powerful.",
         "Caroline",
     );
-    let why = unparsable(extract(&turn, &Canned(response)).unwrap_err());
-    assert!(why.contains("invalid type: boolean"), "{why}");
+    let out = extract(&turn, &Canned(response)).expect("one bad field is not a bad turn");
+    assert_eq!(
+        out.mentions.len(),
+        1,
+        "Caroline used to go with the bad fact"
+    );
+    assert_eq!(out.mentions[0].name, "Caroline");
+    assert!(out.facts.is_empty());
+    assert!(
+        out.dropped[0].why.contains("invalid type: boolean"),
+        "{}",
+        out.dropped[0]
+    );
 }
 
 /// Observed 4 times: a count answered as a number.
 #[test]
-fn an_integer_where_a_string_belongs_is_unparsable() {
+fn an_integer_where_a_string_belongs_drops_only_that_fact() {
     let response = r#"{
       "mentions": [{"kind": "person", "name": "Melanie", "text": "I"}],
       "facts": [
@@ -177,27 +210,35 @@ fn an_integer_where_a_string_belongs_is_unparsable() {
       "relations": [],
       "closures": []
     }"#;
-    let why = unparsable(
-        extract(
-            &turn("I'm swamped with the kids", "Melanie"),
-            &Canned(response),
-        )
-        .unwrap_err(),
+    let out = extract(
+        &turn("I'm swamped with the kids", "Melanie"),
+        &Canned(response),
+    )
+    .unwrap();
+    assert_eq!(out.mentions.len(), 1, "Melanie survives the bad fact");
+    assert!(out.facts.is_empty());
+    assert!(
+        out.dropped[0].why.contains("invalid type: integer"),
+        "{}",
+        out.dropped[0]
     );
-    assert!(why.contains("invalid type: integer"), "{why}");
 }
 
 /// Observed twice: a null value for a *field*, which is different from the
 /// null the schema does allow for `value`.
 #[test]
-fn a_null_name_is_unparsable_where_a_null_value_is_fine() {
+fn a_null_name_drops_the_mention_where_a_null_value_is_fine() {
     let nameless = r#"{
       "mentions": [{"kind": "person", "name": null, "text": "someone"}],
       "facts": [], "relations": [], "closures": []
     }"#;
-    let why =
-        unparsable(extract(&turn("someone said so", "Caroline"), &Canned(nameless)).unwrap_err());
-    assert!(why.contains("invalid type: null"), "{why}");
+    let out = extract(&turn("someone said so", "Caroline"), &Canned(nameless)).unwrap();
+    assert!(out.mentions.is_empty());
+    assert!(
+        out.dropped[0].why.contains("invalid type: null"),
+        "{}",
+        out.dropped[0]
+    );
 
     // The contrast, so the rule is visible rather than inferred: `value` is
     // nullable on purpose -- it is how "he is between jobs" is said.
@@ -220,7 +261,7 @@ fn a_null_name_is_unparsable_where_a_null_value_is_fine() {
 /// Observed 5 times. The model relates a mention to itself, usually on a turn
 /// where someone talks about their own family.
 #[test]
-fn a_relation_from_a_mention_to_itself_discards_the_whole_turn() {
+fn a_relation_from_a_mention_to_itself_is_dropped() {
     let response = r#"{
       "mentions": [{"kind": "person", "name": "Melanie", "text": "I"}],
       "facts": [],
@@ -229,14 +270,22 @@ fn a_relation_from_a_mention_to_itself_discards_the_whole_turn() {
       ],
       "closures": []
     }"#;
-    let why = malformed(
-        extract(
-            &turn("I'm swamped with the kids", "Melanie"),
-            &Canned(response),
-        )
-        .unwrap_err(),
+    let out = extract(
+        &turn("I'm swamped with the kids", "Melanie"),
+        &Canned(response),
+    )
+    .unwrap();
+    assert_eq!(
+        out.mentions.len(),
+        1,
+        "Melanie survives her own bad relation"
     );
-    assert!(why.contains("runs from mention 0 to itself"), "{why}");
+    assert!(out.relations.is_empty());
+    assert!(
+        out.dropped[0].why.contains("to itself"),
+        "{}",
+        out.dropped[0]
+    );
 }
 
 // ---- the control -----------------------------------------------------------
@@ -264,6 +313,10 @@ fn a_well_formed_response_extracts_everything_it_carries() {
         "Caroline",
     );
     let out = extract(&turn, &Canned(response)).expect("the shape the prompt asks for");
+    assert!(
+        out.dropped.is_empty(),
+        "a clean response must drop nothing -- otherwise `dropped` says nothing when it is empty"
+    );
     assert_eq!(out.mentions.len(), 2);
     assert_eq!(out.facts.len(), 1);
     assert_eq!(out.relations.len(), 1);

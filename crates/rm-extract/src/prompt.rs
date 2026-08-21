@@ -177,9 +177,8 @@ mod tests {
         // forbid teaches the opposite of what the rules say. This is the same
         // failure the round-trip test below guards against, one level up.
         let p = prompt(&turn("anything", None));
-        let wire: crate::WireExtraction =
-            serde_json::from_str(example_json(&p)).expect("the example parses");
-        for mention in &wire.mentions {
+        let example = crate::extract(&turn("anything", None), &Echo).expect("the example extracts");
+        for mention in &example.mentions {
             assert!(
                 KINDS.contains(&mention.kind.as_str()),
                 "the example uses kind {:?}, which its own rules forbid",
@@ -260,29 +259,35 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_s_example_round_trips_through_the_wire_schema() {
+    fn the_prompt_s_example_round_trips_through_the_schema_that_reads_it() {
         // The substring test above catches a field added to the types and
         // never described, but a textual check cannot catch a field dropped
         // from the example while its prose sentence lingers, or one renamed to
-        // a word already present elsewhere. Parsing the example itself as the
-        // schema the parser actually reads catches both: a removed or renamed
-        // field fails to parse, or parses into the wrong shape.
-        let p = prompt(&turn("anything", None));
-        let json = example_json(&p);
-        let wire: crate::WireExtraction = serde_json::from_str(json)
-            .expect("the prompt's own example must parse as the wire schema it teaches");
+        // a word already present elsewhere. Running the example through
+        // `extract` catches both, and catches more than parsing it as the wire
+        // types did: since the wire lists became opaque values parsed one at a
+        // time, a field of the wrong type no longer fails the document -- it
+        // drops that item instead. So a renamed field would have shown up as a
+        // silently empty extraction under the old assertion, and shows up here.
+        let out = crate::extract(&turn("anything", None), &Echo)
+            .expect("the prompt's own example must survive the parser it teaches");
 
-        assert_eq!(wire.mentions.len(), 2);
-        assert_eq!(wire.mentions[0].name, "Alex Chen");
-        assert_eq!(wire.mentions[1].name, "Globex");
-        assert_eq!(wire.facts.len(), 1);
-        assert_eq!(wire.facts[0].attribute, "employer");
-        assert_eq!(wire.facts[0].value.as_deref(), Some("Globex"));
-        assert_eq!(wire.relations.len(), 1);
-        assert_eq!(wire.relations[0].predicate, "employed_by");
-        assert_eq!(wire.closures.len(), 1);
+        assert!(
+            out.dropped.is_empty(),
+            "the prompt's example must not teach a shape this crate discards: {:?}",
+            out.dropped
+        );
+        assert_eq!(out.mentions.len(), 2);
+        assert_eq!(out.mentions[0].name, "Alex Chen");
+        assert_eq!(out.mentions[1].name, "Globex");
+        assert_eq!(out.facts.len(), 1);
+        assert_eq!(out.facts[0].attribute, "employer");
+        assert_eq!(out.facts[0].value.as_deref(), Some("Globex"));
+        assert_eq!(out.relations.len(), 1);
+        assert_eq!(out.relations[0].predicate, "employed_by");
+        assert_eq!(out.closures.len(), 1);
         assert_eq!(
-            wire.closures[0].because,
+            out.closures[0].because,
             "starting a new job ends the previous one"
         );
     }
