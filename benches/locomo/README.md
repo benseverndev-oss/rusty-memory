@@ -280,3 +280,44 @@ before it is measured.
 The extraction pass took **68 seconds**, against roughly twelve minutes in
 series. The cache holds 419 completions and 364 embeddings, so a re-run that
 does not change the prompt pays for neither.
+
+## Fourth run: the subject and value rules
+
+| | prompt + salvage | + subject/value rules |
+|---|---:|---:|
+| turns refused | 30 (7.2%) | 32 (7.6%) |
+| items dropped | 239 | **184** |
+| — booleans where a string belongs | 49 | **0** |
+| — fact names a mention that was not listed | 178 | **170** |
+| entities | 92 | 78 |
+| assertions | 574 | **498** |
+| relations | 15 | **13** |
+| review band | 48 | 31 |
+| **overall recall@10** | **0.376** | **0.329** |
+
+### One rule worked and one did not
+
+**The value rule worked.** 49 booleans became 0, and integers went 4 to 2. Saying
+`"value" is a string, or null. Never a number and never true or false` and naming
+the shapes the model actually produced removed them.
+
+**The subject rule did not.** 178 to 170 is not a change. The prompt now says
+plainly that a fact's subject must be an index into `mentions` and that a turn
+with no mentions must emit no facts, and the model writes them anyway. Whatever
+is happening, it is not a matter of the instruction being absent — that was the
+hypothesis and it is wrong.
+
+### And the change is a net regression on retrieval
+
+0.376 to 0.329. The overall figure varied by 0.006 across two independent runs,
+so 0.047 is outside its noise: this is a real move in the wrong direction, on the
+one number in this file worth reading.
+
+Assertions fell with it, 574 to 498. **A hypothesis, offered as one:** the new
+"emit no facts either" sentence may be suppressing good facts as well as
+unanchored ones — a model told to withhold facts when unsure has an easy way to
+comply. That is testable by reverting the subject rule alone and keeping the
+value rule, which is one extraction pass, and it should be tested rather than
+believed.
+
+Nothing here changed relations: 15 to 13. Five runs, no movement.
