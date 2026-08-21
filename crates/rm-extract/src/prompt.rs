@@ -12,6 +12,31 @@ use crate::Turn;
 /// few-shot variant on top of it. The crate owning the contract does not mean
 /// the contract has to be a secret.
 ///
+/// # What 1,165 real responses said
+///
+/// Reading the cached responses from a corpus run, rather than guessing from
+/// the counts they produced: **45% of responses listed no mentions at all**,
+/// 40% listed exactly one, and only 15% listed two or more.
+///
+/// That single number explains the two failures that had resisted every
+/// instruction. A relation names two mention indices, so only 15% of turns
+/// *could* carry one — and when the model did list two things it related them
+/// 26% of the time, which is not the problem. And 258 responses carried facts
+/// with no mentions at all, every sampled one of them about the speaker:
+///
+/// ```text
+/// subject=0  text="Melanie enjoys family camping trips"
+/// subject=0  text="Caroline went to a pride parade a few weeks ago"
+/// ```
+///
+/// The model was treating the speaker as an implicit mention 0 — writing
+/// `subject: 0` while listing nobody. Those were never the model ignoring an
+/// instruction; they were it assuming something the schema never granted.
+///
+/// So the speaker line now asks for the speaker *as a mention*. It had always
+/// said "resolve I, me and my to them", which tells the model who the pronouns
+/// mean and not that the person is a thing to list.
+///
 /// # A rule that was tried and removed
 ///
 /// The commonest thing this prompt gets back is a fact whose `subject` names a
@@ -29,7 +54,12 @@ use crate::Turn;
 /// re-add the rule without measuring it — it has been measured once and it lost.
 pub fn prompt(turn: &Turn) -> String {
     let speaker = match &turn.speaker {
-        Some(name) => format!("The speaker is {name}. Resolve \"I\", \"me\" and \"my\" to them."),
+        Some(name) => format!(
+            "The speaker is {name}. Resolve \"I\", \"me\" and \"my\" to them, and list \
+             {name} in \"mentions\" whenever the turn says anything about them. A fact \
+             about the speaker needs a mention to point at, exactly like a fact about \
+             anyone else."
+        ),
         // Stated rather than omitted: a prompt with a blank where the speaker
         // should be reads as a template that failed to render, and a model will
         // fill it. Saying the speaker is unknown is an instruction.
@@ -133,6 +163,24 @@ mod tests {
         // can be resolved against, and every turn invents a new person.
         let p = prompt(&turn("I started at Globex", Some("Ben Severn")));
         assert!(p.contains("Ben Severn"));
+    }
+
+    #[test]
+    fn the_prompt_asks_for_the_speaker_as_a_mention_not_just_as_a_referent() {
+        // Measured over 1,165 real responses: 45% listed no mentions at all,
+        // and 258 carried facts about the speaker with nobody listed to attach
+        // them to -- `subject: 0` against an empty list. The old line said
+        // "resolve I, me and my to them", which says who the pronouns mean and
+        // not that the person is a thing to list.
+        let p = prompt(&turn("I started at Globex", Some("Ben Severn")));
+        assert!(
+            p.contains("list Ben Severn in \"mentions\""),
+            "the speaker has to be asked for as a mention: {p}"
+        );
+        assert!(
+            p.contains("needs a mention to point at"),
+            "and the reason has to be given, or it reads as an aside"
+        );
     }
 
     #[test]
