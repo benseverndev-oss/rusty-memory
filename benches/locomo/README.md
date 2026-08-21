@@ -370,3 +370,60 @@ each now that responses are cached.
 cost of a hundred good facts and 0.047 of recall. They remain the largest single
 shape, they remain untouched by two direct instructions, and `extract` continues
 to drop them without losing their turns.
+
+## The variance, measured at last — and what it withdraws
+
+Three runs at one configuration, each with a cold cache so each draws a fresh
+sample of model responses.
+
+| | run 7 | run a | run b | mean | range |
+|---|---:|---:|---:|---:|---:|
+| **overall recall@10** | 0.389 | 0.315 | 0.342 | 0.349 | **0.074** |
+| relations | 23 | 17 | 14 | 18 | 9 |
+| assertions | 607 | 547 | 575 | 576 | 60 |
+| entities | 91 | 82 | 88 | 87 | 9 |
+| turns refused | 31 | 35 | 38 | 35 | 7 |
+| review band | 43 | 30 | 41 | 38 | 13 |
+
+**The overall figure varies by 0.074 at a fixed configuration.** Everything in
+this file that compared two single runs of different configurations was reading
+that noise.
+
+### What this withdraws
+
+Earlier sections claimed a noise band of 0.006, taken from two runs that
+happened to land close together (0.295 and 0.289). Two samples cannot establish
+a range; those two were luck, and the number was then used to validate three
+conclusions. All three are withdrawn:
+
+- **"0.289 to 0.376 is well outside the noise."** It is roughly one range. Not
+  established.
+- **"0.376 to 0.329 is a real regression."** It sits inside the range. The
+  subject rule may have cost nothing measurable; the revert is still right,
+  because the rule did not do the job it was added for, but the retrieval
+  argument for it was noise.
+- **"Relations moved for the first time: 23."** Relations run 14 to 23 at a
+  fixed configuration. The 23 was a sample, not a level. It was recorded as
+  "not a fix and should not be read as one" — which was the right instinct and
+  is now the measured answer.
+
+### What survives, and why
+
+Two results are structural rather than sampled, and both hold:
+
+- **Salvage: 135 refusals to about 30.** An order-of-magnitude mechanical
+  change, far outside a range of 7, and it follows from what the code does
+  rather than from what the model happened to say.
+- **The value rule: 49 booleans to 0.** Confirmed independently by reading the
+  cached responses, not inferred from a run metric.
+
+### The rule this establishes
+
+Retrieval numbers in this file are reported as **mean and range over at least
+three cold-cache runs**, or not reported. A single run states nothing about a
+configuration, and a difference smaller than 0.074 between single runs states
+nothing at all.
+
+Structural counts — refusals by shape, items dropped by shape, what the model
+actually emitted — are worth more per run than the retrieval metric, and should
+be preferred where a question can be put in those terms.
