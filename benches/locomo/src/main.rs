@@ -39,6 +39,9 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+mod cache;
+
+use cache::{Cache, Cached};
 use rm_engine::{Engine, Metric, Query, VectorIndex};
 use rm_extract::Turn;
 use rm_host::config::Config;
@@ -92,6 +95,18 @@ fn main() {
 
     let turns = turns_of(sample);
     let total = turns.len().min(budget);
+
+    // Extraction is a pure function of its prompt, so it is cached and
+    // pre-fetched concurrently. Ingestion is not and is not: resolution depends
+    // on what is already in the store, so the order below is part of the
+    // result and stays exactly as the conversation ran.
+    let cache = Cache::open(&PathBuf::from(
+        std::env::var("LOCOMO_CACHE").unwrap_or_else(|_| "locomo-cache.json".into()),
+    ));
+    let workers: usize = std::env::var("LOCOMO_WORKERS")
+        .ok()
+        .and_then(|w| w.parse().ok())
+        .unwrap_or(12);
     eprintln!(
         "conversation {which}: {} turns ({total} within budget), {} questions",
         turns.len(),
@@ -108,8 +123,29 @@ fn main() {
     // did not report it would be assuming the thing it is meant to check.
     let mut dropped: std::collections::BTreeMap<String, usize> = Default::default();
 
+    let prepared: Vec<Turn> = turns
+        .iter()
+        .take(total)
+        .map(|turn| Turn {
+            text: turn.text.clone(),
+            speaker: Some(turn.speaker.clone()),
+            observed_at: turn.at,
+            session: turn.id.clone(),
+        })
+        .collect();
+    let prompts: Vec<String> = prepared.iter().map(rm_extract::prompt).collect();
+    eprintln!("  pre-fetching {} extractions on {workers} threads ...", prompts.len());
+    let started = std::time::Instant::now();
+    cache::prewarm(&prompts, &provider, &cache, workers);
+    eprintln!("  extraction pass took {:.1?}", started.elapsed());
+
+    let provider = Cached {
+        inner: &provider,
+        cache: &cache,
+    };
+
     for (i, turn) in turns.iter().take(total).enumerate() {
-        if i % 25 == 0 {
+        if i % 50 == 0 {
             eprintln!("  ingesting {i}/{total} ...");
         }
         let t = Turn {
@@ -154,6 +190,14 @@ fn main() {
     } else {
         eprintln!("  store written to {}", snapshot.display());
     }
+
+    cache.save();
+    let (c, e) = cache.len();
+    eprintln!(
+        "  cache: {c} completions, {e} embeddings ({} hits, {} misses this run)",
+        cache.hits.load(std::sync::atomic::Ordering::Relaxed),
+        cache.misses.load(std::sync::atomic::Ordering::Relaxed)
+    );
 
     let reviews = engine.pending_review().len();
     println!("\n=== ingestion ===");
@@ -402,7 +446,7 @@ fn parse_when(s: &str) -> Option<rm_engine::Timestamp> {
     Some(((days * 86_400 + hour * 3_600 + minute * 60) * 1_000) as rm_engine::Timestamp)
 }
 
-fn provider_embed(p: &HttpProvider, text: &str) -> Result<Vec<f32>, String> {
+fn provider_embed(p: &Cached<'_>, text: &str) -> Result<Vec<f32>, String> {
     use rm_engine::Embedder;
     p.embed(text).map_err(|e| e.to_string())
 }
