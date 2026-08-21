@@ -58,7 +58,12 @@ match_at = 6.0
 
 [[resolution.field]]
 field = "name"
-comparator = "jaro_winkler"
+# jaro_winkler, plus one rule: a thing is never confused with what it belongs
+# to. "Melanie's son" shares all of "Melanie" and sits where the prefix bonus
+# rewards it, so plain jaro_winkler scores the pair 0.92 and asks whether a
+# woman is her own child. Use "jaro_winkler" instead for fields holding only
+# proper names, where the two behave identically anyway.
+comparator = "possessive_aware"
 # m = P(this field agrees | the two are the same thing)
 # u = P(this field agrees | they are different things) -- the field's commonness
 m = 0.9
@@ -675,8 +680,9 @@ fn comparator(name: &str, where_: &str) -> Result<Comparator, HostError> {
         "normalized" => Ok(Comparator::Normalized),
         "jaro_winkler" => Ok(Comparator::JaroWinkler),
         "token_jaccard" => Ok(Comparator::TokenJaccard),
+        "possessive_aware" => Ok(Comparator::PossessiveAware),
         _ => Err(HostError::Config(format!(
-            "{where_} in rmem.toml names a comparator this build does not know; use \"exact\", \"normalized\", \"jaro_winkler\" or \"token_jaccard\". {NOT_REPEATED}"
+            "{where_} in rmem.toml names a comparator this build does not know; use \"exact\", \"normalized\", \"jaro_winkler\", \"token_jaccard\" or \"possessive_aware\". {NOT_REPEATED}"
         ))),
     }
 }
@@ -1512,7 +1518,10 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
 
     #[test]
     fn an_unknown_comparator_names_the_entry_and_the_choices_but_not_what_was_written() {
-        let bad = TEMPLATE.replace("comparator = \"jaro_winkler\"", "comparator = \"vibes\"");
+        let bad = TEMPLATE.replace(
+            "comparator = \"possessive_aware\"",
+            "comparator = \"vibes\"",
+        );
         let err = parse(&bad).unwrap().ruleset().unwrap_err().to_string();
         assert!(!err.contains("vibes"), "{err}");
         // The entry by table and 1-based index -- a location, which is what a
@@ -1619,7 +1628,7 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         let substitutions = [
             ("metric = \"cosine\"", format!("metric = \"{FAKE}\"")),
             (
-                "comparator = \"jaro_winkler\"",
+                "comparator = \"possessive_aware\"",
                 format!("comparator = \"{FAKE}\""),
             ),
             ("kind = \"prefix\"", format!("kind = \"{FAKE}\"")),
@@ -1637,7 +1646,14 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         ];
 
         for (from, to) in substitutions {
-            let config = parse(&TEMPLATE.replace(from, &to)).expect("still valid TOML");
+            let doctored = TEMPLATE.replace(from, &to);
+            // A `from` the template no longer contains would make the
+            // replacement a no-op, the config valid, and this test pass by
+            // testing nothing. That is how this test first went stale: the
+            // template's comparator changed and the substitution stopped
+            // matching, in silence.
+            assert_ne!(doctored, TEMPLATE, "{from:?} is no longer in the template");
+            let config = parse(&doctored).expect("still valid TOML");
             // Whichever of the three refuses first; all three are driven so no
             // substitution can silently pass by never being read.
             let errors = [

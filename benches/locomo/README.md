@@ -583,3 +583,90 @@ Two things, both about being able to see the band rather than about resolution:
 The second is the more useful of the two. The review band is the project's
 answer to "refuse rather than guess", and the refusal was being handed over in a
 form nobody could act on.
+
+## The possessive guard, measured
+
+The previous section named three causes and shipped none of the fixes, because
+the obvious one — adding `kind` as a second field — promotes the possessive
+pairs from questions into silent merges. This removes the possessive pairs, so
+that route is no longer blocked.
+
+`Comparator::PossessiveAware` splits a name into what it belongs to and what it
+is — `Melanie's son` is `(Melanie, son)`, `your kids` is `(your, kids)`, and a
+plain name is `(nothing, itself)` — then compares owners with owners, heads with
+heads, and takes the weaker of the two. Both halves must agree.
+
+Keeping the owner is the part that is easy to get wrong. Comparing heads alone
+would score `"Melanie's son"` against `"Caroline's son"` at 1.0 and merge two
+different children.
+
+### The run
+
+Conversation 0 again, 402 turns ingested. The extraction cache was hit 2346
+times and missed **zero**, so the model output was byte-identical to the run in
+the previous section: this is the same extractions through a different resolver,
+not two samples of a noisy process.
+
+| | jaro_winkler | possessive_aware |
+|---|---|---|
+| entities | 124 | 124 |
+| assertions | 1508 | 1508 |
+| relations | 104 | 104 |
+| **review band** | **99** | **86** |
+| recall@10 overall | 0.617 | 0.617 |
+| single-hop | 0.586 | 0.586 |
+| multi-hop | 0.516 | 0.516 |
+| temporal | 0.757 | 0.757 |
+| open-domain | 0.636 | 0.636 |
+
+Comparing the two written stores field by field: `store`, `index`, `identity`,
+`assertions` and `rejected` are **byte-identical**. Only `review` differs.
+
+Nothing merged differently. Thirteen questions stopped being asked, and every
+other thing the run produced is the same object.
+
+### The thirteen
+
+```
+"Melanie" [person]          ~  "Melanie's son" [person]
+"Melanie" [person]          ~  "Melanie's husband" [person]
+"Melanie" [person]          ~  "Melanie's kids" [person]
+"Mel" [person]              ~  "Melanie's son" [person]
+"Mel" [person]              ~  "Melanie's husband" [person]
+"Mel" [person]              ~  "Melanie's kids" [person]
+"Melanie's husband" [person] ~ "Melanie's son" [person]
+"Melanie's husband" [person] ~ "Melanie's kids" [person]
+"Melanie's kids" [person]   ~  "Melanie's son" [person]
+"Caroline" [person]         ~  "Caroline's paintings" [work]
+"Caro" [person]             ~  "Caroline's paintings" [work]
+"kids" [thing]              ~  "kids' books" [thing]
+"you" [person]              ~  "your son" [person]
+```
+
+Every one is a thing against what it belongs to, or two things belonging to the
+same person. None is a near miss. No pair was *added*.
+
+### Why one run is enough here, having insisted three are not
+
+This file established that a single run cannot support a claim, after asserting
+a ±0.006 noise band from n=2 that turned out to be 0.074. That rule stands, and
+this is not an exception to it — the rule is about averaging out a stochastic
+process, and there is no stochastic process in this comparison. The cache
+returned every extraction verbatim, so the input was fixed; the resulting store
+was byte-identical, so the output was fixed too. Re-running would produce the
+same two files.
+
+The claim that needs the caution is the *generalisation* — that 13 of 99 is what
+this rule is worth. That is one conversation, two speakers, and one extractor's
+habits. What replicates is the mechanism, not the count.
+
+### What it does not fix
+
+The 86 remaining pairs are still mostly noise: about 55% disagree on kind, and
+the shared-stopword and shared-topic collisions (`"the beach" ~ "the book"`,
+the `LGBTQ *` family) are untouched — those names own nothing, so this rule is
+by construction a no-op on them.
+
+What has changed is that `kind` as a second field is no longer a trap. The pairs
+that adding it would have promoted into silent merges are the pairs this
+removed. That measurement has not been run.
