@@ -188,7 +188,8 @@ mod tests {
                 "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
                 "closures":[]}"#,
         ]);
-        rm_host::command::remember(&mut e, "I work at Acme", 100, "cli", &first, &first).unwrap();
+        rm_host::command::remember(&mut e, "I work at Acme", 100, "cli", None, &first, &first)
+            .unwrap();
 
         // "I started at Globex last month": a new employment, and the model
         // volunteering that the previous one ended. `spared` keeps the
@@ -203,9 +204,16 @@ mod tests {
                              "because":"starting a new job ends the previous one",
                              "days_ago":null}]}"#,
         ]);
-        let out =
-            rm_host::command::remember(&mut e, "I started at Globex", 200, "cli", &second, &second)
-                .unwrap();
+        let out = rm_host::command::remember(
+            &mut e,
+            "I started at Globex",
+            200,
+            "cli",
+            None,
+            &second,
+            &second,
+        )
+        .unwrap();
 
         let HostOutcome::Remembered { ref ingested, .. } = out else {
             panic!("{out:?}")

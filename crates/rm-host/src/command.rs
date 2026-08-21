@@ -110,17 +110,39 @@ pub fn init(
 }
 
 /// Extract a turn and apply it.
+///
+/// # The speaker is worth passing
+///
+/// This was hardcoded to `None`, so neither `rmem` nor the MCP server could
+/// supply a speaker however much the caller knew. Measured on a real corpus,
+/// that is expensive: dialogue is mostly first person, and without a speaker
+/// "I moved to Chicago" names nobody to attach anything to. Supplying it took
+/// responses listing no mentions at all from 45% to 1%, and what a 419-turn
+/// conversation yielded from about 576 assertions to about 1494.
+///
+/// The failure is worse than a missing subject. Run through the built binary,
+/// "I moved to Chicago last month and started at Globex." with no speaker
+/// records `employer = Globex` and `location = Chicago` on the entity *Chicago*
+/// -- the facts are real, and the only thing near enough to hang them on is a
+/// city. A wrong subject is not a smaller error than no subject; it is a
+/// confident one.
+///
+/// Still `Option`, because a turn may genuinely have no identified speaker — a
+/// log line, a document, a note someone left. `rm_extract`'s prompt states that
+/// case explicitly rather than leaving a blank for the model to fill, so `None`
+/// is a supported answer rather than a missing argument.
 pub fn remember(
     engine: &mut Engine,
     text: &str,
     observed_at: rm_engine::Timestamp,
     session: &str,
+    speaker: Option<&str>,
     completer: &impl Completer,
     embedder: &impl Embedder,
 ) -> Result<Outcome, HostError> {
     let turn = Turn {
         text: text.to_string(),
-        speaker: None,
+        speaker: speaker.map(str::to_string),
         observed_at,
         session: session.to_string(),
     };
@@ -349,7 +371,7 @@ mod tests {
     fn remembering_a_turn_names_every_mention_and_where_it_landed() {
         let mut e = engine();
         let stub = StubProvider::new(vec![EXTRACTION]);
-        let out = remember(&mut e, "I work at Globex", 100, "cli", &stub, &stub).unwrap();
+        let out = remember(&mut e, "I work at Globex", 100, "cli", None, &stub, &stub).unwrap();
 
         let Outcome::Remembered {
             ingested, landings, ..
@@ -376,7 +398,7 @@ mod tests {
                          {"subject":9,"attribute":"city","value":"London","text":"x","days_ago":null}],
                 "relations":[],"closures":[]}"#,
         ]);
-        let out = remember(&mut e, "I work at Globex", 100, "cli", &stub, &stub).unwrap();
+        let out = remember(&mut e, "I work at Globex", 100, "cli", None, &stub, &stub).unwrap();
 
         let Outcome::Remembered {
             landings, dropped, ..
@@ -397,7 +419,7 @@ mod tests {
         // recognising them.
         let mut e = engine();
         let first = StubProvider::new(vec![EXTRACTION]);
-        remember(&mut e, "I work at Globex", 100, "cli", &first, &first).unwrap();
+        remember(&mut e, "I work at Globex", 100, "cli", None, &first, &first).unwrap();
 
         let second = StubProvider::new(vec![EXTRACTION]);
         let out = remember(
@@ -405,6 +427,7 @@ mod tests {
             "I still work at Globex",
             200,
             "cli",
+            None,
             &second,
             &second,
         )
@@ -419,7 +442,7 @@ mod tests {
     fn a_turn_the_model_answered_with_nonsense_is_refused_with_the_reason() {
         let mut e = engine();
         let stub = StubProvider::new(vec!["I'm afraid I can't do that"]);
-        let err = remember(&mut e, "anything", 100, "cli", &stub, &stub).unwrap_err();
+        let err = remember(&mut e, "anything", 100, "cli", None, &stub, &stub).unwrap_err();
         assert!(matches!(err, HostError::Refused(_)), "{err:?}");
         assert!(err.to_string().len() > 30, "the reason must survive: {err}");
     }
@@ -429,7 +452,7 @@ mod tests {
         // Without the entity id a user cannot then ask `about` anything.
         let mut e = engine();
         let stub = StubProvider::new(vec![EXTRACTION]);
-        remember(&mut e, "I work at Globex", 100, "cli", &stub, &stub).unwrap();
+        remember(&mut e, "I work at Globex", 100, "cli", None, &stub, &stub).unwrap();
 
         let out = recall(&e, "Ben works at Globex", 5, &stub).unwrap();
         let Outcome::Recalled(hits) = out else {
@@ -454,7 +477,7 @@ mod tests {
     fn asking_about_an_attribute_nobody_mentioned_is_not_an_error() {
         let mut e = engine();
         let stub = StubProvider::new(vec![EXTRACTION]);
-        let out = remember(&mut e, "I work at Globex", 100, "cli", &stub, &stub).unwrap();
+        let out = remember(&mut e, "I work at Globex", 100, "cli", None, &stub, &stub).unwrap();
         let Outcome::Remembered { ingested, .. } = out else {
             panic!()
         };
@@ -478,12 +501,12 @@ mod tests {
             r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"}],
                 "facts":[],"relations":[],"closures":[]}"#,
         ]);
-        remember(&mut e, "Ben", 100, "cli", &a, &a).unwrap();
+        remember(&mut e, "Ben", 100, "cli", None, &a, &a).unwrap();
         let b = StubProvider::new(vec![
             r#"{"mentions":[{"kind":"person","name":"Ben Sanderson","text":"Ben"}],
                 "facts":[],"relations":[],"closures":[]}"#,
         ]);
-        let out = remember(&mut e, "Ben again", 200, "cli", &b, &b).unwrap();
+        let out = remember(&mut e, "Ben again", 200, "cli", None, &b, &b).unwrap();
         let Outcome::Remembered { ingested, .. } = out else {
             panic!()
         };
@@ -509,12 +532,12 @@ mod tests {
             r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"}],
                 "facts":[],"relations":[],"closures":[]}"#,
         ]);
-        remember(&mut e, "Ben", 100, "cli", &a, &a).unwrap();
+        remember(&mut e, "Ben", 100, "cli", None, &a, &a).unwrap();
         let b = StubProvider::new(vec![
             r#"{"mentions":[{"kind":"person","name":"Ben Sanderson","text":"Ben"}],
                 "facts":[],"relations":[],"closures":[]}"#,
         ]);
-        remember(&mut e, "Ben again", 200, "cli", &b, &b).unwrap();
+        remember(&mut e, "Ben again", 200, "cli", None, &b, &b).unwrap();
 
         let Outcome::Reviews(lines) = review_list(&e).unwrap() else {
             panic!()

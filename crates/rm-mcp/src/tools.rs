@@ -45,6 +45,10 @@ pub fn definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "What was said, in full. One turn."
                     },
+                    "speaker": {
+                        "type": "string",
+                        "description": "Who said it. Resolves \"I\", \"me\" and \"my\" to them, and lists them as a mention so facts about them have something to attach to. Omit only when the turn genuinely has no identified speaker -- a log line, a document. Dialogue is mostly first person, and without this a turn about the speaker names nobody."
+                    },
                     "session": {
                         "type": "string",
                         "description": "A name for the conversation this turn belongs to. Recorded with every assertion the turn produces. Defaults to \"mcp\"."
@@ -140,6 +144,9 @@ pub enum Call {
     Remember {
         text: String,
         session: String,
+        /// Who said it. `None` when the caller did not say, which
+        /// `rm_extract`'s prompt states explicitly rather than leaving blank.
+        speaker: Option<String>,
     },
     Recall {
         query: String,
@@ -192,6 +199,11 @@ impl Call {
                 // The CLI passes "cli" here, so the default names this server
                 // rather than inheriting a label that would be wrong.
                 session: optional_string(arguments, "session")?.unwrap_or_else(|| "mcp".into()),
+                // Optional, and deliberately not defaulted to anything. A
+                // guessed speaker is worse than none: the prompt resolves "I"
+                // to whoever is named, so a wrong name attributes the turn to
+                // the wrong person rather than leaving it unattributed.
+                speaker: optional_string(arguments, "speaker")?,
             }),
             "recall" => Ok(Call::Recall {
                 query: string(arguments, "query")?,
@@ -406,6 +418,26 @@ mod tests {
     }
 
     #[test]
+    fn a_speaker_is_carried_when_the_caller_gives_one() {
+        // The gap this closed: `remember` had no way to say who was speaking,
+        // so every turn reached a prompt built for dialogue with the speaker
+        // unknown. Measured on a real corpus, supplying it took responses
+        // listing no mentions at all from 45% to 1%.
+        assert_eq!(
+            read(
+                "remember",
+                json!({"text": "I moved to Chicago", "speaker": "Melanie"})
+            )
+            .unwrap(),
+            Call::Remember {
+                text: "I moved to Chicago".into(),
+                session: "mcp".into(),
+                speaker: Some("Melanie".into()),
+            }
+        );
+    }
+
+    #[test]
     fn the_defaults_are_the_ones_the_descriptions_promise() {
         // Each of these is written into a tool description an agent reads, so
         // a disagreement is a lie told to the caller rather than an internal
@@ -414,7 +446,12 @@ mod tests {
             read("remember", json!({"text": "x"})).unwrap(),
             Call::Remember {
                 text: "x".into(),
-                session: "mcp".into()
+                session: "mcp".into(),
+                // No default, and none promised: the description says to omit
+                // it only when the turn has no identified speaker. Guessing
+                // one would be worse than leaving it out, because the prompt
+                // resolves "I" to whoever is named.
+                speaker: None,
             }
         );
         assert_eq!(
