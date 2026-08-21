@@ -11,6 +11,22 @@ use crate::Turn;
 /// Public so a host can read it, log it, diff it across versions, or build a
 /// few-shot variant on top of it. The crate owning the contract does not mean
 /// the contract has to be a secret.
+///
+/// # A rule that was tried and removed
+///
+/// The commonest thing this prompt gets back is a fact whose `subject` names a
+/// mention the same response did not list — 178 of them in 419 turns. The
+/// obvious rule was added: *every fact\'s subject must be an index into
+/// mentions; if the turn has nothing worth listing, emit no facts either.*
+///
+/// It did nothing to the count (178 to 170) and cost 0.047 of overall recall,
+/// with facts stored falling from 574 to 498. Removing it recovered both. The
+/// reading that survives is that a model told to withhold facts when it is
+/// unsure has an easy way to comply, and it complies with the good ones too.
+///
+/// So the shape is still there and is handled where it can be handled without
+/// side effects: `extract` drops the unanchored fact and keeps the turn. Do not
+/// re-add the rule without measuring it — it has been measured once and it lost.
 pub fn prompt(turn: &Turn) -> String {
     let speaker = match &turn.speaker {
         Some(name) => format!("The speaker is {name}. Resolve \"I\", \"me\" and \"my\" to them."),
@@ -72,9 +88,6 @@ Rules:
   may be a mention; "pottery" is not.
 - "text" on a mention is the phrasing the turn used. "text" on a fact is a short
   sentence stating that fact on its own, because it is searched for separately.
-- Every fact\'s "subject" must be an index into "mentions". If the turn has
-  nothing worth listing as a mention, emit no facts either: a fact with nothing
-  to attach to cannot be stored, and it is dropped rather than guessed at.
 - "value" is a string, or null. Never a number and never true or false — write
   "2" and "true" if those are the values. Null means the attribute has no
   value: "he is between jobs" is a fact with a null value, not a missing fact.
@@ -232,20 +245,16 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_says_a_fact_needs_a_subject_that_exists() {
-        // Measured: 178 facts in 419 turns named mention 0 of a list with none
-        // in it, after the rules above told the model to stop emitting mentions
-        // for unnamed groups. It complied and kept writing the facts that
-        // referred to them. Removing the mentions without saying what becomes
-        // of their facts was half a rule.
+    fn the_prompt_does_not_tell_the_model_to_withhold_facts() {
+        // The rule that used to sit here told the model to emit no facts when
+        // it had no mentions. It did not reduce the unanchored facts it was
+        // aimed at (178 to 170) and it cost 0.047 of overall recall, because a
+        // model told to withhold when unsure withholds the good ones too. It is
+        // gone, and this is here so that adding it back is a deliberate act.
         let p = prompt(&turn("anything", None));
         assert!(
-            p.contains("must be an index into \"mentions\""),
-            "the prompt must constrain a fact's subject, not just describe it"
-        );
-        assert!(
-            p.contains("emit no facts either"),
-            "and must say what to do when there is nothing to attach one to"
+            !p.contains("emit no facts either"),
+            "the withholding rule was measured and lost; see `prompt`'s documentation"
         );
     }
 
