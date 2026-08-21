@@ -82,3 +82,75 @@ This harness sets the speaker, because otherwise it would be measuring a
 pipeline nobody would deploy. That means **its numbers are an upper bound on
 what `rmem` and `rmem-mcp` can currently do** on dialogue, not a measurement of
 them.
+
+## First run: conversation 0, 419 turns
+
+`gpt-4o-mini` extraction, `text-embedding-3-small`, 2026-08-21.
+
+### Ingestion
+
+| | |
+|---|---:|
+| turns ingested | 379 |
+| turns refused | 40 (9.5%) |
+| entities | 148 |
+| assertions | 543 |
+| relations | **17** |
+| review band | **117 pairs** (27.9 per 100 turns) |
+
+### Retrieval, recall@10 against LoCoMo evidence turns
+
+| category | | |
+|---|---:|---:|
+| **overall** | 44/149 | **0.295** |
+| temporal | 15/37 | 0.405 |
+| single-hop | 21/70 | 0.300 |
+| open-domain | 3/11 | 0.273 |
+| multi-hop | 5/31 | 0.161 |
+
+Adversarial: 11 of 47 surfaced something for a question the conversation does
+not answer; 36 correctly surfaced nothing.
+
+### What this says
+
+**Retrieval is weak, and the shape of the weakness is diagnosable.**
+
+**Temporal is the strongest category.** That is the thesis doing what it was
+built for: questions about when something was true are exactly where a
+bi-temporal store should beat a flat vector index, and it is the one category
+above 0.4. It is the only encouraging number here and it is a real one.
+
+**Multi-hop is the worst, and 17 relations explains it.** Four hundred turns of
+two people discussing their lives produced seventeen relationships. There is
+essentially no graph, so there is nothing to hop over, and `rm-graph` — a whole
+crate — is being fed almost nothing. Extraction is not finding relations.
+
+**148 entities is too many.** Two named speakers across nineteen sessions;
+even counting every person, place, employer and pet, this should be a few dozen.
+Together with 117 review pairs — nearly one per entity — the likely reading is
+that resolution is *under*-merging: the same person arriving repeatedly as new
+entities, each near-duplicate then generating review questions. That is an
+inference from two aggregates, not a measurement, which is why the harness now
+writes its store: the next run can confirm or refute it by looking.
+
+**The review band is impractical at this rate.** 117 questions for a human, from
+one conversation. The band is not dead — it fires on real ambiguity — but at
+27.9 per 100 turns it is asking more than anyone will answer. If the
+under-merging reading is right, most of these are the same question about the
+same person, and fixing resolution shrinks this without touching the thresholds.
+
+**9.5% of turns were dropped.** The refusals are correct — they are the
+discipline working — but a tenth of a real conversation never entering the store
+is a quality problem, not a robustness success. The dominant shape is the model
+naming a mention index that does not exist.
+
+### What this does not say
+
+These numbers came from a pipeline that sets the speaker, which `rmem` and
+`rmem-mcp` cannot do. They are an upper bound on the shipped tools, not a
+measurement of them.
+
+One conversation, one model, one run. Nothing here is a published-baseline
+comparison: LoCoMo's own baselines answer questions, and this measures
+retrieval, so the numbers are not the same quantity and must not be read
+against each other.

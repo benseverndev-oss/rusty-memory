@@ -130,6 +130,20 @@ fn main() {
         }
     }
 
+    // Keep the store. The first version of this harness dropped the engine
+    // when it exited, so the only way to ask "what are these 148 entities?"
+    // was to pay for the whole run again. A benchmark whose output is a
+    // handful of aggregates and no artefact can tell you a number is bad and
+    // never why.
+    let snapshot = PathBuf::from(
+        std::env::var("LOCOMO_SNAPSHOT").unwrap_or_else(|_| format!("locomo-{which}.json")),
+    );
+    if let Err(e) = std::fs::write(&snapshot, engine.snapshot()) {
+        eprintln!("  could not write the snapshot: {e}");
+    } else {
+        eprintln!("  store written to {}", snapshot.display());
+    }
+
     let reviews = engine.pending_review().len();
     println!("\n=== ingestion ===");
     println!("turns ingested       {}", total - refused.len());
@@ -141,8 +155,30 @@ fn main() {
         "review band          {reviews} pairs ({:.1} per 100 turns)",
         reviews as f64 * 100.0 / total.max(1) as f64
     );
-    for (id, why) in refused.iter().take(5) {
-        println!("  refused {id}: {}", first_line(why));
+    // What the 148 are. An entity count alone cannot distinguish a
+    // conversation that really mentioned that many things from a resolver
+    // that made four Carolines.
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for e in engine.entity_ids() {
+        let kind = engine
+            .store_history(e, "kind")
+            .last()
+            .and_then(|v| v.value.clone())
+            .unwrap_or_else(|| "?".to_string());
+        *kinds.entry(kind).or_default() += 1;
+    }
+    println!("entities by kind     {kinds:?}");
+
+    // Why the refusals happened, not just how many. One line per distinct
+    // shape: 40 instances of one bug and 40 different bugs need different
+    // work, and a count cannot tell them apart.
+    let mut shapes: std::collections::BTreeMap<&str, usize> = Default::default();
+    for (_, why) in &refused {
+        *shapes.entry(first_line(why)).or_default() += 1;
+    }
+    println!("\nrefusals by shape:");
+    for (why, n) in &shapes {
+        println!("  {n:>3}x {why}");
     }
 
     // ---- retrieval ---------------------------------------------------------
