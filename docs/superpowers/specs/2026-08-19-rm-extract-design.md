@@ -184,6 +184,21 @@ Each names what was wrong. A partial extraction is a turn silently
 half-remembered, and nothing downstream can tell it apart from a turn that
 genuinely said less.
 
+*(Revised — see `rm_extract::extract`.)* The reasoning above survived contact
+with real dialogue; the conclusion did not. Running 419 turns of LoCoMo through
+this refused 135 of them, and the shapes causing it were nearly always one bad
+field beside several good ones — a fact naming a mention the model chose not to
+list, an attribute answered `true` where a string belongs. Discarding a
+correctly identified person and a well-formed fact about her over a *second*
+fact is not caution.
+
+The argument's force is entirely in the word *silently*, so what changed is that
+word: `Extraction::dropped` records each item that was not kept and why, and it
+is rendered by `rmem` and by the MCP server rather than only existing. A partial
+extraction is now a turn *reportedly* half-remembered, which downstream can tell
+apart by looking. Refusal is kept for a response that is not the JSON asked for
+— there is no parsed half of that to keep.
+
 No retry logic. The host owns the `Completer`, so retries, backoff and provider
 failover are its business and it is better placed to do them.
 
