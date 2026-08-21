@@ -427,3 +427,65 @@ nothing at all.
 Structural counts — refusals by shape, items dropped by shape, what the model
 actually emitted — are worth more per run than the retrieval metric, and should
 be preferred where a question can be put in those terms.
+
+## Sixth result: the speaker as a mention
+
+Three cold-cache runs before, three after, reported as mean and range per the
+rule above.
+
+### The direct test — structural, over ~1,200 responses each
+
+| | before | after |
+|---|---:|---:|
+| responses listing no mentions | 45% | **1%** |
+| responses listing two or more | 15% | **72%** |
+| facts with nothing listed (the unanchored shape) | 258 | **0** |
+| items dropped from kept turns | 205 | **3** (mean of 3, 4, 2) |
+
+### The consequences
+
+| | before: mean (range) | after: mean (range) |
+|---|---:|---:|
+| **overall recall@10** | 0.349 (0.315–0.389) | **0.615 (0.591–0.658)** |
+| relations | 18 (14–23) | **115 (106–120)** |
+| assertions | 576 (547–607) | **1494 (1482–1506)** |
+| turns refused | 35 (31–38) | **16 (12–19)** |
+| entities | 87 (82–91) | 107 (104–111) |
+| review band | 38 (30–43) | 62 (56–66) |
+
+**The ranges do not overlap on any of the first four.** Recall's two ranges are
+separated by 0.202 — nearly three times the width of either. This is the first
+change in this file whose effect is larger than the noise it is measured
+against, and the only one that can be stated without hedging.
+
+### What was actually wrong
+
+The near-empty relation graph was a **ceiling, not a reluctance**. Only 15% of
+turns listed two things, and a relation names two mention indices, so 85% of
+turns could not carry one however the prompt was worded. Given two mentions the
+model related them 26% of the time before and 34% after — barely changed. Five
+prompt revisions aimed at persuading it to emit relations were aimed at the
+wrong quantity, and a sixth would have been too.
+
+The 258 unanchored facts had the same cause. The model wrote `subject: 0` while
+listing nobody, because it treated the speaker as an implicit mention 0. Telling
+it a subject must index a mention changed nothing, because it believed it was
+indexing one.
+
+One line fixed both: the speaker line now asks for the speaker *as a mention*
+rather than only as the referent of "I".
+
+### What it cost
+
+Entities rose 87 to 107 and the review band 38 to 62 — more mentions means more
+near-matches to adjudicate. 62 open questions from one conversation is better
+than the 95 this file started with and worse than the 38 just before. Whether
+those are duplicates worth merging or genuinely distinct entities is a question
+for the store, which each run writes, and it has not been asked yet.
+
+### Method note
+
+Every earlier section reasoned from run metrics and got two hypotheses wrong.
+This one came from `analyse-cache.py` reading what the model actually said, and
+the answer — 45% of responses listing nothing — was not a quantity any run
+metric reported. Structural counts first, metrics second.
