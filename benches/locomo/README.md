@@ -670,3 +670,112 @@ by construction a no-op on them.
 What has changed is that `kind` as a second field is no longer a trap. The pairs
 that adding it would have promoted into silent merges are the pairs this
 removed. That measurement has not been run.
+
+## The kind field, and what it cost to do honestly
+
+The previous two sections established that over half the review band was pairs
+whose kinds already disagreed, and that `kind` is asserted on every entity and
+withheld from the thing that decides identity. This gives it to the resolver.
+
+### The parameters said no
+
+`Record` now carries `name` and `kind`, and the ruleset scores `kind` with
+`exact`, `m = 0.9`, `u = 0.38` — `u` measured across four stores as the rate at
+which two entities sharing a name prefix, which is the set blocking actually
+compares, happen to share a kind.
+
+Adding that field alone made things worse, and the test suite said so before the
+benchmark did. Three tests failed on a fixture of `"Ben Severn"` against
+`"Ben Sanderson"` — two different people, both `person` — which stopped being a
+question and became an automatic merge. Agreement on kind is worth
+`log2(0.9/0.38)` = +1.24 bits, and that was enough to push it over `match_at`.
+
+The tempting response is to raise `u` until the answers look right. At `u = 0.7`
+everything behaves. But `u` is a measured quantity, and 0.7 is not what it
+measured — that is fitting a parameter to a conclusion.
+
+The real problem is elsewhere. `name` contributes up to 6.49 bits on its own,
+and `review_at = 4.0` / `match_at = 6.0` were calibrated when it was the only
+field. *Any* second field with positive agreement weight shifts every pair up.
+The thresholds were wrong, not the probabilities.
+
+### Raising both thresholds by exactly the agreement weight
+
+`review_at` 4.0 → 5.2439 and `match_at` 6.0 → 7.2439. Two consequences, both
+asserted by a test:
+
+- A pair whose kinds **agree** scores 1.2439 more against thresholds 1.2439
+  higher, so it is decided exactly as it was before. The change is a no-op on
+  it.
+- A pair whose kinds **differ** can never be asked about. A name contributes at
+  most 6.49 bits, a kind disagreement costs 2.63, and 6.49 − 2.63 = 3.86 is
+  below `review_at`. "Paris" the city is not "Paris" the person and no spelling
+  makes it so.
+
+The second is a threshold policy, not something the probabilities imply: `m =
+0.9` says one true match in ten disagrees on kind, and the veto discards those.
+Lower the two thresholds and it becomes a penalty again.
+
+### The run
+
+Same corpus, same 402 turns, cache hit 2346 times and missed zero — so again one
+set of extractions through two resolvers.
+
+| | possessive_aware only | + kind |
+|---|---|---|
+| entities | 124 | 125 |
+| assertions | 1508 | 1508 |
+| relations | 104 | 104 |
+| **review band** | **86** | **31** |
+| — of which kinds differ | 55 | **0** |
+| recall@10 overall | 0.617 | 0.617 |
+| single-hop | 0.586 | 0.586 |
+| multi-hop | 0.516 | 0.516 |
+| temporal | 0.757 | 0.757 |
+| open-domain | 0.636 | 0.636 |
+
+The band is down 64% from the previous section and 69% from where #17 measured
+it, and not one remaining pair disagrees on kind.
+
+Unlike the possessive run, the store here genuinely differs — `store`,
+`identity` and `assertions` all changed. The identical recall is therefore a
+measurement rather than a consequence of nothing having moved.
+
+### The one entity that changed, which is the interesting part
+
+Entities went up by one, because something that used to merge no longer does.
+
+Before, one entity `Oliver` held `kind: [animal, animal, person, animal]` — a
+record contradicting itself — with both "hid a bone in a slipper" and
+`favorite_food: parsley, veggies`. After, there are two: `Oliver [animal]` with
+the bone, and `Oliver [person]` with the parsley.
+
+The corpus says Oliver is Melanie's cat. The parsley is not his: that turn is
+Caroline answering "can you show me one of Oscar?" with "check out this pic of
+him eating parsley", so the food belongs to Oscar, her guinea pig. Extraction
+misread the subject *and* the kind on one turn.
+
+So the extra entity is not a true match being split. It is a phantom being kept
+out of a real entity's record — the cat no longer eats parsley. The extraction
+error is still there and this change does not fix it; what changed is that it no
+longer contaminates something correct.
+
+That is the veto's cost and its benefit in one example. It cannot tell a
+mislabelled kind from a genuinely different one, so it acts on both. Here that
+happened to be right. On `"pets" [animal]` against `"pet" [thing]` — the same
+thing, kinded differently on two runs — it will be wrong, and those two will
+never be offered for merging.
+
+### What is left
+
+Thirty-one pairs, none of them a kind disagreement. By eye, roughly half are
+worth asking — `"Mel" ~ "Mell"`, `"Caroline" ~ "Caro"`,
+`"adoption agency" ~ "adoption advice/assistance group"`, the several spellings
+of the pride parade — and roughly half are the shared-prefix collisions this
+file has named twice and not addressed: `"the beach" ~ "the café"`,
+`"concert" ~ "connection"`, `"some people" ~ "some pretty cool stuff"`, and the
+`LGBTQ *` family, which alone is a third of what remains.
+
+That is the next thing, and it is a blocking problem rather than a scoring one:
+`prefix n = 3` puts every name beginning "the" or "LGB" in one bucket, and
+Jaro-Winkler then rewards the same prefix a second time in the score.

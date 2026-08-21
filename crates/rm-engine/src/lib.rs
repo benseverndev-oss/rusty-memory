@@ -162,11 +162,13 @@ pub enum EngineError {
     ///
     /// The third of the three refusals `rm_extract::extract` applies, and the
     /// one that costs most if it is skipped. [`Engine::ingest`] resolves a
-    /// mention on a `Record` holding only `name`, and the blocking key that
-    /// finds its candidates is a prefix of that field -- so an empty name
-    /// yields the *same* key for every nameless mention, putting all of them in
-    /// one block, where each scores against every other on the one field they
-    /// share and finds it blank on both sides, which agrees.
+    /// mention on a `Record` holding its name and its kind, and the blocking
+    /// key that finds its candidates is a prefix of the name -- so an empty
+    /// name yields the *same* key for every nameless mention, putting all of
+    /// them in one block, where each scores against every other and finds the
+    /// name blank on both sides, which agrees. The kind does not save it:
+    /// nameless mentions sharing a kind agree on that too, and the pile of
+    /// them a long conversation produces is mostly one or two kinds.
     ///
     /// What that agreement buys depends on the ruleset, and both answers are
     /// wrong. A ruleset that trusts a name match on its own merges distinct

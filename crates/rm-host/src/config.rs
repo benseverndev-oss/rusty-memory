@@ -53,8 +53,29 @@ metric = "cosine"
 # Evidence, in bits, for two mentions being the same thing.
 # Below review_at: different. Above match_at: the same.
 # Between them: you are asked, and nothing is merged until you answer.
-review_at = 4.0
-match_at = 6.0
+#
+# These are calibrated against the fields below and are not portable away from
+# them. They were 4.0 and 6.0 when `name` was the only field; adding `kind`
+# adds log2(0.9/0.38) = 1.2439256 bits to every pair whose kinds agree, so both
+# rose by that much and a pair that agrees on kind lands where it landed
+# before. Written to four places, which leaves each boundary 0.000026 bits
+# below the exact figure -- a pair inside that sliver really would decide
+# differently, and nothing rounder gets closer. Delete the `kind` rule
+# and these want to come back down, or every threshold is 1.24 bits stricter
+# than it reads.
+#
+# The shift also makes a kind disagreement final rather than merely expensive.
+# A name can contribute at most log2(0.9/0.01) = 6.49 bits, a kind
+# disagreement costs 2.63, and 6.49 - 2.63 = 3.86 is below review_at -- so two
+# entities whose kinds differ are never asked about however identical their
+# names. "Paris" the city is not "Paris" the person, and no spelling makes it
+# so. The cost is that extraction's own inconsistencies become final too: it
+# called the same pets "animal" one run and "thing" the next, and those two
+# will now never be offered for merging. That is a threshold policy, not
+# something the probabilities below imply -- lower these two and the veto
+# becomes a penalty again.
+review_at = 5.2439
+match_at = 7.2439
 
 [[resolution.field]]
 field = "name"
@@ -68,6 +89,27 @@ comparator = "possessive_aware"
 # u = P(this field agrees | they are different things) -- the field's commonness
 m = 0.9
 u = 0.01
+
+# What a thing is, which is often the whole answer. The kind is asserted on
+# every entity anyway, and withholding it from resolution meant a person and a
+# place were compared on their names alone -- over half the review band was
+# pairs whose kinds already disagreed.
+#
+# "exact" because these are drawn from a closed vocabulary: "person" is not a
+# near miss for "place", and a fuzzy comparator over category labels would
+# invent agreement between "organisation" and "animal" that nothing means.
+#
+# u is high because there are only a handful of kinds and the distribution is
+# skewed: 0.38 is the rate at which two entities that share a name prefix --
+# the pairs blocking actually compares -- happen to share a kind, measured
+# across four stores from a real corpus. m is lower than for a name because
+# extraction is not perfectly consistent about the boundary cases; it called
+# the same pets "animal" once and "thing" the next run.
+[[resolution.field]]
+field = "kind"
+comparator = "exact"
+m = 0.9
+u = 0.38
 
 [[resolution.blocking]]
 kind = "prefix"
@@ -980,7 +1022,7 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             TEMPLATE.replace("dimension = 1536", &format!("dimension = \"{FAKE}\"")),
             // Value position again, on a float, which is a different serde
             // message with the same shape.
-            TEMPLATE.replace("review_at = 4.0", &format!("review_at = \"{FAKE}\"")),
+            doctored("review_at = 5.24", &format!("review_at = \"{FAKE}\"")),
             // And in a table whose keys are open, where it parses as data
             // rather than failing here at all.
             format!("{TEMPLATE}\"{FAKE}\" = \"nonsense\"\n"),
@@ -1392,6 +1434,24 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         );
     }
 
+    /// `TEMPLATE` with one substitution applied, refusing to return quietly if
+    /// it did not apply.
+    ///
+    /// Several tests here doctor the template by string match to produce a bad
+    /// config. A `from` the template no longer contains makes the replacement a
+    /// no-op, the config valid, and the test pass by testing nothing -- which
+    /// has now happened twice, once when the template's comparator changed and
+    /// once when its thresholds did. The assertion is the whole point of the
+    /// helper.
+    fn doctored(from: &str, to: &str) -> String {
+        let out = TEMPLATE.replace(from, to);
+        assert_ne!(
+            out, TEMPLATE,
+            "{from:?} is no longer in the template, so this test doctors nothing"
+        );
+        out
+    }
+
     #[test]
     fn a_ruleset_carries_the_thresholds_and_fields_the_file_asked_for() {
         // `Ruleset` keeps its rules and thresholds private, so the only honest
@@ -1417,15 +1477,17 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             &[BlockingKey::Prefix("name".to_string(), 3)]
         );
 
-        // review_at = 4.0, match_at = 6.0: read straight off the boundaries
+        // review_at = 5.24, match_at = 7.24: read straight off the boundaries
         // decide() draws, since that is the only way to observe them.
-        assert_eq!(ruleset.decide(3.999), Decision::NonMatch);
-        assert_eq!(ruleset.decide(4.0), Decision::Review);
-        assert_eq!(ruleset.decide(5.999), Decision::Review);
-        assert_eq!(ruleset.decide(6.0), Decision::Match);
+        assert_eq!(ruleset.decide(5.2438), Decision::NonMatch);
+        assert_eq!(ruleset.decide(5.2439), Decision::Review);
+        assert_eq!(ruleset.decide(7.2438), Decision::Review);
+        assert_eq!(ruleset.decide(7.2439), Decision::Match);
 
         // m = 0.9, u = 0.01 on "name": two records that agree completely score
-        // exactly the field's agreement weight, log2(m / u).
+        // exactly the field's agreement weight, log2(m / u). The `kind` rule
+        // contributes nothing here because neither record carries the field --
+        // silence is not disagreement.
         let a = Record::new().with("name", "Ben Severn");
         let b = Record::new().with("name", "Ben Severn");
         let expected = (0.9_f64 / 0.01).log2();
@@ -1433,6 +1495,60 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         assert!(
             (got - expected).abs() < 1e-9,
             "score = {got}, expected {expected}"
+        );
+
+        // And with the kind present on both, agreeing, its own weight on top.
+        let a = a.with("kind", "person");
+        let b = b.with("kind", "person");
+        let expected = expected + (0.9_f64 / 0.38).log2();
+        let got = ruleset.score(&a, &b);
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "score = {got}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn the_thresholds_leave_an_agreeing_kind_exactly_where_it_was_and_veto_a_disagreeing_one() {
+        // The two properties that justify moving review_at and match_at rather
+        // than tuning `u` until the answers looked right.
+        use rm_engine::{Decision, Record};
+        let ruleset = parse(TEMPLATE).unwrap().ruleset().unwrap();
+        let agreement = (0.9_f64 / 0.38).log2();
+
+        // One: both thresholds rose by the kind agreement weight, so a pair
+        // whose kinds agree is decided as it was when `name` was the only
+        // field and the thresholds were 4.0 and 6.0.
+        //
+        // Held to a thousandth of a bit rather than exactly: the thresholds
+        // are decimal literals in a config file and the weight is irrational,
+        // so the two boundaries differ by about 0.00005 bits and a pair inside
+        // that sliver really would decide differently. The values below sit
+        // clear of it, which is the honest form of this claim.
+        let rec = |name, kind| Record::new().with("name", name).with("kind", kind);
+        for name_score in [3.9_f64, 4.001, 5.0, 5.999, 6.001, 6.5] {
+            let old = if name_score >= 6.0 {
+                Decision::Match
+            } else if name_score >= 4.0 {
+                Decision::Review
+            } else {
+                Decision::NonMatch
+            };
+            assert_eq!(
+                ruleset.decide(name_score + agreement),
+                old,
+                "a name scoring {name_score} with an agreeing kind moved band"
+            );
+        }
+
+        // Two: a kind disagreement is final, not merely expensive. Identical
+        // names are the strongest evidence the ruleset can produce, and they
+        // are still not enough.
+        let identical = ruleset.score(&rec("Paris", "place"), &rec("Paris", "person"));
+        assert_eq!(
+            ruleset.decide(identical),
+            Decision::NonMatch,
+            "identical names, different kinds, scored {identical}"
         );
     }
 
@@ -1493,7 +1609,7 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         let start = TEMPLATE.find("[[resolution.field]]").unwrap();
         let end = TEMPLATE.find("[[resolution.blocking]]").unwrap();
         let none = format!("{}{}", &TEMPLATE[..start], &TEMPLATE[end..])
-            .replace("review_at = 4.0", "field = []\nreview_at = 4.0");
+            .replace("review_at = 5.24", "field = []\nreview_at = 5.24");
 
         let config = parse(&none).expect("still valid TOML");
         let Err(err) = config.ruleset() else {
@@ -1508,12 +1624,11 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
         // which cannot reach it (see its comment), but `Ruleset::new`'s own
         // validation, exercised directly here with the file's own numbers
         // swapped -- review_at above match_at leaves no review band at all.
-        let swapped = TEMPLATE
-            .replace("review_at = 4.0", "review_at = 6.0")
-            .replace("match_at = 6.0", "match_at = 4.0");
+        let swapped = doctored("review_at = 5.24", "review_at = 7.24")
+            .replace("match_at = 7.24", "match_at = 5.24");
         let err = parse(&swapped).unwrap().ruleset().unwrap_err();
-        assert!(err.to_string().contains('6'), "{err}");
-        assert!(err.to_string().contains('4'), "{err}");
+        assert!(err.to_string().contains("7.24"), "{err}");
+        assert!(err.to_string().contains("5.24"), "{err}");
     }
 
     #[test]
