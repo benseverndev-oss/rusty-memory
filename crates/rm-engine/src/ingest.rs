@@ -137,7 +137,15 @@ impl Engine {
             // every-assertion-has-a-vector rule free of exceptions.
             let remembered = self.remember(Observation {
                 kind: mention.kind.clone(),
-                mention: Record::new().with("name", mention.name.clone()),
+                // Name *and* kind. The kind was asserted as an attribute two
+                // lines below and withheld from the thing that decides identity,
+                // so a person and a place were compared on their names alone --
+                // measured on a real corpus, over half the review band was pairs
+                // whose kinds already disagreed. Whether the ruleset reads it is
+                // the ruleset's business; the engine's job is not to hide it.
+                mention: Record::new()
+                    .with("name", mention.name.clone())
+                    .with("kind", mention.kind.clone()),
                 attribute: "kind".to_string(),
                 value: Some(mention.kind.clone()),
                 valid: Interval::since(turn.observed_at),
@@ -183,7 +191,9 @@ impl Engine {
                 entity,
                 &Observation {
                     kind: subject_mention.kind.clone(),
-                    mention: Record::new().with("name", subject_mention.name.clone()),
+                    mention: Record::new()
+                        .with("name", subject_mention.name.clone())
+                        .with("kind", subject_mention.kind.clone()),
                     attribute: fact.attribute.clone(),
                     value: fact.value.clone(),
                     valid: Interval::since(fact.valid_from),
