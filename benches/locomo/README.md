@@ -790,3 +790,81 @@ file has named twice and not addressed: `"the beach" ~ "the café"`,
 That is the next thing, and it is a blocking problem rather than a scoring one:
 `prefix n = 3` puts every name beginning "the" or "LGB" in one bucket, and
 Jaro-Winkler then rewards the same prefix a second time in the score.
+
+## The attribute vocabulary, and why the temporal machinery never runs
+
+Found while looking for something else. The search was for a suspected
+extraction bug -- possessive turns collapsing onto the owner and misattributing
+the fact -- and that bug is not what the corpus shows. Conversation 0 contains
+thirty turns naming an unnamed relative ("my kids", "the kids", "my husband"),
+and in twenty-three of them every fact landed on the speaker. That is the
+prompt's unnamed-group rule working as written: *say what the turn says about
+them as a fact about someone who is named*. The names it produces --
+`children_excitement`, `kids_experience` -- put the relationship in the
+attribute name.
+
+Which turned out to be the thread worth pulling.
+
+`analyse-store.py` reads a written snapshot and counts what is in it. Over
+conversation 0:
+
+```
+entities            125
+assertions          735   (excluding `kind`)
+distinct attributes 498
+used exactly once   408  (82% of names)
+assertions per name 1.48
+
+attributes with more than one version: 82 of 550  (15%)
+  assertions inside them: 267 of 735  (36%)
+```
+
+Supersession, survivorship, valid intervals and `about` all operate *within one
+attribute name on one entity*. A later fact only contradicts an earlier one if
+both were recorded under the same name. So that 15% is the entire surface on
+which any of this project's temporal machinery can act. The other 85% is inert
+by construction.
+
+Nothing in five runs of a retrieval metric could have shown this. Recall is
+embedding search over a fact's own text and never reads the attribute name.
+
+### It fails in both directions at once
+
+Too many names, and nothing ever meets: `feeling`, `emotion`,
+`emotional_response`, `feeling_about_art` and `emotional_impact` are five names
+for one idea. Seventeen names share the stem `suppor*`, twelve share `feelin*`.
+
+Too few names where they do meet, and unrelated facts are forced into one slot.
+`entity 0` has fourteen versions of `feeling`: *happy*, *thankful*, *love for
+horses*, *liberated and empowered*, *peace and serenity*, *alone*. Those are
+fourteen moments, not fourteen claims about one thing. Driven through the built
+binary against that store:
+
+```
+$ rmem about 0 feeling
+survivorship refused: 2 different values share the latest observation time
+(1697193060000); simultaneous contradictory assertions have no "most recent".
+
+$ rmem about 0 experience
+amazing journey                     # one of nine; the other eight unreachable
+
+$ rmem about 0 goal
+having a family                     # one of six
+```
+
+The refusal is the store behaving correctly on data it should never have been
+given. `experience` is the quieter failure: eight facts are still in the log and
+`about` will not return them, because the ninth superseded them for sharing a
+name they should not have shared.
+
+### The cause is a gap in the prompt
+
+`kind` is a closed vocabulary of seven. `value` is a string or null. `days_ago`
+is a whole number of days or null. The attribute name has no rule at all -- not
+a vocabulary, not a preference for reuse, not even a sentence saying what an
+attribute *is*. The model invents one per fact, which is the only thing it can
+do when nothing has been asked of it.
+
+That is the next thing to change, and it needs a measurement recall@10 cannot
+give: the counts above, before and after. `analyse-store.py` exists so that
+measurement has somewhere to come from.
