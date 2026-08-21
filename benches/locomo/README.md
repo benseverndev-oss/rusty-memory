@@ -321,3 +321,52 @@ value rule, which is one extraction pass, and it should be tested rather than
 believed.
 
 Nothing here changed relations: 15 to 13. Five runs, no movement.
+
+## Fifth run: the value rule alone
+
+Reverting the subject rule and keeping the value rule separates the two.
+
+| | salvage only | + both rules | **+ value rule only** |
+|---|---:|---:|---:|
+| **overall recall@10** | 0.376 | 0.329 | **0.389** |
+| assertions | 574 | 498 | **607** |
+| booleans dropped | 49 | 0 | **0** |
+| unanchored facts dropped | 178 | 170 | 195 |
+| entities | 92 | 78 | 91 |
+| relations | 15 | 13 | **23** |
+| turns refused | 30 | 32 | 31 |
+
+### The hypothesis held
+
+Recall recovered to 0.389 and facts stored to 607, both above where they were
+before either rule existed. The withholding sentence was the cause: a model told
+to emit no facts when it has no mentions complies with the good ones too.
+
+The value rule keeps its gain — booleans stay at 0 — and costs nothing. This is
+the best configuration measured, and it is the one in the tree.
+
+0.376 to 0.389 is 0.013 against a noise band of 0.006, so "at least as good" is
+the honest claim rather than "better".
+
+### Relations moved for the first time
+
+17, 16, 15, 15, 13, **23**. Every previous run sat in a band of 13 to 17; this
+one is half again above it.
+
+**This is not a fix and should not be read as one.** Nothing in this change
+targeted relations — the value rule is about a field type, and the reverted rule
+was about facts. There is no variance estimate for the relation count, no run has
+ever been repeated at a fixed configuration to get one, and a single number
+outside a band of five is exactly the shape of result that has already been wrong
+twice in this file.
+
+What it does justify is measuring it: two runs at this configuration would say
+whether 23 is a real level or a good sample, and that costs one extraction pass
+each now that responses are cached.
+
+### The unanchored facts got worse, as expected
+
+178 to 195. The reverted rule was suppressing perhaps a dozen of them, at the
+cost of a hundred good facts and 0.047 of recall. They remain the largest single
+shape, they remain untouched by two direct instructions, and `extract` continues
+to drop them without losing their turns.
