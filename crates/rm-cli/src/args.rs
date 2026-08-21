@@ -35,7 +35,8 @@ pub const USAGE: &str = "\
 rmem — a memory that resolves contradictions deterministically
 
     rmem init [--force]              write rmem.toml, asking the model its embedding size
-    rmem remember \"<turn>\"           extract a turn and record what it said
+    rmem remember \"<turn>\" [--speaker <name>]
+                                     extract a turn and record what it said
     rmem recall \"<query>\" [-k N]     find assertions near a query (default 5)
     rmem about <entity> <attribute>  what the store believes an attribute holds
     rmem review                      open questions the resolver could not answer
@@ -47,10 +48,22 @@ Entity ids come from `remember` and `recall`. Review ids come from `review`.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    Init { force: bool },
-    Remember { text: String },
-    Recall { query: String, k: usize },
-    About { entity: u64, attribute: String },
+    Init {
+        force: bool,
+    },
+    Remember {
+        text: String,
+        /// Who said it, so first-person references resolve to them.
+        speaker: Option<String>,
+    },
+    Recall {
+        query: String,
+        k: usize,
+    },
+    About {
+        entity: u64,
+        attribute: String,
+    },
     ReviewList,
     ReviewConfirm(u64),
     ReviewReject(u64),
@@ -89,12 +102,36 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
             })
         }
 
-        "remember" => match args.get(1) {
-            Some(text) => Ok(Command::Remember { text: text.clone() }),
-            None => Err(CliError::Usage(format!(
-                "remember needs the turn to remember, in quotes\n\n{USAGE}"
-            ))),
-        },
+        "remember" => {
+            let Some(text) = args.get(1) else {
+                return Err(CliError::Usage(format!(
+                    "remember needs the turn to remember, in quotes\n\n{USAGE}"
+                )));
+            };
+            // The same trap `-k` set for `recall`: a flag sitting where the
+            // positional belongs parses as the positional, and the command
+            // succeeds having remembered the word "--speaker".
+            if text == "--speaker" {
+                return Err(CliError::Usage(format!(
+                    "remember needs the turn before --speaker, in quotes: `rmem remember \"<turn>\" --speaker \"<name>\"`\n\n{USAGE}"
+                )));
+            }
+            let speaker = match args.iter().position(|a| a == "--speaker") {
+                None => None,
+                Some(i) => Some(
+                    args.get(i + 1)
+                        .filter(|n| !n.trim().is_empty())
+                        .ok_or_else(|| {
+                            CliError::Usage(format!("--speaker needs a name\n\n{USAGE}"))
+                        })?
+                        .clone(),
+                ),
+            };
+            Ok(Command::Remember {
+                text: text.clone(),
+                speaker,
+            })
+        }
 
         "recall" => {
             let Some(query) = args.get(1) else {
@@ -186,7 +223,8 @@ mod tests {
         assert_eq!(
             parse_args(&["remember", "I moved"]).unwrap(),
             Command::Remember {
-                text: "I moved".into()
+                text: "I moved".into(),
+                speaker: None,
             }
         );
         assert_eq!(
@@ -366,5 +404,59 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn remember_takes_a_speaker() {
+        assert_eq!(
+            parse(
+                ["remember", "I moved to Chicago", "--speaker", "Melanie"]
+                    .map(String::from)
+                    .into_iter()
+            )
+            .unwrap(),
+            Command::Remember {
+                text: "I moved to Chicago".into(),
+                speaker: Some("Melanie".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn remember_without_a_speaker_says_so_rather_than_guessing() {
+        let Command::Remember { speaker, .. } =
+            parse(["remember", "someone moved"].map(String::from).into_iter()).unwrap()
+        else {
+            panic!("expected Remember")
+        };
+        assert_eq!(speaker, None);
+    }
+
+    #[test]
+    fn a_speaker_flag_in_the_turn_position_is_refused() {
+        // The trap `-k` set for `recall`: a flag where the positional belongs
+        // parses as the positional, and the command succeeds having
+        // remembered the word "--speaker".
+        let err = parse(
+            ["remember", "--speaker", "Melanie"]
+                .map(String::from)
+                .into_iter(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("needs the turn before --speaker"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_speaker_flag_with_no_name_is_refused() {
+        let err = parse(
+            ["remember", "a turn", "--speaker"]
+                .map(String::from)
+                .into_iter(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--speaker needs a name"), "{err}");
     }
 }

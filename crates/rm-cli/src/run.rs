@@ -110,9 +110,17 @@ pub fn run(
     if mutates {
         store::with_write(&path, ruleset, policy, dimension, metric, |engine| {
             match command {
-                Command::Remember { text } => {
+                Command::Remember { text, speaker } => {
                     let provider = config.provider()?;
-                    command::remember(engine, &text, now, "cli", &provider, &provider)
+                    command::remember(
+                        engine,
+                        &text,
+                        now,
+                        "cli",
+                        speaker.as_deref(),
+                        &provider,
+                        &provider,
+                    )
                 }
                 Command::ReviewConfirm(id) => command::review_confirm(engine, id),
                 Command::ReviewReject(id) => command::review_reject(engine, id),

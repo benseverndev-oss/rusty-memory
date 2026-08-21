@@ -306,9 +306,21 @@ where
         now: Timestamp,
     ) -> Result<Outcome, HostError> {
         match call {
-            Call::Remember { text, session } => {
+            Call::Remember {
+                text,
+                session,
+                speaker,
+            } => {
                 let provider = provider(config)?;
-                command::remember(engine, &text, now, &session, &provider, &provider)
+                command::remember(
+                    engine,
+                    &text,
+                    now,
+                    &session,
+                    speaker.as_deref(),
+                    &provider,
+                    &provider,
+                )
             }
             Call::ResolveReview { id, same } => {
                 if same {
