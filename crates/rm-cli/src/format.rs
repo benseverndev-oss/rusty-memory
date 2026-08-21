@@ -9,10 +9,22 @@ use rm_host::command::{MentionLanding, Outcome};
 
 pub fn render(outcome: &Outcome) -> String {
     match outcome {
-        Outcome::Initialised { path, dimension } => format!(
-            "wrote {}\nembedding dimension {dimension}, taken from the model\n\nnext: rmem remember \"something you want to remember\"",
-            path.display()
-        ),
+        Outcome::Initialised {
+            path,
+            dimension,
+            replaced_unparsable,
+        } => {
+            let notice = match replaced_unparsable {
+                Some(why) => format!(
+                    "the existing config could not be parsed, and was replaced because --force was passed: {why}\n\n"
+                ),
+                None => String::new(),
+            };
+            format!(
+                "{notice}wrote {}\nembedding dimension {dimension}, taken from the model\n\nnext: rmem remember \"something you want to remember\"",
+                path.display()
+            )
+        }
 
         Outcome::Remembered {
             ingested,
@@ -84,9 +96,7 @@ pub fn render(outcome: &Outcome) -> String {
 
         Outcome::About(Believed::Value(v)) => v.clone(),
         Outcome::About(Believed::Absent) => "no value — asserted to have none".to_string(),
-        Outcome::About(Believed::Unknown) => {
-            "nothing known — this was never discussed".to_string()
-        }
+        Outcome::About(Believed::Unknown) => "nothing known — this was never discussed".to_string(),
 
         Outcome::Reviews(lines) if lines.is_empty() => "no open questions".to_string(),
         Outcome::Reviews(lines) => {
@@ -255,6 +265,32 @@ mod tests {
             "more than one landing line names {name}"
         );
         line
+    }
+
+    #[test]
+    fn initialising_over_an_unparsable_config_says_so_plainly() {
+        let text = render(&Outcome::Initialised {
+            path: std::path::PathBuf::from("rmem.toml"),
+            dimension: 1536,
+            replaced_unparsable: Some(
+                "rmem.toml is not valid: that is not valid TOML (line 1, column 1)".to_string(),
+            ),
+        });
+        assert!(
+            text.contains("could not be parsed") && text.contains("--force"),
+            "{text}"
+        );
+        assert!(text.contains("wrote rmem.toml"), "{text}");
+    }
+
+    #[test]
+    fn initialising_a_fresh_config_carries_no_notice_about_a_replaced_one() {
+        let text = render(&Outcome::Initialised {
+            path: std::path::PathBuf::from("rmem.toml"),
+            dimension: 1536,
+            replaced_unparsable: None,
+        });
+        assert!(!text.contains("could not be parsed"), "{text}");
     }
 
     #[test]

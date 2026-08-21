@@ -13,10 +13,11 @@ use rm_engine::Timestamp;
 
 use crate::args::{parse, Command};
 use rm_host::command::{self, Outcome};
-use rm_host::config::Config;
+use rm_host::config::{Config, InitConfig};
 use rm_host::store;
 
 use crate::CliError;
+use rm_host::HostError;
 
 /// The process exit code a result becomes.
 ///
@@ -52,10 +53,24 @@ pub fn run(
         // Loaded here rather than by `init`, because init is what a user runs
         // when there is no config -- so only the provider block has to be
         // readable, and it comes from the template if the file is absent.
-        // `?` here matters: a file that exists and fails to parse must
-        // surface that, not be treated as if it were absent and silently
-        // replaced by the template's defaults.
-        let config = Config::load_or_template(config_path)?;
+        //
+        // A file that exists and fails to parse is still surfaced, not
+        // treated as if it were absent and silently replaced by the
+        // template's defaults -- that silent fallback is the bug this match
+        // exists to prevent, and it is still prevented: `--force` is the one
+        // way through, and only because a user who passes it has explicitly
+        // said "replace this file", which this then says back to them rather
+        // than doing quietly. Without `--force` the file wins exactly as it
+        // always has.
+        let (config, replaced_unparsable) = match Config::read_for_init(config_path)? {
+            InitConfig::Absent(config) | InitConfig::Loaded(config) => (config, None),
+            InitConfig::Unparsable(e) if force => (Config::from_template(), Some(e.to_string())),
+            InitConfig::Unparsable(e) => {
+                return Err(CliError::Host(HostError::Config(format!(
+                    "{e} -- pass --force to replace it with a fresh template"
+                ))));
+            }
+        };
         // Built *inside* the probe closure, not before it. `command::init`
         // refuses an existing config before it probes -- deliberately, so a
         // user who already has a file does not need a working key and a live
@@ -75,10 +90,15 @@ pub fn run(
         // `Ok(..?)` rather than a bare `return`: `?` is what applies
         // `From<HostError>`, and a `return` of the inner result would not
         // compile now that the two error types differ.
-        return Ok(command::init(config_path, force, &|| {
-            let provider = config.provider().map_err(|e| e.to_string())?;
-            provider.probe_dimension().map_err(|e| e.to_string())
-        })?);
+        return Ok(command::init(
+            config_path,
+            force,
+            replaced_unparsable,
+            &|| {
+                let provider = config.provider().map_err(|e| e.to_string())?;
+                provider.probe_dimension().map_err(|e| e.to_string())
+            },
+        )?);
     }
 
     let config = Config::load(config_path)?;
@@ -330,6 +350,45 @@ mod tests {
             !err.to_string().contains("--force"),
             "the file is not what is in the way this time: {err}"
         );
+    }
+
+    #[test]
+    fn init_without_force_refuses_an_unparsable_config_but_names_force_as_the_way_through() {
+        // The regression this guards: before this fix, `run` called
+        // `Config::load_or_template(config_path)?` unconditionally, so an
+        // unparsable `rmem.toml` blocked `init --force` exactly as hard as
+        // plain `init` -- the only escape was deleting the file by hand, and
+        // nothing said so. Without `--force` the file still wins here too,
+        // but the refusal now names the way through.
+        //
+        // The awkward fixture: `dimension` wants a `usize` and this hands it
+        // a string with a backtick in it, so `toml`'s own message would have
+        // quoted it -- the same shape `our_reason` already guards for
+        // `Config::parse`'s own refusal. This pins that `run`'s new match arm,
+        // which builds a *different* message by appending the `--force`
+        // hint, does not reopen that door.
+        let dir = TempDir::new();
+        let config = dir.path().join("rmem.toml");
+        let canary = "CANARY-`-not-a-number";
+        let broken = TEMPLATE.replace("dimension = 1536", &format!("dimension = \"{canary}\""));
+        std::fs::write(&config, &broken).unwrap();
+
+        let err = go(&config, &["init"]).unwrap_err();
+        assert!(
+            matches!(err, CliError::Host(HostError::Config(_))),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("--force"), "{err}");
+        // Distinguishes this refusal from `command::init`'s own "already
+        // exists, and it may have been edited" refusal, which also mentions
+        // `--force` and would otherwise let a regression to the silent
+        // fallback hide behind that unrelated check still firing.
+        assert!(err.to_string().contains("is not valid"), "{err}");
+        assert!(!err.to_string().contains("may have been edited"), "{err}");
+        assert!(!err.to_string().contains(canary), "{err}");
+        assert!(!err.to_string().contains('`'), "{err}");
+        // The file it refused to replace is byte-for-byte the file it was.
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), broken);
     }
 
     #[test]
