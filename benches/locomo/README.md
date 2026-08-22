@@ -1049,3 +1049,42 @@ Re-run against the same cache, conversation 1's entities do not move at all.
 The check that caught it is cheap and worth repeating on any before/after here:
 if the two stores do not share ~100% of their `(attribute, value)` pairs, they
 are not measuring what they appear to measure.
+
+## All ten
+
+Conversations 2, 4 and 6 completed once the daily request quota reset.
+Conversation 2's earlier partial run -- 194 of 663 turns, excluded above -- is
+replaced by a clean one at 637.
+
+| conv | ingested | refused | entities | attrs | once | >1 ver | band | recall@10 |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 402 | 4% | 125 | 498 | 82% | 15% | 31 | 0.617 |
+| 1 | 350 | 5% | 92 | 389 | 82% | 18% | 28 | 0.691 |
+| 2 | 637 | 4% | 194 | 652 | 80% | 18% | 21 | 0.697 |
+| 3 | 591 | 6% | 192 | 544 | 83% | 14% | 50 | 0.553 |
+| 4 | 653 | 4% | 321 | 615 | 80% | 15% | 118 | 0.729 |
+| 5 | 639 | 5% | 257 | 562 | 83% | 14% | 99 | 0.675 |
+| 6 | 666 | 3% | 263 | 634 | 82% | 13% | 50 | 0.711 |
+| 7 | 658 | 3% | 224 | 565 | 82% | 16% | 42 | 0.707 |
+| 8 | 482 | 5% | 119 | 490 | 80% | 16% | 10 | 0.686 |
+| 9 | 535 | 6% | 197 | 592 | 80% | 15% | 68 | 0.626 |
+
+**5,613 turns, twenty speakers, ten conversations.**
+
+**81.3% of attribute names are used exactly once** — 4,506 of 5,541 — and the
+range across ten conversations is 80% to 83%. The share of attributes carrying
+more than one version is 13% to 18%. Whatever the bi-temporal machinery is
+worth, it is reachable on about a sixth of what the store holds, everywhere,
+and that is now measured on the whole corpus rather than argued from one
+transcript.
+
+One inconsistency in the band column, stated rather than smoothed over:
+conversations 2, 4 and 6 were run after the article rule landed and the other
+seven before it. The rule changes only which pairs are asked about — entities
+and assertions were measured unchanged — so every other column is comparable
+and the band column is not, by roughly the 15% the rule removes.
+
+The band still ranges from 10 pairs to 118, a factor of twelve, on corpora of
+comparable size. Recall ranges 0.553 to 0.729. Neither is a measurement of
+anything this project changed; both are measurements of how much the
+conversations differ.
