@@ -36,7 +36,7 @@ mod prompt;
 
 pub use prompt::prompt;
 
-use rm_core::Timestamp;
+use rm_core::{Supersession, Timestamp};
 use serde::Deserialize;
 
 /// One line of dialogue to extract from.
@@ -88,6 +88,23 @@ pub struct Fact {
     /// be unreachable.
     pub text: String,
     pub valid_from: Timestamp,
+    /// Whether this fact replaces what the same attribute already held, or
+    /// joins it.
+    ///
+    /// The model is the only party that ever knows: the store sees arrival
+    /// order and nothing else, and arrival order says a second pet replaced the
+    /// first.
+    ///
+    /// [`prompt`] does not currently ask. It did, as a `"replaces"` boolean per
+    /// fact, and the measurement is in that function's docs -- it answered the
+    /// question well and cost 19% of the facts, which is a worse trade than
+    /// leaving them [`Supersession::Unstated`]. The field stays because the
+    /// wire format should still accept an answer: `prompt` is public so a host
+    /// can build its own, and a host that has found a way to ask without
+    /// costing an extraction should not have to fork the parser to be heard.
+    ///
+    /// [`prompt`]: crate::prompt::prompt
+    pub supersession: Supersession,
 }
 
 /// A relationship between two mentions.
@@ -246,6 +263,38 @@ struct WireFact {
     value: Option<String>,
     text: String,
     days_ago: Option<i64>,
+    /// Untyped on purpose, and the one field here that cannot fail the fact.
+    ///
+    /// A `bool` would let `"replaces": "true"` -- the same string-for-scalar
+    /// slip that cost this crate 24 turns in 419 -- discard an otherwise
+    /// perfect fact over a field that is allowed to be missing anyway. An
+    /// answer nothing can read is indistinguishable from no answer, and no
+    /// answer is already a legal one.
+    #[serde(default)]
+    replaces: Option<serde_json::Value>,
+}
+
+/// What the model said about arity, read leniently.
+///
+/// Anything unrecognised is [`Supersession::Unstated`] rather than a drop or a
+/// guess: this field is optional, so a garbled answer to it is exactly as
+/// informative as omitting it, and neither is a reason to lose the fact.
+fn claim(raw: Option<&serde_json::Value>) -> Supersession {
+    let yes = match raw {
+        None | Some(serde_json::Value::Null) => return Supersession::Unstated,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" => true,
+            "false" | "no" => false,
+            _ => return Supersession::Unstated,
+        },
+        _ => return Supersession::Unstated,
+    };
+    if yes {
+        Supersession::Corrects
+    } else {
+        Supersession::Joins
+    }
 }
 
 #[derive(Deserialize)]
@@ -405,6 +454,7 @@ pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, Ex
             value: f.value,
             text: f.text,
             valid_from,
+            supersession: claim(f.replaces.as_ref()),
         });
     }
 
@@ -537,6 +587,62 @@ mod tests {
         assert_eq!(out.facts[0].value.as_deref(), Some("Globex"));
         assert_eq!(out.relations.len(), 1);
         assert_eq!(out.relations[0].object, 1);
+    }
+
+    #[test]
+    fn a_fact_carries_what_the_model_said_about_arity() {
+        let out = extract(
+            &turn(),
+            &Canned(
+                r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
+                    "facts":[{"subject":0,"attribute":"employer","value":"Globex",
+                              "text":"Ben works at Globex","days_ago":null,"replaces":true},
+                             {"subject":0,"attribute":"pet","value":"a cat",
+                              "text":"Ben has a cat","days_ago":null,"replaces":false},
+                             {"subject":0,"attribute":"mood","value":"tired",
+                              "text":"Ben is tired","days_ago":null}],
+                    "relations":[],"closures":[]}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(out.facts[0].supersession, Supersession::Corrects);
+        assert_eq!(out.facts[1].supersession, Supersession::Joins);
+        assert_eq!(
+            out.facts[2].supersession,
+            Supersession::Unstated,
+            "a fact that did not answer says so, rather than defaulting to a claim"
+        );
+    }
+
+    #[test]
+    fn a_garbled_answer_about_arity_costs_the_answer_and_not_the_fact() {
+        // The lesson this crate already learned once, applied before it can be
+        // learned again: a model that writes `"true"` for a boolean took 24
+        // turns in 419 down with it. This field is optional, so an answer
+        // nothing can read is worth exactly what an absent one is worth -- and
+        // the fact beside it is worth keeping either way.
+        let out = extract(
+            &turn(),
+            &Canned(
+                r#"{"mentions":[{"kind":"person","name":"Ben","text":"Ben"}],
+                    "facts":[{"subject":0,"attribute":"employer","value":"Globex",
+                              "text":"Ben works at Globex","days_ago":null,"replaces":"yes"},
+                             {"subject":0,"attribute":"pet","value":"a cat",
+                              "text":"Ben has a cat","days_ago":null,"replaces":"No"},
+                             {"subject":0,"attribute":"mood","value":"tired",
+                              "text":"Ben is tired","days_ago":null,"replaces":"sometimes"},
+                             {"subject":0,"attribute":"age","value":"41",
+                              "text":"Ben is 41","days_ago":null,"replaces":7}],
+                    "relations":[],"closures":[]}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(out.facts.len(), 4, "every fact survives");
+        assert!(out.dropped.is_empty(), "and nothing is reported as lost");
+        assert_eq!(out.facts[0].supersession, Supersession::Corrects);
+        assert_eq!(out.facts[1].supersession, Supersession::Joins);
+        assert_eq!(out.facts[2].supersession, Supersession::Unstated);
+        assert_eq!(out.facts[3].supersession, Supersession::Unstated);
     }
 
     #[test]

@@ -15,7 +15,7 @@
 use rm_engine::{
     BlockingKey, Comparator, Direction, Edge, EdgeVersion, Engine, EngineError, FieldRule,
     Interval, Metric, Neighborhood, Observation, Policy, Provenance, Reached, Record, Remembered,
-    Ruleset, Source, Strategy, VectorIndex, Walk,
+    Ruleset, Source, Strategy, Supersession, VectorIndex, Walk,
 };
 
 fn ruleset() -> Ruleset {
@@ -44,6 +44,7 @@ fn person(name: &str, at: i64) -> Observation {
         value: Some("person".to_string()),
         valid: Interval::since(at),
         provenance: Provenance::new(Source::UserAssertion, at, "s"),
+        supersession: Supersession::Unstated,
         embedding: vec![1.0, 0.0, 0.0],
     }
 }
@@ -65,6 +66,7 @@ fn seen(name: &str, attribute: &str, value: &str, at: i64, v: [f32; 3]) -> Obser
         value: Some(value.to_string()),
         valid: Interval::since(at),
         provenance: Provenance::new(Source::UserAssertion, at, "session-1"),
+        supersession: Supersession::Unstated,
         embedding: v.to_vec(),
     }
 }

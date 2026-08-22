@@ -338,6 +338,7 @@ mod tests {
             value: Some(value.to_string()),
             valid: rm_engine::Interval::since(at),
             provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, at, "test"),
+            supersession: rm_engine::Supersession::Unstated,
             embedding: vec![1.0, 0.0, 0.0],
         }
     }
@@ -514,6 +515,7 @@ mod tests {
                 value: Some("Acme".to_string()),
                 valid: rm_engine::Interval::since(1),
                 provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, 1, "test"),
+                supersession: rm_engine::Supersession::Unstated,
                 embedding: vec![1.0, 0.0, 0.0],
             })
             .unwrap();
@@ -681,6 +683,7 @@ mod tests {
                 value: Some("Acme".to_string()),
                 valid: rm_engine::Interval::since(1),
                 provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, 1, "test"),
+                supersession: rm_engine::Supersession::Unstated,
                 embedding: vec![1.0, 0.0, 0.0],
             })
             .unwrap();
@@ -699,6 +702,7 @@ mod tests {
                 value: Some("Other Co".to_string()),
                 valid: rm_engine::Interval::since(2),
                 provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, 2, "test"),
+                supersession: rm_engine::Supersession::Unstated,
                 embedding: vec![0.0, 1.0, 0.0],
             })
             .unwrap();

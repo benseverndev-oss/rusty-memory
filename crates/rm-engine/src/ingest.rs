@@ -5,7 +5,7 @@
 //! to a `StableId` lives here because here is where the ids are born — inside
 //! `remember`, which resolves the mention against everything already known.
 
-use rm_core::{Interval, Provenance, Source, Timestamp};
+use rm_core::{Interval, Provenance, Source, Supersession, Timestamp};
 use rm_extract::{Extraction, Turn};
 use rm_store::StableId;
 
@@ -150,6 +150,12 @@ impl Engine {
                 value: Some(mention.kind.clone()),
                 valid: Interval::since(turn.observed_at),
                 provenance: prov.clone(),
+                // A thing is one kind at a time. Every mention re-asserts it,
+                // so this slot fills up faster than any other, and a later
+                // reading of what something is *is* the store's position on
+                // it -- a place that turns out to be an organisation is a
+                // correction, not a second nature.
+                supersession: Supersession::Corrects,
                 embedding,
             })?;
             record(&mut out, remembered);
@@ -183,8 +189,8 @@ impl Engine {
             // rather than usually hold.
             let entity = out.entities[fact.subject];
             let subject_mention = &extraction.mentions[fact.subject];
-            // `write` only reads `attribute`, `value`, `valid`, `provenance`
-            // and `embedding` -- `kind` and `mention` exist because
+            // `write` only reads `attribute`, `value`, `valid`, `provenance`,
+            // `supersession` and `embedding` -- `kind` and `mention` exist because
             // `Observation` is the one shape both `remember` and `write` take,
             // not because a fact's write needs an identity to resolve.
             let assertion = self.write(
@@ -198,6 +204,7 @@ impl Engine {
                     value: fact.value.clone(),
                     valid: Interval::since(fact.valid_from),
                     provenance: prov.clone(),
+                    supersession: fact.supersession,
                     embedding,
                 },
             )?;

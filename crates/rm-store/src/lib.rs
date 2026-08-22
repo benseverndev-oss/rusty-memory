@@ -47,7 +47,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rm_core::{Interval, Provenance, Timestamp};
+use rm_core::{Interval, Provenance, Supersession, Timestamp};
 use rm_survivor::{merge, Candidate, Held, Outcome, Refused, Strategy};
 use serde::{Deserialize, Serialize};
 
@@ -152,6 +152,19 @@ pub struct Version {
     /// transaction time; keeping one field rather than two means they cannot
     /// drift apart.
     pub provenance: Provenance,
+    /// What this assertion claims about the ones already in the slot.
+    ///
+    /// The store does not read it -- [`MemoryStore::as_of`] still answers with
+    /// one value and still breaks ties by arrival, because a caller asking for
+    /// one value has to be given one. It is carried so that a reader who wants
+    /// to know whether the later assertion *meant* to replace this one can find
+    /// out, instead of inferring it from the order and being wrong a quarter of
+    /// the time. `rm_engine`'s recall path is that reader.
+    ///
+    /// Written only when it says something, so a snapshot from before the field
+    /// existed round-trips byte for byte.
+    #[serde(default, skip_serializing_if = "Supersession::is_unstated")]
+    pub supersession: Supersession,
 }
 
 impl Version {
@@ -276,6 +289,12 @@ impl MemoryStore {
     /// Nothing is overwritten: this appends. Asserting a different value over
     /// the same valid span is a *correction*, and both versions survive so the
     /// earlier belief stays reconstructible.
+    ///
+    /// `supersession` is what this assertion claims about what the slot already
+    /// holds, and it is a parameter rather than a default so that every caller
+    /// has to have an answer. [`Supersession::Unstated`] is a real answer --
+    /// "this host does not know" -- and saying it explicitly is the difference
+    /// between a caller that has considered the question and one that has not.
     pub fn assert(
         &mut self,
         id: StableId,
@@ -283,7 +302,9 @@ impl MemoryStore {
         value: Option<String>,
         valid: Interval,
         provenance: Provenance,
+        supersession: Supersession,
     ) -> Result<(), StoreError> {
+        let value_is_absent = value.is_none();
         let entity = self
             .entities
             .get_mut(&id)
@@ -296,6 +317,17 @@ impl MemoryStore {
                 value,
                 valid,
                 provenance,
+                // A tombstone always corrects, whatever the caller passed. "She
+                // has no pets" is not one more pet: it is a claim about the
+                // whole slot, and there is no reading of it under which the
+                // values it lands on top of are still true. The caller is not
+                // second-guessed anywhere else -- this is the one case where
+                // the value itself settles the question.
+                supersession: if value_is_absent {
+                    Supersession::Corrects
+                } else {
+                    supersession
+                },
             });
         Ok(())
     }
@@ -350,12 +382,20 @@ impl MemoryStore {
 
         match outcome {
             Outcome::Survivor(None) => Ok(()),
+            // Both arms claim [`Supersession::Corrects`], for the same reason:
+            // a resolution is by construction the answer that beat the others,
+            // so whatever the slot held before it is no longer the store's
+            // position. Within a `Timeline` the spans do not correct *each
+            // other* -- they share one `observed_at`, so no reader that orders
+            // by transaction time can put one after another anyway, and their
+            // valid times are disjoint by construction.
             Outcome::Survivor(Some(value)) => self.assert(
                 id,
                 attribute,
                 held_to_value(value),
                 Interval::since(earliest),
                 latest.clone(),
+                Supersession::Corrects,
             ),
             Outcome::Timeline(facts) => {
                 for fact in facts {
@@ -365,6 +405,7 @@ impl MemoryStore {
                         held_to_value(fact.value),
                         fact.valid,
                         latest.clone(),
+                        Supersession::Corrects,
                     )?;
                 }
                 Ok(())
@@ -1058,6 +1099,7 @@ mod tests {
             Some("Acme".into()),
             Interval::since(JAN),
             user_said(MAR),
+            Supersession::Unstated,
         )
         .unwrap();
         s.assert(
@@ -1066,6 +1108,7 @@ mod tests {
             Some("Globex".into()),
             Interval::since(JUL),
             user_said(SEP),
+            Supersession::Unstated,
         )
         .unwrap();
 
@@ -1092,6 +1135,7 @@ mod tests {
             Some("Globex".into()),
             Interval::since(JAN),
             user_said(SEP),
+            Supersession::Unstated,
         )
         .unwrap();
         // True since January, but we did not hear it until September.
@@ -1106,8 +1150,15 @@ mod tests {
         let (mut s, id) = store_with_user();
         assert_eq!(s.current(id, "employer", OCT), Known::Unknown);
 
-        s.assert(id, "employer", None, Interval::since(JUL), user_said(JUL))
-            .unwrap();
+        s.assert(
+            id,
+            "employer",
+            None,
+            Interval::since(JUL),
+            user_said(JUL),
+            Supersession::Unstated,
+        )
+        .unwrap();
         // "I'm unemployed" is an answer; it must not read as "never discussed".
         assert_eq!(s.current(id, "employer", OCT), Known::Absent);
         assert!(s.current(id, "employer", OCT).is_known());
@@ -1117,16 +1168,152 @@ mod tests {
     }
 
     #[test]
+    fn a_tombstone_corrects_whatever_the_caller_claimed() {
+        // The one place the store overrules its caller. "She has no pets" is
+        // not one more pet -- it is a claim about the whole slot, and there is
+        // no reading of it under which the values beneath it survive. A host
+        // that passed `Joins` here has made a mistake the store can see.
+        let mut s = MemoryStore::new();
+        let id = s.create_entity("person", JAN);
+        s.assert(
+            id,
+            "pet",
+            Some("a dog".into()),
+            Interval::since(JAN),
+            user_said(JAN),
+            Supersession::Joins,
+        )
+        .unwrap();
+        s.assert(
+            id,
+            "pet",
+            None,
+            Interval::since(JUL),
+            user_said(JUL),
+            Supersession::Joins,
+        )
+        .unwrap();
+
+        let h = s.history(id, "pet");
+        assert_eq!(h[0].supersession, Supersession::Joins, "the dog joins");
+        assert_eq!(
+            h[1].supersession,
+            Supersession::Corrects,
+            "the tombstone corrects, whatever it was asked to claim"
+        );
+    }
+
+    #[test]
+    fn a_second_value_keeps_the_claim_it_was_given() {
+        // The complement of the test above, and the whole point of the field:
+        // two pets are two pets. Nothing here reads the claim -- `as_of` still
+        // answers with one value -- but it survives to the reader that does.
+        let mut s = MemoryStore::new();
+        let id = s.create_entity("person", JAN);
+        for (v, t, claim) in [
+            ("a dog", JAN, Supersession::Unstated),
+            ("a cat", JUL, Supersession::Joins),
+        ] {
+            s.assert(
+                id,
+                "pet",
+                Some(v.into()),
+                Interval::since(t),
+                user_said(t),
+                claim,
+            )
+            .unwrap();
+        }
+        let h = s.history(id, "pet");
+        assert_eq!(h[0].supersession, Supersession::Unstated);
+        assert_eq!(h[1].supersession, Supersession::Joins);
+
+        // And `as_of` is unchanged by any of it. A caller that asks for one
+        // value is still given one, still the latest by arrival. The claim is
+        // for readers who can hold more than one answer; this one cannot.
+        assert_eq!(s.current(id, "pet", OCT).value(), Some("a cat"));
+    }
+
+    #[test]
+    fn a_snapshot_written_before_the_field_existed_reads_as_unstated() {
+        // Not `Joins`, which would retroactively un-correct every correction
+        // ever stored, and not `Corrects`, which is the inference this field
+        // exists to stop making. The stored assertion answered no question, so
+        // it goes on answering none.
+        let mut s = MemoryStore::new();
+        let id = s.create_entity("person", JAN);
+        s.assert(
+            id,
+            "employer",
+            Some("Acme".into()),
+            Interval::since(JAN),
+            user_said(JAN),
+            Supersession::Corrects,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            json.contains("corrects"),
+            "a claim that says something is written: {json}"
+        );
+
+        // The same snapshot with the field cut out, which is exactly what every
+        // store written before this change looks like.
+        let old = json.replace(r#","supersession":"corrects""#, "");
+        let restored: MemoryStore = serde_json::from_str(&old).unwrap();
+        assert_eq!(
+            restored.history(id, "employer")[0].supersession,
+            Supersession::Unstated
+        );
+    }
+
+    #[test]
+    fn an_unstated_claim_is_not_written_at_all() {
+        // Snapshots run to tens of megabytes and are meant to be diffable, so
+        // the state that means "nothing to say" says nothing. It also means a
+        // pre-existing snapshot survives a round-trip through the new shape
+        // byte for byte, rather than acquiring a field it never had.
+        let mut s = MemoryStore::new();
+        let id = s.create_entity("person", JAN);
+        s.assert(
+            id,
+            "employer",
+            Some("Acme".into()),
+            Interval::since(JAN),
+            user_said(JAN),
+            Supersession::Unstated,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(
+            !json.contains("supersession"),
+            "the default writes nothing: {json}"
+        );
+        let restored: MemoryStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, s, "and it comes back the same store");
+    }
+
+    #[test]
     fn a_tombstone_can_itself_be_superseded() {
         let (mut s, id) = store_with_user();
-        s.assert(id, "employer", None, Interval::since(JAN), user_said(MAR))
-            .unwrap();
+        s.assert(
+            id,
+            "employer",
+            None,
+            Interval::since(JAN),
+            user_said(MAR),
+            Supersession::Unstated,
+        )
+        .unwrap();
         s.assert(
             id,
             "employer",
             Some("Globex".into()),
             Interval::since(JUL),
             user_said(SEP),
+            Supersession::Unstated,
         )
         .unwrap();
         assert_eq!(s.as_of(id, "employer", AUG, MAR), Known::Absent);
@@ -1255,6 +1442,7 @@ mod tests {
                 Some("Acme".into()),
                 Interval::since(JAN),
                 user_said(MAR),
+                Supersession::Unstated,
             )
             .unwrap_err();
         assert_eq!(err, StoreError::UnknownEntity(99));
@@ -1280,10 +1468,18 @@ mod tests {
                 Some("Acme".into()),
                 Interval::since(JAN),
                 user_said(JAN),
+                Supersession::Unstated,
             )
             .unwrap();
         store
-            .assert(user, "employer", None, Interval::since(JUL), user_said(JUL))
+            .assert(
+                user,
+                "employer",
+                None,
+                Interval::since(JUL),
+                user_said(JUL),
+                Supersession::Unstated,
+            )
             .unwrap();
 
         // Before erasing: the tombstone wins now, and January is still answerable.
@@ -1845,6 +2041,7 @@ mod tests {
                 Some("Acme".into()),
                 Interval::since(JAN),
                 user_said(JAN),
+                Supersession::Unstated,
             )
             .unwrap();
         store
@@ -2280,6 +2477,7 @@ mod tests {
             Some("Acme".into()),
             Interval::since(JAN),
             user_said(MAR),
+            Supersession::Unstated,
         )
         .unwrap();
         s.assert(
@@ -2288,6 +2486,7 @@ mod tests {
             Some("Globex".into()),
             Interval::since(JUL),
             user_said(SEP),
+            Supersession::Unstated,
         )
         .unwrap();
 
@@ -2309,6 +2508,7 @@ mod tests {
             Some("engineer".into()),
             Interval::since(JAN),
             user_said(MAR),
+            Supersession::Unstated,
         )
         .unwrap();
         s.assert(
@@ -2317,6 +2517,7 @@ mod tests {
             Some("Acme".into()),
             Interval::since(JAN),
             user_said(MAR),
+            Supersession::Unstated,
         )
         .unwrap();
         // Attributes inserted out of order still serialise identically, so

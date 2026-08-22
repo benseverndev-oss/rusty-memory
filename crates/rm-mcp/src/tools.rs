@@ -61,7 +61,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": "recall",
             "title": "Recall assertions",
-            "description": "Search memory for the assertions nearest a query, by embedding distance. Returns the entity behind every hit, so what comes back can be asked about. A hit marked superseded is one a later assertion has since replaced -- it is returned rather than hidden, because what was believed is part of the record.",
+            "description": "Search memory for the assertions nearest a query, by embedding distance. Returns the entity behind every hit, so what comes back can be asked about. Every hit carries a \"standing\": \"latest\" (nothing later under that attribute), \"joined\" (later assertions exist and each said it was one more of the same thing, so this is still true), \"corrected\" (a later assertion said it replaces this) or \"unsettled\" (something later exists and nobody said whether it replaces this). Only \"corrected\" means stale; \"still_stands\" is the same judgement as a boolean. A corrected hit is returned rather than hidden, because what was believed is part of the record.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

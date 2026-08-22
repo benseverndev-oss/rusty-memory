@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 pub use ingest::{Closed, Embedder, EmbedderError, Ingested};
 pub use policy::Policy;
-pub use read::{Believed, Query, Recalled};
+pub use read::{Believed, Query, Recalled, Standing};
 pub use review::{PendingReview, ReviewId, Settled};
 
 // Everything a caller needs to construct an `Observation`, build the index and
@@ -65,7 +65,7 @@ pub use review::{PendingReview, ReviewId, Settled};
 // not have to. A caller ingesting a turn needs to name every type in
 // `extract`'s signature and in `ingest`'s, which is why the full list below
 // goes past what `Extraction` alone would require.
-pub use rm_core::{Interval, Provenance, Source, Timestamp};
+pub use rm_core::{Interval, Provenance, Source, Supersession, Timestamp};
 pub use rm_extract::{
     extract, prompt, Closure, Completer, CompleterError, ExtractError, Extraction, Fact, Mention,
     Relation, Turn,
@@ -556,8 +556,20 @@ impl Engine {
         for attribute in &attributes {
             let versions: Vec<_> = self.store.history(absorbed, attribute).to_vec();
             for v in versions {
+                // The claim moves with the version. A merge decides *whose*
+                // slot these assertions are in and nothing about whether they
+                // corrected one another; re-deciding that here would let two
+                // entities becoming one silently rewrite what each of them had
+                // said.
                 self.store
-                    .assert(kept, attribute.clone(), v.value, v.valid, v.provenance)
+                    .assert(
+                        kept,
+                        attribute.clone(),
+                        v.value,
+                        v.valid,
+                        v.provenance,
+                        v.supersession,
+                    )
                     .map_err(on_write)?;
             }
             self.store.erase(absorbed, attribute).map_err(on_write)?;
@@ -771,6 +783,7 @@ impl Engine {
             obs.value.clone(),
             obs.valid,
             obs.provenance.clone(),
+            obs.supersession,
         )?;
         let version = self.store.history(entity, &obs.attribute).len() - 1;
 
@@ -832,6 +845,11 @@ impl Engine {
                 None,
                 Interval::since(at),
                 prov,
+                // Redundant -- the store makes every tombstone a correction --
+                // and stated anyway, because reading `Unstated` here would
+                // suggest the question was open. "Stop telling me this" is the
+                // least open question in the crate.
+                Supersession::Corrects,
             )
             .map_err(on_write)?;
         self.drop_vectors(entity, attribute);
@@ -1044,6 +1062,12 @@ pub struct Observation {
     pub value: Option<String>,
     pub valid: Interval,
     pub provenance: Provenance,
+    /// Whether this observation replaces what the attribute already held.
+    ///
+    /// [`Supersession::Unstated`] is the honest answer for a host that has not
+    /// thought about it, and it is what the recall path will report: a later
+    /// assertion exists, and nobody said whether it corrected this one.
+    pub supersession: Supersession,
     /// Caller-supplied. `rm_extract` is the only crate permitted to reach the
     /// network, so nothing here computes an embedding.
     pub embedding: Vec<f32>,
@@ -1109,8 +1133,18 @@ mod tests {
             value: Some(value.to_string()),
             valid: Interval::since(at),
             provenance: Provenance::new(Source::UserAssertion, at, "session-1"),
+            // The default a host that has not thought about it would produce,
+            // so the tests exercise the same path an unconsidered caller takes.
+            // `correcting` marks the ones that are about a fact changing.
+            supersession: Supersession::Unstated,
             embedding: vec![1.0, 0.0, 0.0],
         }
+    }
+
+    /// An observation that claims to replace what its attribute already held.
+    fn correcting(mut obs: Observation) -> Observation {
+        obs.supersession = Supersession::Corrects;
+        obs
     }
 
     fn engine() -> Engine {
@@ -2094,7 +2128,7 @@ mod tests {
     }
 
     #[test]
-    fn a_superseded_fact_is_returned_marked_not_dropped() {
+    fn a_corrected_fact_is_returned_marked_not_dropped() {
         // "What did I believe about her employer in May" needs the old fact, and
         // a caller stating it as current needs to be stopped from doing so.
         let mut e = engine();
@@ -2106,13 +2140,13 @@ mod tests {
             [1.0, 0.0, 0.0],
         ))
         .unwrap();
-        e.remember(embedded(
+        e.remember(correcting(embedded(
             "Ben Severn",
             "employer",
             "Globex",
             20,
             [0.9, 0.1, 0.0],
-        ))
+        )))
         .unwrap();
 
         let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 2)).unwrap();
@@ -2121,12 +2155,168 @@ mod tests {
             .iter()
             .find(|h| h.value.as_deref() == Some("Acme"))
             .unwrap();
-        assert!(acme.superseded, "an old fact must be returned marked");
+        assert_eq!(
+            acme.standing,
+            Standing::Corrected,
+            "an old fact must be returned marked"
+        );
+        assert!(!acme.standing.still_stands());
         let globex = hits
             .iter()
             .find(|h| h.value.as_deref() == Some("Globex"))
             .unwrap();
-        assert!(!globex.superseded);
+        assert_eq!(globex.standing, Standing::Latest);
+    }
+
+    #[test]
+    fn a_second_pet_does_not_supersede_the_first() {
+        // The defect this whole field exists for, at its smallest. Before it,
+        // recall marked "a dog" as replaced by "a cat" because the cat arrived
+        // second, and an agent reading that out forgets the dog. Measured over
+        // ten LoCoMo conversations, arrival order alone flagged 26% of every
+        // assertion in the store.
+        let mut e = engine();
+        let mut dog = embedded("Ben Severn", "pet", "a dog", 10, [1.0, 0.0, 0.0]);
+        dog.supersession = Supersession::Joins;
+        let mut cat = embedded("Ben Severn", "pet", "a cat", 20, [0.9, 0.1, 0.0]);
+        cat.supersession = Supersession::Joins;
+        e.remember(dog).unwrap();
+        e.remember(cat).unwrap();
+
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 2)).unwrap();
+        let dog = hits
+            .iter()
+            .find(|h| h.value.as_deref() == Some("a dog"))
+            .unwrap();
+        assert_eq!(dog.standing, Standing::Joined, "the dog is still a pet");
+        assert!(dog.standing.still_stands());
+    }
+
+    #[test]
+    fn an_unanswered_slot_says_it_is_unsettled_rather_than_picking_a_side() {
+        // What every assertion written before this field existed looks like.
+        // Reading it as `Joined` would retroactively un-correct every job
+        // change ever stored; reading it as `Corrected` is the inference the
+        // field exists to stop making. So it reports the question as open.
+        let mut e = engine();
+        e.remember(embedded("Ben Severn", "mood", "tired", 10, [1.0, 0.0, 0.0]))
+            .unwrap();
+        e.remember(embedded(
+            "Ben Severn",
+            "mood",
+            "cheerful",
+            20,
+            [0.9, 0.1, 0.0],
+        ))
+        .unwrap();
+
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 2)).unwrap();
+        let tired = hits
+            .iter()
+            .find(|h| h.value.as_deref() == Some("tired"))
+            .unwrap();
+        assert_eq!(tired.standing, Standing::Unsettled);
+        assert!(
+            tired.standing.still_stands(),
+            "an open question is not a correction"
+        );
+    }
+
+    #[test]
+    fn one_correction_settles_a_slot_that_also_holds_additions() {
+        // "another pet", "another pet", "actually she has none of them now".
+        // The correction speaks about the whole slot, so it outranks the
+        // additions stacked above the fact it corrects -- unanimity is required
+        // to *keep* a fact standing, not to knock it down.
+        let mut e = engine();
+        let mut first = embedded("Ben Severn", "pet", "a dog", 10, [1.0, 0.0, 0.0]);
+        first.supersession = Supersession::Joins;
+        let mut second = embedded("Ben Severn", "pet", "a cat", 20, [0.9, 0.1, 0.0]);
+        second.supersession = Supersession::Joins;
+        e.remember(first).unwrap();
+        e.remember(second).unwrap();
+        e.remember(correcting(embedded(
+            "Ben Severn",
+            "pet",
+            "none any more",
+            30,
+            [0.8, 0.2, 0.0],
+        )))
+        .unwrap();
+
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 3)).unwrap();
+        for value in ["a dog", "a cat"] {
+            let h = hits
+                .iter()
+                .find(|h| h.value.as_deref() == Some(value))
+                .unwrap();
+            assert_eq!(h.standing, Standing::Corrected, "{value}");
+        }
+    }
+
+    #[test]
+    fn two_assertions_at_one_instant_do_not_rank_each_other() {
+        // One turn saying "I have a dog and a cat" writes both at the same
+        // transaction time. Which one `Vec::push` reached first is not a fact
+        // about the world, and reporting it as a correction would be a claim
+        // built out of an index.
+        let mut e = engine();
+        e.remember(embedded("Ben Severn", "pet", "a dog", 10, [1.0, 0.0, 0.0]))
+            .unwrap();
+        e.remember(embedded("Ben Severn", "pet", "a cat", 10, [0.9, 0.1, 0.0]))
+            .unwrap();
+
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 2)).unwrap();
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            assert_eq!(h.standing, Standing::Latest, "{:?}", h.value);
+        }
+    }
+
+    #[test]
+    fn forgetting_an_attribute_corrects_it_rather_than_leaving_it_open() {
+        // "Stop telling me this" is the least ambiguous instruction the crate
+        // takes, and it is checked in the history rather than through recall
+        // because `forget` drops the attribute's vectors -- semantic recall is
+        // meant to go quiet, which is the whole point of it.
+        let mut e = engine();
+        let Remembered::Created { entity, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                10,
+                [1.0, 0.0, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("expected a new entity");
+        };
+        e.forget(
+            entity,
+            "employer",
+            20,
+            Provenance::new(Source::UserAssertion, 20, "session-2"),
+        )
+        .unwrap();
+
+        let history = e.store_history(entity, "employer");
+        assert_eq!(
+            history.len(),
+            2,
+            "the tombstone is appended, not written over"
+        );
+        assert_eq!(
+            history[1].supersession,
+            Supersession::Corrects,
+            "a tombstone leaves nothing under it standing"
+        );
+        assert!(
+            e.recall(&Query::new(vec![1.0, 0.0, 0.0], 5))
+                .unwrap()
+                .is_empty(),
+            "and recall goes quiet, which is what was asked for"
+        );
     }
 
     #[test]
@@ -2153,8 +2343,9 @@ mod tests {
         let hits = e.recall(&q).unwrap();
         assert_eq!(hits.len(), 1, "September's news is not August's knowledge");
         assert_eq!(hits[0].value.as_deref(), Some("Acme"));
-        assert!(
-            !hits[0].superseded,
+        assert_eq!(
+            hits[0].standing,
+            Standing::Latest,
             "Globex was learned after the horizon, so it must not count as \
              superseding Acme — only later knowledge the horizon has already \
              seen can do that"
@@ -3138,6 +3329,7 @@ mod tests {
                 value: Some("Globex".to_string()),
                 text: "Ben works at Globex".to_string(),
                 valid_from: 100,
+                supersession: Supersession::Corrects,
             }],
             ..Default::default()
         };
@@ -3165,6 +3357,7 @@ mod tests {
                 value: Some("Globex".to_string()),
                 text: "Ben works at Globex".to_string(),
                 valid_from: 100,
+                supersession: Supersession::Corrects,
             }],
             ..Default::default()
         };
@@ -3264,6 +3457,7 @@ mod tests {
                     value: Some("Globex".to_string()),
                     text: "Ben works at Globex".to_string(),
                     valid_from: 100,
+                    supersession: Supersession::Unstated,
                 },
                 rm_extract::Fact {
                     subject: 1,
@@ -3271,6 +3465,7 @@ mod tests {
                     value: Some("England".to_string()),
                     text: "Bristol is in England".to_string(),
                     valid_from: 100,
+                    supersession: Supersession::Unstated,
                 },
             ],
             ..Default::default()
@@ -3346,6 +3541,7 @@ mod tests {
             value: Some("person".to_string()),
             valid: Interval::since(at),
             provenance: Provenance::new(Source::ToolOutput, at, "session-1"),
+            supersession: Supersession::Unstated,
             embedding: vec![1.0, 0.0, 0.0],
         };
 
@@ -3440,6 +3636,7 @@ mod tests {
                 value: Some("Globex".to_string()),
                 text: "Ben works at Globex".to_string(),
                 valid_from: 100,
+                supersession: Supersession::Corrects,
             }],
             ..Default::default()
         };
@@ -3465,6 +3662,7 @@ mod tests {
                 value: Some("Globex".to_string()),
                 text: "Ben works at Globex".to_string(),
                 valid_from: 100,
+                supersession: Supersession::Corrects,
             }],
             ..Default::default()
         };
@@ -3519,6 +3717,7 @@ mod tests {
                 value: Some("Globex".to_string()),
                 text: "Ben works at Globex".to_string(),
                 valid_from: 100,
+                supersession: Supersession::Corrects,
             }],
             ..Default::default()
         };
@@ -3543,6 +3742,7 @@ mod tests {
                 value: Some("Globex".to_string()),
                 text: "Ben joined Globex".to_string(),
                 valid_from: 40,
+                supersession: Supersession::Unstated,
             }],
             ..Default::default()
         };
