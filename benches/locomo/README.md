@@ -928,3 +928,63 @@ Recall differs by 0.074 between the two conversations, which is exactly the
 range this file measured *within* one configuration on one conversation. So the
 two numbers are not distinguishable and nothing should be read into the
 difference.
+
+## Seven conversations
+
+The daily request quota reset and the remaining conversations were run in the
+foreground, a few hundred turns per invocation, resuming from the cache each
+time. Seven of ten completed cleanly: **3,657 turns ingested, fourteen
+speakers.** Conversations 2, 4 and 6 remain, blocked only by the quota.
+
+| conv | ingested | refused | entities | attrs | once | >1 ver | band | kind≠ | stopword | recall@10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 402 | 4% | 125 | 498 | 82% | 15% | 31 | 0 | 7 | 0.617 |
+| 1 | 350 | 5% | 92 | 389 | 82% | 18% | 28 | 0 | 11 | 0.691 |
+| 3 | 591 | 6% | 192 | 544 | 83% | 14% | 50 | 0 | 3 | 0.553 |
+| 5 | 639 | 5% | 257 | 562 | 83% | 14% | 99 | 0 | 21 | 0.675 |
+| 7 | 658 | 3% | 224 | 565 | 82% | 16% | 42 | 0 | 9 | 0.707 |
+| 8 | 482 | 5% | 119 | 490 | 80% | 16% | 10 | 0 | 1 | 0.686 |
+| 9 | 535 | 6% | 197 | 592 | 80% | 15% | 68 | 0 | 17 | 0.626 |
+
+### The attribute sprawl is established
+
+**81.8% of attribute names are used exactly once** — 2,978 of 3,640 — and no
+conversation departs from the band 80–83%. The share of attributes carrying more
+than one version sits at 14–18% everywhere.
+
+Seven independent conversations, fourteen speakers, subject matter ranging from
+adoption to pottery to a recording studio, and the number does not move. This is
+a property of the extraction contract, not of any transcript. Whatever the
+bi-temporal machinery is worth, it is currently reachable on about a sixth of
+what the store holds.
+
+### Both resolution fixes hold everywhere
+
+Not one pair in any of the seven bands disagrees on kind. Before #19,
+conversation 0 alone had 57 of 99.
+
+The crude classifier used above flags two pairs in conversation 7 as possessive,
+and both are the comparator being right rather than wrong:
+
+```
+5.78  "Deborah's mom" ~ "Deborah's mum"        same owner, and the heads are the same word
+6.70  "Jolene's partner" ~ "Jolene's parents"  string-similar heads, below match_at: asked, not merged
+```
+
+`PossessiveAware` is built to let same-owner pairs through when their heads
+agree, which is exactly what the first of those is. Zero genuine failures in
+seven conversations.
+
+### What varies, and by how much
+
+The band ranges from 10 pairs to 99 — a factor of ten — and the stopword
+collisions inside it from 1 to 21. Conversation 8 produced a band of ten
+questions from 482 turns; conversation 5 produced ninety-nine from 639. The
+blocking key is doing wildly different amounts of damage depending on what the
+speakers happened to call things, which is the strongest argument yet for
+fixing it rather than tuning thresholds around it.
+
+Recall ranges 0.553 to 0.707. That spread of 0.154 is twice the 0.074 this file
+measured *within* one configuration, so unlike the two-conversation comparison
+earlier, some of this is real: conversations differ in how answerable they are.
+It is not a measurement of anything this project changed.
