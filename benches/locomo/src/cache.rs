@@ -55,6 +55,15 @@ pub struct Cache {
     embeddings: Mutex<HashMap<String, Vec<f32>>>,
     pub hits: AtomicUsize,
     pub misses: AtomicUsize,
+    /// Entries added since the file was last written.
+    ///
+    /// The cache used to be written once, at the end of a run. A process that
+    /// died before that -- and in the environment this was developed in they
+    /// are reaped a few minutes after the session goes idle -- lost every
+    /// response it had paid for, so the next attempt started cold and died in
+    /// the same place. Writing as it goes makes a run resumable: whatever was
+    /// fetched stays fetched.
+    unsaved: AtomicUsize,
 }
 
 impl Cache {
@@ -75,6 +84,21 @@ impl Cache {
             embeddings: Mutex::new(embeddings),
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
+            unsaved: AtomicUsize::new(0),
+        }
+    }
+
+    /// Write if enough has accumulated to be worth losing.
+    ///
+    /// 50 is a compromise: the file is rewritten whole, so saving on every
+    /// insert would spend more time serialising than fetching, and saving
+    /// never is what this is fixing. It was 250, which a run proved too coarse
+    /// -- 200 responses were fetched and then lost, having never reached the
+    /// threshold.
+    fn save_if_due(&self) {
+        if self.unsaved.fetch_add(1, Ordering::Relaxed) + 1 >= 50 {
+            self.unsaved.store(0, Ordering::Relaxed);
+            self.save();
         }
     }
 
@@ -116,6 +140,7 @@ impl Completer for Cached<'_> {
             .lock()
             .unwrap()
             .insert(k, answer.clone());
+        self.cache.save_if_due();
         Ok(answer)
     }
 }
@@ -134,18 +159,38 @@ impl Embedder for Cached<'_> {
             .lock()
             .unwrap()
             .insert(k, answer.clone());
+        self.cache.save_if_due();
         Ok(answer)
     }
 }
 
+/// How a pre-fetch went.
+pub struct Prewarmed {
+    pub attempted: usize,
+    pub failed: usize,
+    /// The first failure's message, for a caller that wants to say why.
+    pub first_error: Option<String>,
+}
+
 /// Fill the cache for `prompts` using `workers` threads.
 ///
-/// Failures are left out rather than recorded: an entry that is absent is
-/// fetched again on the sequential pass, where the error reaches the run's own
-/// reporting. Caching a failure would make one bad minute permanent.
-pub fn prewarm(prompts: &[String], provider: &HttpProvider, cache: &Cache, workers: usize) {
+/// Failures are left out of the cache rather than recorded: an entry that is
+/// absent is fetched again on the sequential pass, where the error reaches the
+/// run's own reporting. Caching a failure would make one bad minute permanent.
+///
+/// They are, however, *counted* and returned. They were not, and a run where
+/// every request failed was indistinguishable from a run that was entirely
+/// cached -- both finish instantly and print the same thing.
+pub fn prewarm(
+    prompts: &[String],
+    provider: &HttpProvider,
+    cache: &Cache,
+    workers: usize,
+) -> Prewarmed {
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+    let first_error = std::sync::Mutex::new(None::<String>);
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| {
@@ -156,7 +201,20 @@ pub fn prewarm(prompts: &[String], provider: &HttpProvider, cache: &Cache, worke
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(prompt) = prompts.get(i) else { return };
-                    let _ = cached.complete(prompt);
+                    // Counted, not discarded. This used to be `let _ = ...`,
+                    // and a run in which every single request failed looked
+                    // from the outside exactly like a run in which every one
+                    // was already cached: the pass finished in milliseconds and
+                    // said nothing. That happened, and cost a corpus run.
+                    if let Err(e) = cached.complete(prompt) {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        let mut slot = first_error
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if slot.is_none() {
+                            *slot = Some(e.to_string());
+                        }
+                    }
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                     if n.is_multiple_of(50) {
                         eprintln!("  extracted {n}/{}", prompts.len());
@@ -165,4 +223,13 @@ pub fn prewarm(prompts: &[String], provider: &HttpProvider, cache: &Cache, worke
             });
         }
     });
+
+    let first_error = first_error
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Prewarmed {
+        attempted: prompts.len(),
+        failed: failed.load(Ordering::Relaxed),
+        first_error,
+    }
 }

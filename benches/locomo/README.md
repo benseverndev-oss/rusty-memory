@@ -790,3 +790,201 @@ file has named twice and not addressed: `"the beach" ~ "the café"`,
 That is the next thing, and it is a blocking problem rather than a scoring one:
 `prefix n = 3` puts every name beginning "the" or "LGB" in one bucket, and
 Jaro-Winkler then rewards the same prefix a second time in the score.
+
+## The attribute vocabulary, and why the temporal machinery never runs
+
+Found while looking for something else. The search was for a suspected
+extraction bug -- possessive turns collapsing onto the owner and misattributing
+the fact -- and that bug is not what the corpus shows. Conversation 0 contains
+thirty turns naming an unnamed relative ("my kids", "the kids", "my husband"),
+and in twenty-three of them every fact landed on the speaker. That is the
+prompt's unnamed-group rule working as written: *say what the turn says about
+them as a fact about someone who is named*. The names it produces --
+`children_excitement`, `kids_experience` -- put the relationship in the
+attribute name.
+
+Which turned out to be the thread worth pulling.
+
+`analyse-store.py` reads a written snapshot and counts what is in it. Over
+conversation 0:
+
+```
+entities            125
+assertions          735   (excluding `kind`)
+distinct attributes 498
+used exactly once   408  (82% of names)
+assertions per name 1.48
+
+attributes with more than one version: 82 of 550  (15%)
+  assertions inside them: 267 of 735  (36%)
+```
+
+Supersession, survivorship, valid intervals and `about` all operate *within one
+attribute name on one entity*. A later fact only contradicts an earlier one if
+both were recorded under the same name. So that 15% is the entire surface on
+which any of this project's temporal machinery can act. The other 85% is inert
+by construction.
+
+Nothing in five runs of a retrieval metric could have shown this. Recall is
+embedding search over a fact's own text and never reads the attribute name.
+
+### It fails in both directions at once
+
+Too many names, and nothing ever meets: `feeling`, `emotion`,
+`emotional_response`, `feeling_about_art` and `emotional_impact` are five names
+for one idea. Seventeen names share the stem `suppor*`, twelve share `feelin*`.
+
+Too few names where they do meet, and unrelated facts are forced into one slot.
+`entity 0` has fourteen versions of `feeling`: *happy*, *thankful*, *love for
+horses*, *liberated and empowered*, *peace and serenity*, *alone*. Those are
+fourteen moments, not fourteen claims about one thing. Driven through the built
+binary against that store:
+
+```
+$ rmem about 0 feeling
+survivorship refused: 2 different values share the latest observation time
+(1697193060000); simultaneous contradictory assertions have no "most recent".
+
+$ rmem about 0 experience
+amazing journey                     # one of nine; the other eight unreachable
+
+$ rmem about 0 goal
+having a family                     # one of six
+```
+
+The refusal is the store behaving correctly on data it should never have been
+given. `experience` is the quieter failure: eight facts are still in the log and
+`about` will not return them, because the ninth superseded them for sharing a
+name they should not have shared.
+
+### The cause is a gap in the prompt
+
+`kind` is a closed vocabulary of seven. `value` is a string or null. `days_ago`
+is a whole number of days or null. The attribute name has no rule at all -- not
+a vocabulary, not a preference for reuse, not even a sentence saying what an
+attribute *is*. The model invents one per fact, which is the only thing it can
+do when nothing has been asked of it.
+
+That is the next thing to change, and it needs a measurement recall@10 cannot
+give: the counts above, before and after. `analyse-store.py` exists so that
+measurement has somewhere to come from.
+
+## A second conversation, and what it settles
+
+Everything above was measured on conversation 0. The corpus holds ten, and the
+attempt to run all of them is written up in the next section -- it did not
+finish. Two conversations completed cleanly, and two is not ten but it is twice
+what every threshold in `rmem.toml` was tuned on.
+
+| | conv 0 (Caroline & Melanie) | conv 1 (Jon & Gina) |
+|---|---|---|
+| turns ingested | 402 of 419 | 350 of 369 |
+| turns refused | 17 (4%) | 19 (5%) |
+| entities | 125 | 92 |
+| assertions | 1508 | 1219 |
+| relations | 104 | 69 |
+| review band | 31 | 28 |
+| recall@10 overall | 0.617 | 0.691 |
+
+Conversation 2 ran during the failure described below -- 469 of its 663 turns
+refused, on "the connection did not establish" -- so it ingested 29% of its
+corpus and is excluded. Its numbers are consistent with the others, which is
+worth nothing: a 29% sample agreeing with a 96% sample is not evidence.
+
+### What replicates
+
+**The attribute sprawl, almost exactly.**
+
+| | conv 0 | conv 1 | conv 2 (partial) |
+|---|---|---|---|
+| distinct attribute names | 498 | 389 | 203 |
+| used exactly once | **82%** | **82%** | 84% |
+| assertions per name | 1.48 | 1.50 | 1.36 |
+| attributes with >1 version | 15% | 18% | 12% |
+
+Two independent conversations, four speakers, different subject matter, and the
+singleton rate is 82% in both. This is not an artefact of one transcript.
+
+Conversation 1 also shows the same collapse at the other end: `entity 1` has
+sixteen versions of `determination` -- *determined to make it work*, *make it
+work*, *persistent*, *not giving up*, *will not quit* -- which are restatements
+of one thing rather than a value that changed sixteen times. One of them is the
+string `"true"`, which the prompt forbids in as many words.
+
+**The two resolution fixes hold.** Neither conversation's review band contains a
+single pair whose kinds disagree, or a single possessive pair. Before those
+changes, conversation 0's band was 57 kind-mismatches and 12 possessives out of
+99.
+
+### What does not replicate, and what got worse
+
+The shared-prefix collisions this file has now named three times are a *larger*
+share of conversation 1's band than of conversation 0's: 11 of 28 pairs against
+7 of 31. `prefix n = 3` blocks on the first three characters of a name, so how
+much damage it does depends entirely on what the speakers happened to talk
+about. That is the argument for fixing it rather than tuning around it.
+
+Recall differs by 0.074 between the two conversations, which is exactly the
+range this file measured *within* one configuration on one conversation. So the
+two numbers are not distinguishable and nothing should be read into the
+difference.
+
+## Seven conversations
+
+The daily request quota reset and the remaining conversations were run in the
+foreground, a few hundred turns per invocation, resuming from the cache each
+time. Seven of ten completed cleanly: **3,657 turns ingested, fourteen
+speakers.** Conversations 2, 4 and 6 remain, blocked only by the quota.
+
+| conv | ingested | refused | entities | attrs | once | >1 ver | band | kind≠ | stopword | recall@10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | 402 | 4% | 125 | 498 | 82% | 15% | 31 | 0 | 7 | 0.617 |
+| 1 | 350 | 5% | 92 | 389 | 82% | 18% | 28 | 0 | 11 | 0.691 |
+| 3 | 591 | 6% | 192 | 544 | 83% | 14% | 50 | 0 | 3 | 0.553 |
+| 5 | 639 | 5% | 257 | 562 | 83% | 14% | 99 | 0 | 21 | 0.675 |
+| 7 | 658 | 3% | 224 | 565 | 82% | 16% | 42 | 0 | 9 | 0.707 |
+| 8 | 482 | 5% | 119 | 490 | 80% | 16% | 10 | 0 | 1 | 0.686 |
+| 9 | 535 | 6% | 197 | 592 | 80% | 15% | 68 | 0 | 17 | 0.626 |
+
+### The attribute sprawl is established
+
+**81.8% of attribute names are used exactly once** — 2,978 of 3,640 — and no
+conversation departs from the band 80–83%. The share of attributes carrying more
+than one version sits at 14–18% everywhere.
+
+Seven independent conversations, fourteen speakers, subject matter ranging from
+adoption to pottery to a recording studio, and the number does not move. This is
+a property of the extraction contract, not of any transcript. Whatever the
+bi-temporal machinery is worth, it is currently reachable on about a sixth of
+what the store holds.
+
+### Both resolution fixes hold everywhere
+
+Not one pair in any of the seven bands disagrees on kind. Before #19,
+conversation 0 alone had 57 of 99.
+
+The crude classifier used above flags two pairs in conversation 7 as possessive,
+and both are the comparator being right rather than wrong:
+
+```
+5.78  "Deborah's mom" ~ "Deborah's mum"        same owner, and the heads are the same word
+6.70  "Jolene's partner" ~ "Jolene's parents"  string-similar heads, below match_at: asked, not merged
+```
+
+`PossessiveAware` is built to let same-owner pairs through when their heads
+agree, which is exactly what the first of those is. Zero genuine failures in
+seven conversations.
+
+### What varies, and by how much
+
+The band ranges from 10 pairs to 99 — a factor of ten — and the stopword
+collisions inside it from 1 to 21. Conversation 8 produced a band of ten
+questions from 482 turns; conversation 5 produced ninety-nine from 639. The
+blocking key is doing wildly different amounts of damage depending on what the
+speakers happened to call things, which is the strongest argument yet for
+fixing it rather than tuning thresholds around it.
+
+Recall ranges 0.553 to 0.707. That spread of 0.154 is twice the 0.074 this file
+measured *within* one configuration, so unlike the two-conversation comparison
+earlier, some of this is real: conversations differ in how answerable they are.
+It is not a measurement of anything this project changed.

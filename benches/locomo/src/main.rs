@@ -140,8 +140,37 @@ fn main() {
         prompts.len()
     );
     let started = std::time::Instant::now();
-    cache::prewarm(&prompts, &provider, &cache, workers);
-    eprintln!("  extraction pass took {:.1?}", started.elapsed());
+    let warmed = cache::prewarm(&prompts, &provider, &cache, workers);
+    eprintln!(
+        "  extraction pass took {:.1?} ({} of {} failed)",
+        started.elapsed(),
+        warmed.failed,
+        warmed.attempted
+    );
+
+    // Stop rather than measure nothing.
+    //
+    // This exists because of a run that did not stop. The sandbox's egress
+    // proxy moved to a new port mid-run; a process's environment is fixed at
+    // exec, so this one kept dialling the old one, every connection was refused
+    // instantly, and 629 extractions "finished" in 4.9ms. Ingestion then failed
+    // for every turn, and the harness wrote a snapshot of an empty store and
+    // carried on as though it had measured something.
+    //
+    // A tenth is the line: a handful of failures is a corpus with some turns
+    // the model would not answer, which is a result. Most of them failing is
+    // not a result, it is a broken machine, and the difference has to be
+    // visible without reading a log.
+    let tolerated = warmed.attempted / 10;
+    if warmed.failed > tolerated && warmed.failed > 5 {
+        eprintln!(
+            "\n  ABORTING: {} of {} extractions failed, past the {tolerated} this \n               treats as a corpus problem rather than a broken connection.\n               First failure: {}\n               Nothing is written; fix the cause and run again. A partial store \n               would look like a measurement.",
+            warmed.failed,
+            warmed.attempted,
+            warmed.first_error.as_deref().unwrap_or("(none recorded)")
+        );
+        std::process::exit(2);
+    }
 
     let provider = Cached {
         inner: &provider,

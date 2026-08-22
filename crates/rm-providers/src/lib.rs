@@ -99,18 +99,62 @@ pub struct HttpProvider {
     api_key: String,
     completion_model: String,
     embedding_model: String,
-    /// Built once, from the environment, in [`HttpProvider::new`].
+    /// What the environment said about proxies and roots, read once.
+    network: Network,
+    /// The built agent, cached on success only.
     ///
-    /// A `Result` in a field rather than a fallible constructor. Building it
-    /// reads a file that may not be there and parses a proxy URL that may not
-    /// be one, and both are worth refusing over -- but `new` is called from
-    /// four places including a config loader that has no better answer than
-    /// passing the error along, and every request already returns
-    /// `Result<_, ProviderError>` where a transport problem is exactly what a
-    /// caller is prepared for. So the failure is kept and returned by whichever
-    /// request comes first. In practice that is `rmem init`'s dimension probe,
-    /// which runs before anything is written.
-    agent: Result<ureq::Agent, ProviderError>,
+    /// The first version of this held a `Result` built in `new`, which made a
+    /// failure permanent: a CA bundle that was briefly unreadable -- being
+    /// rewritten, say, which is exactly what a machine that rotates one does --
+    /// poisoned every later request in the process with a cached error and no
+    /// second attempt. That is wrong for anything long-lived, and `rmem-mcp` is
+    /// a server. Only success is cached; a failure is returned and nothing is
+    /// stored, so the next request builds again.
+    ///
+    /// A `Mutex` rather than a `OnceLock` because the point is to be able to
+    /// *not* have a value after trying. `ureq::Agent` is an `Arc` inside, so
+    /// the clone this hands out is a pointer copy.
+    agent: std::sync::Mutex<Option<ureq::Agent>>,
+    /// How hard to try. See [`Retry`].
+    retry: Retry,
+}
+
+/// How many times to repeat a request that failed in a way that might not
+/// repeat, and how long to wait between.
+///
+/// There was no retry at all before this. A single 429 or a dropped connection
+/// lost a turn permanently: the benchmark harness pushes the error onto a
+/// `refused` list and carries on, so a rate limit arrived looking exactly like
+/// a model that would not answer. That is the wrong shape of failure to be
+/// silent about, and it is what stops a caller running several extractions at
+/// once, which is the only way a long corpus finishes in reasonable time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retry {
+    /// Total attempts, including the first. One means no retrying.
+    pub attempts: u32,
+    /// Wait before the second attempt; doubled before each one after.
+    pub base_delay: std::time::Duration,
+    /// A ceiling on that doubling.
+    pub max_delay: std::time::Duration,
+}
+
+impl Default for Retry {
+    fn default() -> Self {
+        // Six attempts, 250ms doubling to a 16s ceiling: about a minute of
+        // patience in total, which is the unit a token-per-minute limit is
+        // denominated in. The first version stopped after three attempts and
+        // 750ms, which is nowhere near long enough -- a corpus run hit a TPM
+        // limit and lost 482 of 629 extractions to it.
+        //
+        // A dead endpoint still fails fast, because a refused connection is not
+        // what most of this patience is for: `retry_after` skips straight to
+        // the provider's own answer when it gives one.
+        Retry {
+            attempts: 6,
+            base_delay: std::time::Duration::from_millis(250),
+            max_delay: std::time::Duration::from_secs(16),
+        }
+    }
 }
 
 impl HttpProvider {
@@ -123,15 +167,48 @@ impl HttpProvider {
         // Stored without the trailing slash so `url` can join with exactly
         // one. A config file will contain both spellings.
         let base_url = base_url.trim_end_matches('/').to_string();
-        let agent = Network::from_env(|name| std::env::var(name).ok()).agent(&base_url);
 
         HttpProvider {
             base_url,
             api_key,
             completion_model,
             embedding_model,
-            agent,
+            network: Network::from_env(|name| std::env::var(name).ok()),
+            agent: std::sync::Mutex::new(None),
+            retry: Retry::default(),
         }
+    }
+
+    /// Replace the retry policy.
+    ///
+    /// Exists for tests, which dial a port nothing listens on and would
+    /// otherwise pay the backoff for a failure they are asserting on purpose.
+    pub fn with_retry(mut self, retry: Retry) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// The agent, built if it has not been built yet.
+    ///
+    /// Note what re-reading does *not* buy: a process's environment is fixed at
+    /// exec, so if the proxy moves after this process started, every rebuild
+    /// reads the same stale address. Only a new process picks that up. What
+    /// this does buy is a second chance at a file or a value that was briefly
+    /// unreadable when the first request happened to arrive.
+    fn agent(&self) -> Result<ureq::Agent, ProviderError> {
+        // Recovering from a poisoned lock rather than propagating the panic:
+        // the only thing under it is a cached handle, and a previous panic
+        // elsewhere says nothing about whether it is still good.
+        let mut slot = self
+            .agent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(agent) = slot.as_ref() {
+            return Ok(agent.clone());
+        }
+        let agent = self.network.agent(&self.base_url)?;
+        *slot = Some(agent.clone());
+        Ok(agent)
     }
 
     fn url(&self, path: &str) -> String {
@@ -144,21 +221,46 @@ impl HttpProvider {
     /// possibly an issue tracker, and a key that reaches any of those has to be
     /// rotated.
     fn post(&self, path: &str, body: String) -> Result<String, ProviderError> {
-        // Not `ureq::post`, which is a free function over a default agent that
-        // reads no environment: no proxy, and the compiled-in Mozilla roots
-        // whatever the machine is configured to trust.
-        let agent = match &self.agent {
-            Ok(agent) => agent,
-            Err(e) => return Err(e.clone()),
-        };
+        let mut delay = self.retry.base_delay;
+        for attempt in 1..=self.retry.attempts.max(1) {
+            // Not `ureq::post`, which is a free function over a default agent
+            // that reads no environment: no proxy, and the compiled-in Mozilla
+            // roots whatever the machine is configured to trust.
+            let response = self
+                .agent()?
+                .post(&self.url(path))
+                .set("Authorization", &format!("Bearer {}", self.api_key))
+                .set("Content-Type", "application/json")
+                .send_string(&body);
 
-        let response = agent
-            .post(&self.url(path))
-            .set("Authorization", &format!("Bearer {}", self.api_key))
-            .set("Content-Type", "application/json")
-            .send_string(&body);
-
-        self.handle_response(response, path)
+            if attempt < self.retry.attempts && worth_repeating(&response) {
+                // A provider that says when to come back knows better than any
+                // schedule here. A per-minute budget is not a blip that clears
+                // in a moment -- it clears when the minute does -- so guessing
+                // short is how a rate limit turns into a lost turn.
+                //
+                // And when it asks for longer than we are willing to wait, the
+                // answer is to stop, not to wait the ceiling and try anyway.
+                // The first version capped the sleep and retried regardless,
+                // which is ignoring the instruction: against a *daily* quota --
+                // which counts attempts, not successes -- that turns one
+                // refusal into six and spends the very thing that ran out. A
+                // run did exactly that to 4,400 extractions.
+                let wait = match retry_after(&response) {
+                    Some(asked) if asked > self.retry.max_delay => {
+                        return self.handle_response(response, path)
+                    }
+                    Some(asked) => asked,
+                    None => delay,
+                };
+                std::thread::sleep(wait);
+                delay = delay.saturating_mul(2).min(self.retry.max_delay);
+                continue;
+            }
+            return self.handle_response(response, path);
+        }
+        // `attempts.max(1)` guarantees at least one pass, and it returns.
+        unreachable!("the retry loop always returns on its last attempt")
     }
 
     /// What went wrong reaching the provider, in this crate's own words.
@@ -432,6 +534,52 @@ impl HttpProvider {
     }
 }
 
+/// How long the provider asked us to wait, if it said.
+///
+/// `Retry-After` is the header for it, in seconds. OpenAI also puts a hint in
+/// the message body ("Please try again in 282ms"), which is not read here: the
+/// body is the provider's own prose, this crate scrubs and relays it rather
+/// than parsing it, and a header is a contract where a sentence is not.
+///
+/// Not capped here: the caller compares it against what it is willing to wait
+/// and gives up if it is longer. Clamping it and sleeping the clamp would be
+/// the worst of both -- a wait that does not help, followed by a request that
+/// spends quota it was just told there is none of.
+fn retry_after(response: &Result<ureq::Response, ureq::Error>) -> Option<std::time::Duration> {
+    let Err(ureq::Error::Status(_, r)) = response else {
+        return None;
+    };
+    let secs: f64 = r.header("retry-after")?.trim().parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(secs))
+}
+
+/// Whether a failed request is one that might succeed if simply repeated.
+///
+/// Deliberately narrow. Repeating a request the provider *understood* and
+/// refused -- a bad key, an unknown model, a malformed body -- cannot help, and
+/// doing it anyway turns one clear error into the same error three times more
+/// slowly.
+///
+/// - **429** is the case this exists for: too many requests, come back later.
+/// - **5xx** is the provider saying the failure is on its side.
+/// - A transport failure that is I/O or a connection that never established: a
+///   dropped socket or a refused connect can be a restart in progress.
+///
+/// Everything else, including every 4xx but 429, is answered once.
+fn worth_repeating(response: &Result<ureq::Response, ureq::Error>) -> bool {
+    match response {
+        Ok(_) => false,
+        Err(ureq::Error::Status(code, _)) => *code == 429 || (500..600).contains(code),
+        Err(ureq::Error::Transport(t)) => matches!(
+            t.kind(),
+            ureq::ErrorKind::Io | ureq::ErrorKind::ConnectionFailed
+        ),
+    }
+}
+
 impl Completer for HttpProvider {
     fn complete(&self, prompt: &str) -> Result<String, CompleterError> {
         let body = self
@@ -455,6 +603,18 @@ impl Embedder for HttpProvider {
 mod tests {
     use super::*;
 
+    /// One attempt, no waiting.
+    ///
+    /// Most tests here dial a port nothing listens on and assert on the
+    /// refusal. A refused connection is exactly what the retry policy repeats,
+    /// so without this every one of them pays a minute of patience for a
+    /// failure it wants.
+    const NO_RETRY: Retry = Retry {
+        attempts: 1,
+        base_delay: std::time::Duration::ZERO,
+        max_delay: std::time::Duration::ZERO,
+    };
+
     fn provider() -> HttpProvider {
         // Port 1 on the loopback address has nothing listening on it, so the
         // connection is refused by the local kernel: no DNS lookup, no packet
@@ -471,6 +631,177 @@ mod tests {
             "gpt-4o-mini".to_string(),
             "text-embedding-3-small".to_string(),
         )
+        // A refused connection is exactly the kind the retry policy repeats,
+        // and these tests are asserting on that refusal rather than hoping it
+        // clears. One attempt, no backoff: retrying here buys nothing but three
+        // times the wait, on a refusal this machine already takes two seconds
+        // to produce.
+        .with_retry(NO_RETRY)
+    }
+
+    #[test]
+    fn only_a_failure_that_might_not_repeat_is_repeated() {
+        // `ureq::Response::new` builds a response without a socket, which is
+        // how the rest of this module tests response handling too. Boxed
+        // because `ureq::Error` is large and clippy is right to say so.
+        let status = |code| -> Box<Result<ureq::Response, ureq::Error>> {
+            Box::new(Err(ureq::Error::Status(
+                code,
+                ureq::Response::new(code, "s", "body").unwrap(),
+            )))
+        };
+
+        assert!(worth_repeating(&status(429)), "rate limiting is the case");
+        assert!(worth_repeating(&status(500)));
+        assert!(worth_repeating(&status(503)));
+
+        // Refusals the provider understood. Repeating them turns one clear
+        // error into the same error three times more slowly.
+        assert!(!worth_repeating(&status(400)), "a malformed body");
+        assert!(!worth_repeating(&status(401)), "a bad key");
+        assert!(!worth_repeating(&status(404)), "an unknown model");
+        assert!(!worth_repeating(&status(422)));
+
+        assert!(!worth_repeating(&Ok(ureq::Response::new(
+            200, "ok", "body"
+        )
+        .unwrap())));
+    }
+
+    #[test]
+    fn the_provider_s_own_retry_after_is_preferred_to_any_schedule_here() {
+        // A token-per-minute budget clears when the minute does, and the
+        // provider is the only one who knows how much of it is left.
+        // `Response` parses from a raw response, headers included, so this
+        // needs no socket.
+        let rate_limited = |headers: &str| -> Box<Result<ureq::Response, ureq::Error>> {
+            let raw = format!("HTTP/1.1 429 Too Many Requests\r\n{headers}\r\nslow down");
+            Box::new(Err(ureq::Error::Status(429, raw.parse().unwrap())))
+        };
+
+        assert_eq!(
+            retry_after(&rate_limited("Retry-After: 3\r\n")),
+            Some(std::time::Duration::from_secs(3))
+        );
+        // Fractional seconds are what a busy provider actually sends.
+        assert_eq!(
+            retry_after(&rate_limited("Retry-After: 0.282\r\n")),
+            Some(std::time::Duration::from_secs_f64(0.282))
+        );
+        // Reported as asked, not clamped. A caller that wants a ceiling
+        // compares against it and stops; clamping here would hide that the
+        // provider said "not for an hour" and let the caller spend another
+        // request finding out.
+        assert_eq!(
+            retry_after(&rate_limited("Retry-After: 3600\r\n")),
+            Some(std::time::Duration::from_secs(3600))
+        );
+
+        // No instruction, so the caller falls back to its own doubling.
+        assert_eq!(retry_after(&rate_limited("")), None);
+        // `Retry-After` may also be an HTTP date, which is not parsed here.
+        // Falling back to the schedule is the right answer, not a panic.
+        assert_eq!(
+            retry_after(&rate_limited(
+                "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n"
+            )),
+            None
+        );
+        assert_eq!(retry_after(&rate_limited("Retry-After: -5\r\n")), None);
+        assert_eq!(
+            retry_after(&Ok(ureq::Response::new(200, "ok", "body").unwrap())),
+            None
+        );
+    }
+
+    #[test]
+    fn a_retry_policy_of_one_attempt_does_not_sleep() {
+        // The property the test helper above depends on: `attempts: 1` must
+        // take the single-pass path, or every offline test in this module pays
+        // a backoff for a failure it is asserting on.
+        let started = std::time::Instant::now();
+        let provider = HttpProvider::new(
+            "http://127.0.0.1:1".to_string(),
+            "k".into(),
+            "c".into(),
+            "e".into(),
+        )
+        .with_retry(Retry {
+            attempts: 1,
+            base_delay: std::time::Duration::from_secs(30),
+            max_delay: std::time::Duration::from_secs(30),
+        });
+        let _ = provider.embed("anything");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "a 30s backoff was waited on despite attempts = 1"
+        );
+    }
+
+    #[test]
+    fn a_provider_whose_agent_cannot_be_built_tries_again_rather_than_staying_broken() {
+        // The regression this replaced: the agent was built once in `new` and a
+        // failure cached forever, so a CA bundle that was briefly unreadable --
+        // being rewritten, which is what a machine that rotates one does --
+        // poisoned every later request in the process with no second attempt.
+        //
+        // Driven through `agent()` rather than a request: building is the unit
+        // under test, and it needs no socket. Driven through the proxy setting
+        // rather than a certificate, because "a failure is not cached" is
+        // reachable that way without a fixture that expires.
+        //
+        // The base URL is deliberately not loopback -- loopback bypasses the
+        // proxy entirely, so a broken proxy would never be consulted.
+        let mut provider = HttpProvider::new(
+            "https://api.openai.com/v1".to_string(),
+            "k".into(),
+            "c".into(),
+            "e".into(),
+        );
+        provider.network = network::Network {
+            proxy: Some("not a url".to_string()),
+            ..network::Network::default()
+        };
+
+        let Err(ProviderError::Transport(why)) = provider.agent() else {
+            panic!("an unusable proxy is a refusal, not an agent");
+        };
+        assert!(why.contains("http://host:port"), "{why}");
+        assert!(
+            provider.agent().is_err(),
+            "still broken, so still refused -- but from a fresh attempt"
+        );
+
+        // The setting is corrected. Nothing restarted, and the next call has to
+        // build rather than hand back the error it produced a moment ago, which
+        // is what it did before this.
+        provider.network = network::Network::default();
+        assert!(
+            provider.agent().is_ok(),
+            "the earlier failure was cached and outlived the thing that caused it"
+        );
+    }
+
+    #[test]
+    fn a_built_agent_is_reused_rather_than_rebuilt_per_request() {
+        // The other half: caching success is the point. Rebuilding would
+        // re-read and re-parse the CA bundle on every request, and on the
+        // machine this was written for that file is 232KB.
+        let provider = HttpProvider::new(
+            "https://api.openai.com/v1".to_string(),
+            "k".into(),
+            "c".into(),
+            "e".into(),
+        );
+        assert!(provider.agent().is_ok());
+        assert!(
+            provider
+                .agent
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some(),
+            "a successful build is kept"
+        );
     }
 
     #[test]
@@ -556,7 +887,10 @@ mod tests {
                 "sk-key-not-under-test".into(),
                 "c".into(),
                 "e".into(),
-            );
+            )
+            // Asserting on the refusal, not hoping it clears: retrying here
+            // buys nothing but the backoff, once per base URL.
+            .with_retry(NO_RETRY);
             let err = provider.embed("anything").unwrap_err().0;
 
             assert!(
