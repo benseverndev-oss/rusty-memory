@@ -1088,3 +1088,65 @@ The band still ranges from 10 pairs to 118, a factor of twelve, on corpora of
 comparable size. Recall ranges 0.553 to 0.729. Neither is a measurement of
 anything this project changed; both are measurements of how much the
 conversations differ.
+
+## The attribute rule: measured, and withdrawn
+
+The prompt says what `kind` may be and what `value` may be, and had never said
+what an *attribute name* is. A rule was added asking for the plainest reusable
+name and forbidding names built out of the value — `enjoyment_of_grand_canyon`
+is `enjoyment`, `kids_experience` is `experience` — and measured on
+conversation 1 against its own baseline.
+
+| | before | after |
+|---|---|---|
+| distinct attribute names | 389 | **187** |
+| assertions per name | 1.50 | **3.05** |
+| used exactly once | 82% | 77% |
+| assertions inside multi-version attributes | 40% | **71%** |
+| entities | 92 | 115 |
+| recall@10 | 0.691 | 0.667 |
+
+Read as a table it looks like a win: the vocabulary halved, reuse doubled, and
+the surface the temporal machinery can act on went from 40% of assertions to
+71%. It is not a win, and the store says why:
+
+```
+entity 1  goal     86 versions: 'starting my own business', 'to share dancing
+                   with others', 'start a dance studio', 'spread intensity...'
+entity 1  feeling  71 versions: 'excited', 'amazing', 'glad', 'positive'...
+```
+
+Eighty-six goals in one slot. Those are not successive values of one goal that
+supersede each other; they are eighty-six different goals, and `most_recent`
+returns exactly one of them. The rule traded a store where nothing ever met for
+a store where unrelated things are forced together, and "71% of assertions are
+inside a contested attribute" counts both alike. **The metric could not tell a
+value that changed from two facts colliding**, which is why it read as success.
+
+The change is reverted. Two prompt changes in this project have now been
+measured and withdrawn, and the rule that keeps being confirmed is that a
+plausible prompt improvement is worth nothing until the artefact is read.
+
+### What it actually established
+
+The attribute name is being asked to do two jobs at once:
+
+- say what **kind** of fact this is, so that a later fact about the same thing
+  finds the earlier one;
+- say **which** fact this is, so that unrelated facts do not collide.
+
+One string cannot do both, and every version of the prompt trades one failure
+for the other. Loosen it and nothing ever supersedes; tighten it and unrelated
+facts share a slot.
+
+That is not a prompt problem. It is the store's grain: `feeling` and `goal` are
+not single-valued attributes where a later value replaces an earlier one, they
+are *accumulating* ones where a later value is an additional observation.
+`rm-survivor` already distinguishes these — `valid_interval` keeps disjoint
+spans rather than picking a winner, and `two_employers_at_once_both_stand` is a
+test that exists — and `rmem.toml` already carries per-attribute policy. What
+is missing is anything that decides *which* attributes are which, and nothing
+in the pipeline currently asks.
+
+That is the next thing worth designing, and it is a design question rather than
+a wording one.
