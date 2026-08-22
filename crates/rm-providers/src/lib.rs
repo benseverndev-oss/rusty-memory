@@ -235,11 +235,25 @@ impl HttpProvider {
 
             if attempt < self.retry.attempts && worth_repeating(&response) {
                 // A provider that says when to come back knows better than any
-                // schedule here. A token-per-minute budget is not a blip that
-                // clears in a moment -- it clears when the minute does -- so
-                // guessing short and giving up is how a rate limit turns into a
-                // lost turn.
-                std::thread::sleep(retry_after(&response).unwrap_or(delay));
+                // schedule here. A per-minute budget is not a blip that clears
+                // in a moment -- it clears when the minute does -- so guessing
+                // short is how a rate limit turns into a lost turn.
+                //
+                // And when it asks for longer than we are willing to wait, the
+                // answer is to stop, not to wait the ceiling and try anyway.
+                // The first version capped the sleep and retried regardless,
+                // which is ignoring the instruction: against a *daily* quota --
+                // which counts attempts, not successes -- that turns one
+                // refusal into six and spends the very thing that ran out. A
+                // run did exactly that to 4,400 extractions.
+                let wait = match retry_after(&response) {
+                    Some(asked) if asked > self.retry.max_delay => {
+                        return self.handle_response(response, path)
+                    }
+                    Some(asked) => asked,
+                    None => delay,
+                };
+                std::thread::sleep(wait);
                 delay = delay.saturating_mul(2).min(self.retry.max_delay);
                 continue;
             }
@@ -527,8 +541,10 @@ impl HttpProvider {
 /// body is the provider's own prose, this crate scrubs and relays it rather
 /// than parsing it, and a header is a contract where a sentence is not.
 ///
-/// Capped at a minute. A provider asking for longer than that is asking for a
-/// different run, not a longer sleep.
+/// Not capped here: the caller compares it against what it is willing to wait
+/// and gives up if it is longer. Clamping it and sleeping the clamp would be
+/// the worst of both -- a wait that does not help, followed by a request that
+/// spends quota it was just told there is none of.
 fn retry_after(response: &Result<ureq::Response, ureq::Error>) -> Option<std::time::Duration> {
     let Err(ureq::Error::Status(_, r)) = response else {
         return None;
@@ -537,7 +553,7 @@ fn retry_after(response: &Result<ureq::Response, ureq::Error>) -> Option<std::ti
     if !secs.is_finite() || secs < 0.0 {
         return None;
     }
-    Some(std::time::Duration::from_secs_f64(secs.min(60.0)))
+    Some(std::time::Duration::from_secs_f64(secs))
 }
 
 /// Whether a failed request is one that might succeed if simply repeated.
@@ -672,10 +688,13 @@ mod tests {
             retry_after(&rate_limited("Retry-After: 0.282\r\n")),
             Some(std::time::Duration::from_secs_f64(0.282))
         );
-        // Capped: a provider asking for an hour is asking for a different run.
+        // Reported as asked, not clamped. A caller that wants a ceiling
+        // compares against it and stops; clamping here would hide that the
+        // provider said "not for an hour" and let the caller spend another
+        // request finding out.
         assert_eq!(
             retry_after(&rate_limited("Retry-After: 3600\r\n")),
-            Some(std::time::Duration::from_secs(60))
+            Some(std::time::Duration::from_secs(3600))
         );
 
         // No instruction, so the caller falls back to its own doubling.

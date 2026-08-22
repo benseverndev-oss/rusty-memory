@@ -55,6 +55,15 @@ pub struct Cache {
     embeddings: Mutex<HashMap<String, Vec<f32>>>,
     pub hits: AtomicUsize,
     pub misses: AtomicUsize,
+    /// Entries added since the file was last written.
+    ///
+    /// The cache used to be written once, at the end of a run. A process that
+    /// died before that -- and in the environment this was developed in they
+    /// are reaped a few minutes after the session goes idle -- lost every
+    /// response it had paid for, so the next attempt started cold and died in
+    /// the same place. Writing as it goes makes a run resumable: whatever was
+    /// fetched stays fetched.
+    unsaved: AtomicUsize,
 }
 
 impl Cache {
@@ -75,6 +84,21 @@ impl Cache {
             embeddings: Mutex::new(embeddings),
             hits: AtomicUsize::new(0),
             misses: AtomicUsize::new(0),
+            unsaved: AtomicUsize::new(0),
+        }
+    }
+
+    /// Write if enough has accumulated to be worth losing.
+    ///
+    /// 50 is a compromise: the file is rewritten whole, so saving on every
+    /// insert would spend more time serialising than fetching, and saving
+    /// never is what this is fixing. It was 250, which a run proved too coarse
+    /// -- 200 responses were fetched and then lost, having never reached the
+    /// threshold.
+    fn save_if_due(&self) {
+        if self.unsaved.fetch_add(1, Ordering::Relaxed) + 1 >= 50 {
+            self.unsaved.store(0, Ordering::Relaxed);
+            self.save();
         }
     }
 
@@ -116,6 +140,7 @@ impl Completer for Cached<'_> {
             .lock()
             .unwrap()
             .insert(k, answer.clone());
+        self.cache.save_if_due();
         Ok(answer)
     }
 }
@@ -134,6 +159,7 @@ impl Embedder for Cached<'_> {
             .lock()
             .unwrap()
             .insert(k, answer.clone());
+        self.cache.save_if_due();
         Ok(answer)
     }
 }
