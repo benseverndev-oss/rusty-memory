@@ -868,3 +868,63 @@ do when nothing has been asked of it.
 That is the next thing to change, and it needs a measurement recall@10 cannot
 give: the counts above, before and after. `analyse-store.py` exists so that
 measurement has somewhere to come from.
+
+## A second conversation, and what it settles
+
+Everything above was measured on conversation 0. The corpus holds ten, and the
+attempt to run all of them is written up in the next section -- it did not
+finish. Two conversations completed cleanly, and two is not ten but it is twice
+what every threshold in `rmem.toml` was tuned on.
+
+| | conv 0 (Caroline & Melanie) | conv 1 (Jon & Gina) |
+|---|---|---|
+| turns ingested | 402 of 419 | 350 of 369 |
+| turns refused | 17 (4%) | 19 (5%) |
+| entities | 125 | 92 |
+| assertions | 1508 | 1219 |
+| relations | 104 | 69 |
+| review band | 31 | 28 |
+| recall@10 overall | 0.617 | 0.691 |
+
+Conversation 2 ran during the failure described below -- 469 of its 663 turns
+refused, on "the connection did not establish" -- so it ingested 29% of its
+corpus and is excluded. Its numbers are consistent with the others, which is
+worth nothing: a 29% sample agreeing with a 96% sample is not evidence.
+
+### What replicates
+
+**The attribute sprawl, almost exactly.**
+
+| | conv 0 | conv 1 | conv 2 (partial) |
+|---|---|---|---|
+| distinct attribute names | 498 | 389 | 203 |
+| used exactly once | **82%** | **82%** | 84% |
+| assertions per name | 1.48 | 1.50 | 1.36 |
+| attributes with >1 version | 15% | 18% | 12% |
+
+Two independent conversations, four speakers, different subject matter, and the
+singleton rate is 82% in both. This is not an artefact of one transcript.
+
+Conversation 1 also shows the same collapse at the other end: `entity 1` has
+sixteen versions of `determination` -- *determined to make it work*, *make it
+work*, *persistent*, *not giving up*, *will not quit* -- which are restatements
+of one thing rather than a value that changed sixteen times. One of them is the
+string `"true"`, which the prompt forbids in as many words.
+
+**The two resolution fixes hold.** Neither conversation's review band contains a
+single pair whose kinds disagree, or a single possessive pair. Before those
+changes, conversation 0's band was 57 kind-mismatches and 12 possessives out of
+99.
+
+### What does not replicate, and what got worse
+
+The shared-prefix collisions this file has now named three times are a *larger*
+share of conversation 1's band than of conversation 0's: 11 of 28 pairs against
+7 of 31. `prefix n = 3` blocks on the first three characters of a name, so how
+much damage it does depends entirely on what the speakers happened to talk
+about. That is the argument for fixing it rather than tuning around it.
+
+Recall differs by 0.074 between the two conversations, which is exactly the
+range this file measured *within* one configuration on one conversation. So the
+two numbers are not distinguishable and nothing should be read into the
+difference.
