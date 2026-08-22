@@ -91,17 +91,19 @@ pub struct Fact {
     /// Whether this fact replaces what the same attribute already held, or
     /// joins it.
     ///
-    /// The model is asked, because it is the only party that ever knows. The
-    /// store sees arrival order and nothing else, and arrival order says a
-    /// second pet replaced the first.
+    /// The model is the only party that ever knows: the store sees arrival
+    /// order and nothing else, and arrival order says a second pet replaced the
+    /// first.
     ///
-    /// What the prompt actually asks for is the attribute's *arity* -- can a
-    /// person have more than one of these at a time -- rather than a
-    /// comparison against a store the model has never seen. An employer, an
-    /// address, an age: one at a time, so a later one corrects. A pet, a
-    /// hobby, a place they have been: accumulated, so a later one joins. The
-    /// two questions have the same answer for the reader, and only one of them
-    /// is answerable from a single turn.
+    /// [`prompt`] does not currently ask. It did, as a `"replaces"` boolean per
+    /// fact, and the measurement is in that function's docs -- it answered the
+    /// question well and cost 19% of the facts, which is a worse trade than
+    /// leaving them [`Supersession::Unstated`]. The field stays because the
+    /// wire format should still accept an answer: `prompt` is public so a host
+    /// can build its own, and a host that has found a way to ask without
+    /// costing an extraction should not have to fork the parser to be heard.
+    ///
+    /// [`prompt`]: crate::prompt::prompt
     pub supersession: Supersession,
 }
 

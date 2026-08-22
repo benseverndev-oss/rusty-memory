@@ -52,6 +52,43 @@ use crate::Turn;
 /// So the shape is still there and is handled where it can be handled without
 /// side effects: `extract` drops the unanchored fact and keeps the turn. Do not
 /// re-add the rule without measuring it — it has been measured once and it lost.
+///
+/// # A second rule that was tried and removed
+///
+/// [`rm_core::Supersession`] needs someone to say whether a later fact under
+/// one attribute replaces the earlier ones or joins them, and the model reading
+/// the turn is the only party that ever knows. So this prompt asked, per fact,
+/// for a `"replaces"` boolean — phrased as arity, "can someone have only one of
+/// these at a time", because that is answerable from a single turn and "does
+/// this contradict the store" is not.
+///
+/// It answered well. Over conversation 0 it classified all 134 assertions that
+/// had something later in their slot, leaving none unstated: 89 additions and
+/// 45 corrections, which is the two-thirds-were-never-replaced result the type
+/// exists for.
+///
+/// And it cost more than it bought. Three runs of conversation 0, one variable:
+///
+/// ```text
+///                        facts   entities   recall@10
+///   old prompt, day 1      735        125       0.617
+///   old prompt, day 2      763        131       0.617
+///   with "replaces"        616        147       0.604
+/// ```
+///
+/// Two samplings of the unchanged prompt bracket the noise at about ±4%. The
+/// rule cost 19% of the facts, far outside it, and the shape of the loss is
+/// legible: mentions went *up* while facts went down, so a model given one more
+/// question per fact answers it by emitting fewer of them. 147 facts that no
+/// longer exist is a worse trade than 134 that read `Unstated` and go on
+/// standing.
+///
+/// The measurement points somewhere better than a reworded rule. Arity is a
+/// property of the *attribute name*, not of the fact — `employer` admits one at
+/// a time whatever turn it came from — so it can be asked once per distinct
+/// name, away from extraction, and cached. Conversation 0 has 418 distinct
+/// names against 616 facts. That is the next thing to try, and it cannot cost
+/// an extraction anything, because it does not touch one.
 pub fn prompt(turn: &Turn) -> String {
     let speaker = match &turn.speaker {
         Some(name) => format!(
@@ -83,7 +120,7 @@ Reply with only a JSON object of this shape, and nothing else:
   ],
   "facts": [
     {{"subject": 0, "attribute": "employer", "value": "Globex",
-      "text": "Alex works at Globex", "days_ago": null, "replaces": true}}
+      "text": "Alex works at Globex", "days_ago": null}}
   ],
   "relations": [
     {{"subject": 0, "predicate": "employed_by", "object": 1, "days_ago": null}}
@@ -121,12 +158,6 @@ Rules:
 - "value" is a string, or null. Never a number and never true or false — write
   "2" and "true" if those are the values. Null means the attribute has no
   value: "he is between jobs" is a fact with a null value, not a missing fact.
-- "replaces" is whether someone can have only one of these at a time. An
-  employer, an address, an age, a mood, a marital status: true, because a new
-  one makes the last one no longer so. A pet, a hobby, a place they have been,
-  a thing they like, something they attended: false, because a new one is one
-  more and the old one is still true. Say true as well when the turn is
-  correcting something said earlier. Leave it out only if neither reading fits.
 - "days_ago" is how long before now the thing began or ended, as a whole number
   of days, or null if it is happening now. It is never negative: nothing here
   is in the future. Do not output dates or timestamps.

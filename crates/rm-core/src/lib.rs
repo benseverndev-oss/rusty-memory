@@ -121,6 +121,19 @@ impl Provenance {
 /// this person has ended". Attributes had no way to say the same thing, so the
 /// engine inferred it from arrival order instead.
 ///
+/// How wrong that inference is has been measured once, on conversation 0 with
+/// the extraction prompt asking for it: of the 134 assertions with something
+/// later in their slot, **89 were additions and 45 were corrections**. Two
+/// thirds of what arrival order called a replacement had replaced nothing. That
+/// prompt rule was then withdrawn for costing 19% of the facts -- see
+/// `rm_extract::prompt` -- so nothing in this workspace currently fills this
+/// field from a model, and a store built by the LoCoMo harness reads
+/// [`Supersession::Unstated`] throughout. The type is not idle for that:
+/// tombstones, resolved survivorship and entity kinds all state
+/// [`Supersession::Corrects`], and the assertions that say nothing now read as
+/// unsettled rather than as replaced, which is the difference between a store
+/// that does not know and a store that is wrong.
+///
 /// # Three states, not two
 ///
 /// [`Supersession::Unstated`] is not a synonym for [`Supersession::Joins`]. A
