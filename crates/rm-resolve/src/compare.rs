@@ -156,7 +156,7 @@ pub fn token_jaccard(a: &str, b: &str) -> f64 {
 pub fn possessive_parts(s: &str) -> (Option<&str>, &str) {
     const DETERMINERS: [&str; 7] = ["my", "your", "his", "her", "its", "our", "their"];
 
-    let trimmed = s.trim();
+    let trimmed = article_stripped(s.trim());
 
     // `X's Y` / `X' Y`. Scan for the first apostrophe that ends a token and has
     // something after it.
@@ -187,6 +187,43 @@ pub fn possessive_parts(s: &str) -> (Option<&str>, &str) {
     }
 
     (None, trimmed)
+}
+
+/// The name without a leading "the", "a" or "an".
+///
+/// An article says nothing about which thing is meant, and leaving it on makes
+/// every name that has one look alike. Measured across seven conversations,
+/// 21% of everything in the review band was a pair of names both beginning with
+/// an article -- `"the park" ~ "the lake"`, `"the car" ~ "the crowd"`,
+/// `"the view" ~ "the idea"` -- scoring 6.5 to 6.9 on the strength of a word
+/// that carries no identity. Compared on what follows it, `"park"` and
+/// `"lake"` are not a near miss, while `"the main stage"` and `"the stage"`
+/// still are, which is the distinction that was being lost.
+///
+/// Possessive determiners are deliberately *not* stripped: `"my kids"` and
+/// `"your kids"` are different children, and [`possessive_parts`] keeps them as
+/// owners for exactly that reason. Of the 69 article pairs measured, none was a
+/// possessive determiner on both sides -- the two cases do not overlap in
+/// practice, and they must not be treated alike.
+///
+/// A name that is *only* an article keeps it, since there would be nothing left.
+fn article_stripped(s: &str) -> &str {
+    for article in ["the ", "a ", "an "] {
+        // `get` rather than a slice: an index that lands inside a multi-byte
+        // character panics, and "José García" is four bytes into its second
+        // character at the index "the " would ask for. The range invariant
+        // below carries that name precisely to catch this, and did.
+        let Some(prefix) = s.get(..article.len()) else {
+            continue;
+        };
+        if prefix.eq_ignore_ascii_case(article) {
+            let rest = s[article.len()..].trim_start();
+            if !rest.is_empty() {
+                return rest;
+            }
+        }
+    }
+    s
 }
 
 /// [`jaro_winkler`], but a thing is never confused with what it belongs to.
@@ -361,7 +398,9 @@ mod tests {
         assert_eq!(possessive_parts("Melanie's son"), (Some("Melanie"), "son"));
         assert_eq!(
             possessive_parts("the kids' books"),
-            (Some("the kids"), "books")
+            // The owner loses its article too: "the kids" and "kids" are the
+            // same children, and the article never distinguished them.
+            (Some("kids"), "books")
         );
         assert_eq!(possessive_parts("your son"), (Some("your"), "son"));
         assert_eq!(
@@ -386,6 +425,103 @@ mod tests {
         assert_eq!(possessive_parts("your"), (None, "your"));
         // A bare marker owns nothing -- there is no owner in front of it.
         assert_eq!(possessive_parts("'s thing"), (None, "'s thing"));
+    }
+
+    #[test]
+    fn an_article_carries_no_identity_and_is_not_compared_on() {
+        // 21% of everything in the review band, across seven conversations,
+        // was a pair of names both starting with an article, scoring 6.5 to
+        // 6.9 on the strength of a word that means nothing about which thing
+        // is meant.
+        for (a, b) in [
+            ("the park", "the lake"),
+            ("the car", "the crowd"),
+            ("the view", "the idea"),
+            ("the beach", "the book"),
+        ] {
+            assert!(
+                jaro_winkler(&normalize(a), &normalize(b)) > 0.7,
+                "{a:?}/{b:?} should be a near miss with the article left on"
+            );
+            assert!(
+                possessive_aware(a, b) < 0.7,
+                "{a:?}/{b:?} is not a near miss once the article is gone"
+            );
+        }
+    }
+
+    #[test]
+    fn stripping_the_article_keeps_what_still_looks_alike_without_it() {
+        for (a, b) in [
+            ("the event next month", "the event"),
+            // An article on one side only is the same thing named twice.
+            ("the beach", "beach"),
+            ("a studio", "the studio"),
+        ] {
+            assert!(
+                possessive_aware(a, b) > 0.7,
+                "{a:?}/{b:?} is still a question worth asking"
+            );
+        }
+        assert_eq!(possessive_aware("the beach", "beach"), 1.0);
+    }
+
+    #[test]
+    fn a_modifier_in_front_is_lost_and_that_is_the_price() {
+        // What this rule costs, pinned rather than left to be discovered.
+        //
+        // Once the article is gone these are compared from the front, and
+        // Jaro-Winkler rewards a shared *prefix* -- so an extra word at the end
+        // survives ("the event next month" against "the event") and an extra
+        // word at the start does not. That asymmetry is an artefact of the
+        // comparator, not a judgement about names, and these four pairs are
+        // plausibly the same thing:
+        for (a, b) in [
+            ("the whole gang", "the gang"),
+            ("the main stage", "the stage"),
+        ] {
+            assert!(
+                possessive_aware(a, b) < 0.746,
+                "{a:?}/{b:?} is expected to fall out of the band"
+            );
+        }
+
+        // And the same shape the other way round survives, which is the
+        // asymmetry itself: extra words at the end keep the shared prefix.
+        for (a, b) in [
+            ("the car", "the car Dave is restoring"),
+            ("the city", "the city with the clock tower"),
+        ] {
+            assert!(
+                possessive_aware(a, b) >= 0.746,
+                "{a:?}/{b:?} keeps its prefix and stays a question"
+            );
+        }
+
+        // Measured over every pair in seven conversations' review bands: two
+        // questions lost against sixty-seven coincidences removed. A lost
+        // question is the safe direction -- the two entities stay apart, which
+        // is what they already were, and nothing in the store is corrupted. A
+        // kept coincidence costs someone's attention every time they read the
+        // queue.
+    }
+
+    #[test]
+    fn a_possessive_determiner_is_not_an_article_and_keeps_its_owner() {
+        // "my kids" and "your kids" are different children. Stripping these
+        // the way articles are stripped would score them 1.0 and merge two
+        // families.
+        assert_eq!(possessive_parts("my kids"), (Some("my"), "kids"));
+        assert_eq!(possessive_parts("your kids"), (Some("your"), "kids"));
+        assert!(possessive_aware("my kids", "your kids") < 0.7);
+    }
+
+    #[test]
+    fn a_name_that_is_only_an_article_keeps_it() {
+        // There would be nothing left otherwise.
+        assert_eq!(possessive_parts("the"), (None, "the"));
+        assert_eq!(possessive_parts("a"), (None, "a"));
+        assert_eq!(possessive_parts("the "), (None, "the"));
     }
 
     #[test]
@@ -442,7 +578,6 @@ mod tests {
             ("Acme Inc.", "acme inc"),
             ("O'Brien", "O'Brian"),
             ("McDonald's", "McDonalds"),
-            ("the beach", "the book"),
         ] {
             assert_eq!(
                 possessive_aware(a, b),

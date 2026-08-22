@@ -988,3 +988,64 @@ Recall ranges 0.553 to 0.707. That spread of 0.154 is twice the 0.074 this file
 measured *within* one configuration, so unlike the two-conversation comparison
 earlier, some of this is real: conversations differ in how answerable they are.
 It is not a measurement of anything this project changed.
+
+## The article rule, and a comparison that had to be thrown away
+
+Three times this file called the shared-prefix collisions "a blocking problem
+rather than a scoring one". That was wrong, and the reason is structural:
+blocking is *disjunctive* -- a pair is compared if it shares **any** key -- so
+no blocking change can remove a pair from the band. It can only add. The fix
+had to be in the comparator.
+
+Measured over every pair in seven conversations' review bands, 69 of 328 (21%)
+were pairs whose names *both* began with an article:
+
+```
+6.80  "the car" ~ "the crowd"        6.76  "the park" ~ "the lake"
+6.76  "the view" ~ "the idea"        6.71  "the store" ~ "the studio"
+```
+
+Scoring 6.5 to 6.9 on the strength of a word that says nothing about which
+thing is meant. None of the 69 had a possessive determiner on both sides, so
+articles (`the`, `a`, `an`) can be stripped while `my`/`your`/`their` stay
+owners -- `"my kids"` and `"your kids"` are different children.
+
+### What it costs
+
+Two of the 69 are lost: `"the whole gang" ~ "the gang"` and
+`"the main stage" ~ "the stage"`. Once the article is gone these are compared
+from the front, and Jaro-Winkler rewards a shared *prefix*, so an extra word at
+the end survives (`"the event next month" ~ "the event"`, 0.863; `"the car" ~
+"the car Dave is restoring"`, 0.800) and an extra word at the start does not.
+That asymmetry is an artefact of the comparator rather than a judgement about
+names, and it is pinned by a test so it is a known price rather than a
+surprise.
+
+Sixty-seven coincidences removed against two questions lost. A lost question is
+the safe direction: the two entities stay apart, which is what they already
+were, and nothing in the store is corrupted. A kept coincidence costs attention
+every time someone reads the queue.
+
+### Measured
+
+| conv | band | entities | recall@10 |
+|---|---|---|---|
+| 0 | 31 → 24 | 125 → 125 | 0.617 → 0.617 |
+| 1 | 25 → 23 | 90 → 90 | 0.679 → 0.679 |
+| 8 | 10 → 9 | 119 → 119 | 0.686 → 0.686 |
+
+Every assertion identical on both sides of all three, so this is one set of
+extractions through two resolvers. The queue shrinks and nothing else moves.
+
+### The comparison that was thrown away
+
+The first attempt at conversation 1 reported entities falling 92 to 90 and
+recall falling 0.691 to 0.679, and both were artefacts. The "before" store had
+been written the previous day against a different cache file, and comparing
+assertion contents showed only **732 of 1219 identical** -- two different sets
+of extractions, not two resolvers over one.
+
+Re-run against the same cache, conversation 1's entities do not move at all.
+The check that caught it is cheap and worth repeating on any before/after here:
+if the two stores do not share ~100% of their `(attribute, value)` pairs, they
+are not measuring what they appear to measure.
