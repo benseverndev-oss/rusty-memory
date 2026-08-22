@@ -134,16 +134,25 @@ pub struct Retry {
     pub attempts: u32,
     /// Wait before the second attempt; doubled before each one after.
     pub base_delay: std::time::Duration,
+    /// A ceiling on that doubling.
+    pub max_delay: std::time::Duration,
 }
 
 impl Default for Retry {
     fn default() -> Self {
-        // Three attempts at 250ms and 500ms. Long enough to outlast the
-        // transient failures worth outlasting, short enough that a caller
-        // waiting on a genuinely dead endpoint finds out in under a second.
+        // Six attempts, 250ms doubling to a 16s ceiling: about a minute of
+        // patience in total, which is the unit a token-per-minute limit is
+        // denominated in. The first version stopped after three attempts and
+        // 750ms, which is nowhere near long enough -- a corpus run hit a TPM
+        // limit and lost 482 of 629 extractions to it.
+        //
+        // A dead endpoint still fails fast, because a refused connection is not
+        // what most of this patience is for: `retry_after` skips straight to
+        // the provider's own answer when it gives one.
         Retry {
-            attempts: 3,
+            attempts: 6,
             base_delay: std::time::Duration::from_millis(250),
+            max_delay: std::time::Duration::from_secs(16),
         }
     }
 }
@@ -225,8 +234,13 @@ impl HttpProvider {
                 .send_string(&body);
 
             if attempt < self.retry.attempts && worth_repeating(&response) {
-                std::thread::sleep(delay);
-                delay = delay.saturating_mul(2);
+                // A provider that says when to come back knows better than any
+                // schedule here. A token-per-minute budget is not a blip that
+                // clears in a moment -- it clears when the minute does -- so
+                // guessing short and giving up is how a rate limit turns into a
+                // lost turn.
+                std::thread::sleep(retry_after(&response).unwrap_or(delay));
+                delay = delay.saturating_mul(2).min(self.retry.max_delay);
                 continue;
             }
             return self.handle_response(response, path);
@@ -506,6 +520,26 @@ impl HttpProvider {
     }
 }
 
+/// How long the provider asked us to wait, if it said.
+///
+/// `Retry-After` is the header for it, in seconds. OpenAI also puts a hint in
+/// the message body ("Please try again in 282ms"), which is not read here: the
+/// body is the provider's own prose, this crate scrubs and relays it rather
+/// than parsing it, and a header is a contract where a sentence is not.
+///
+/// Capped at a minute. A provider asking for longer than that is asking for a
+/// different run, not a longer sleep.
+fn retry_after(response: &Result<ureq::Response, ureq::Error>) -> Option<std::time::Duration> {
+    let Err(ureq::Error::Status(_, r)) = response else {
+        return None;
+    };
+    let secs: f64 = r.header("retry-after")?.trim().parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(secs.min(60.0)))
+}
+
 /// Whether a failed request is one that might succeed if simply repeated.
 ///
 /// Deliberately narrow. Repeating a request the provider *understood* and
@@ -553,6 +587,18 @@ impl Embedder for HttpProvider {
 mod tests {
     use super::*;
 
+    /// One attempt, no waiting.
+    ///
+    /// Most tests here dial a port nothing listens on and assert on the
+    /// refusal. A refused connection is exactly what the retry policy repeats,
+    /// so without this every one of them pays a minute of patience for a
+    /// failure it wants.
+    const NO_RETRY: Retry = Retry {
+        attempts: 1,
+        base_delay: std::time::Duration::ZERO,
+        max_delay: std::time::Duration::ZERO,
+    };
+
     fn provider() -> HttpProvider {
         // Port 1 on the loopback address has nothing listening on it, so the
         // connection is refused by the local kernel: no DNS lookup, no packet
@@ -574,10 +620,7 @@ mod tests {
         // clears. One attempt, no backoff: retrying here buys nothing but three
         // times the wait, on a refusal this machine already takes two seconds
         // to produce.
-        .with_retry(Retry {
-            attempts: 1,
-            base_delay: std::time::Duration::ZERO,
-        })
+        .with_retry(NO_RETRY)
     }
 
     #[test]
@@ -610,6 +653,49 @@ mod tests {
     }
 
     #[test]
+    fn the_provider_s_own_retry_after_is_preferred_to_any_schedule_here() {
+        // A token-per-minute budget clears when the minute does, and the
+        // provider is the only one who knows how much of it is left.
+        // `Response` parses from a raw response, headers included, so this
+        // needs no socket.
+        let rate_limited = |headers: &str| -> Box<Result<ureq::Response, ureq::Error>> {
+            let raw = format!("HTTP/1.1 429 Too Many Requests\r\n{headers}\r\nslow down");
+            Box::new(Err(ureq::Error::Status(429, raw.parse().unwrap())))
+        };
+
+        assert_eq!(
+            retry_after(&rate_limited("Retry-After: 3\r\n")),
+            Some(std::time::Duration::from_secs(3))
+        );
+        // Fractional seconds are what a busy provider actually sends.
+        assert_eq!(
+            retry_after(&rate_limited("Retry-After: 0.282\r\n")),
+            Some(std::time::Duration::from_secs_f64(0.282))
+        );
+        // Capped: a provider asking for an hour is asking for a different run.
+        assert_eq!(
+            retry_after(&rate_limited("Retry-After: 3600\r\n")),
+            Some(std::time::Duration::from_secs(60))
+        );
+
+        // No instruction, so the caller falls back to its own doubling.
+        assert_eq!(retry_after(&rate_limited("")), None);
+        // `Retry-After` may also be an HTTP date, which is not parsed here.
+        // Falling back to the schedule is the right answer, not a panic.
+        assert_eq!(
+            retry_after(&rate_limited(
+                "Retry-After: Wed, 21 Oct 2026 07:28:00 GMT\r\n"
+            )),
+            None
+        );
+        assert_eq!(retry_after(&rate_limited("Retry-After: -5\r\n")), None);
+        assert_eq!(
+            retry_after(&Ok(ureq::Response::new(200, "ok", "body").unwrap())),
+            None
+        );
+    }
+
+    #[test]
     fn a_retry_policy_of_one_attempt_does_not_sleep() {
         // The property the test helper above depends on: `attempts: 1` must
         // take the single-pass path, or every offline test in this module pays
@@ -624,6 +710,7 @@ mod tests {
         .with_retry(Retry {
             attempts: 1,
             base_delay: std::time::Duration::from_secs(30),
+            max_delay: std::time::Duration::from_secs(30),
         });
         let _ = provider.embed("anything");
         assert!(
@@ -781,7 +868,10 @@ mod tests {
                 "sk-key-not-under-test".into(),
                 "c".into(),
                 "e".into(),
-            );
+            )
+            // Asserting on the refusal, not hoping it clears: retrying here
+            // buys nothing but the backoff, once per base URL.
+            .with_retry(NO_RETRY);
             let err = provider.embed("anything").unwrap_err().0;
 
             assert!(
