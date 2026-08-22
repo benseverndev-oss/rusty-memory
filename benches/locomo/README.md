@@ -988,3 +988,165 @@ Recall ranges 0.553 to 0.707. That spread of 0.154 is twice the 0.074 this file
 measured *within* one configuration, so unlike the two-conversation comparison
 earlier, some of this is real: conversations differ in how answerable they are.
 It is not a measurement of anything this project changed.
+
+## The article rule, and a comparison that had to be thrown away
+
+Three times this file called the shared-prefix collisions "a blocking problem
+rather than a scoring one". That was wrong, and the reason is structural:
+blocking is *disjunctive* -- a pair is compared if it shares **any** key -- so
+no blocking change can remove a pair from the band. It can only add. The fix
+had to be in the comparator.
+
+Measured over every pair in seven conversations' review bands, 69 of 328 (21%)
+were pairs whose names *both* began with an article:
+
+```
+6.80  "the car" ~ "the crowd"        6.76  "the park" ~ "the lake"
+6.76  "the view" ~ "the idea"        6.71  "the store" ~ "the studio"
+```
+
+Scoring 6.5 to 6.9 on the strength of a word that says nothing about which
+thing is meant. None of the 69 had a possessive determiner on both sides, so
+articles (`the`, `a`, `an`) can be stripped while `my`/`your`/`their` stay
+owners -- `"my kids"` and `"your kids"` are different children.
+
+### What it costs
+
+Two of the 69 are lost: `"the whole gang" ~ "the gang"` and
+`"the main stage" ~ "the stage"`. Once the article is gone these are compared
+from the front, and Jaro-Winkler rewards a shared *prefix*, so an extra word at
+the end survives (`"the event next month" ~ "the event"`, 0.863; `"the car" ~
+"the car Dave is restoring"`, 0.800) and an extra word at the start does not.
+That asymmetry is an artefact of the comparator rather than a judgement about
+names, and it is pinned by a test so it is a known price rather than a
+surprise.
+
+Sixty-seven coincidences removed against two questions lost. A lost question is
+the safe direction: the two entities stay apart, which is what they already
+were, and nothing in the store is corrupted. A kept coincidence costs attention
+every time someone reads the queue.
+
+### Measured
+
+| conv | band | entities | recall@10 |
+|---|---|---|---|
+| 0 | 31 → 24 | 125 → 125 | 0.617 → 0.617 |
+| 1 | 25 → 23 | 90 → 90 | 0.679 → 0.679 |
+| 8 | 10 → 9 | 119 → 119 | 0.686 → 0.686 |
+
+Every assertion identical on both sides of all three, so this is one set of
+extractions through two resolvers. The queue shrinks and nothing else moves.
+
+### The comparison that was thrown away
+
+The first attempt at conversation 1 reported entities falling 92 to 90 and
+recall falling 0.691 to 0.679, and both were artefacts. The "before" store had
+been written the previous day against a different cache file, and comparing
+assertion contents showed only **732 of 1219 identical** -- two different sets
+of extractions, not two resolvers over one.
+
+Re-run against the same cache, conversation 1's entities do not move at all.
+The check that caught it is cheap and worth repeating on any before/after here:
+if the two stores do not share ~100% of their `(attribute, value)` pairs, they
+are not measuring what they appear to measure.
+
+## All ten
+
+Conversations 2, 4 and 6 completed once the daily request quota reset.
+Conversation 2's earlier partial run -- 194 of 663 turns, excluded above -- is
+replaced by a clean one at 637.
+
+| conv | ingested | refused | entities | attrs | once | >1 ver | band | recall@10 |
+|---|---|---|---|---|---|---|---|---|
+| 0 | 402 | 4% | 125 | 498 | 82% | 15% | 31 | 0.617 |
+| 1 | 350 | 5% | 92 | 389 | 82% | 18% | 28 | 0.691 |
+| 2 | 637 | 4% | 194 | 652 | 80% | 18% | 21 | 0.697 |
+| 3 | 591 | 6% | 192 | 544 | 83% | 14% | 50 | 0.553 |
+| 4 | 653 | 4% | 321 | 615 | 80% | 15% | 118 | 0.729 |
+| 5 | 639 | 5% | 257 | 562 | 83% | 14% | 99 | 0.675 |
+| 6 | 666 | 3% | 263 | 634 | 82% | 13% | 50 | 0.711 |
+| 7 | 658 | 3% | 224 | 565 | 82% | 16% | 42 | 0.707 |
+| 8 | 482 | 5% | 119 | 490 | 80% | 16% | 10 | 0.686 |
+| 9 | 535 | 6% | 197 | 592 | 80% | 15% | 68 | 0.626 |
+
+**5,613 turns, twenty speakers, ten conversations.**
+
+**81.3% of attribute names are used exactly once** — 4,506 of 5,541 — and the
+range across ten conversations is 80% to 83%. The share of attributes carrying
+more than one version is 13% to 18%. Whatever the bi-temporal machinery is
+worth, it is reachable on about a sixth of what the store holds, everywhere,
+and that is now measured on the whole corpus rather than argued from one
+transcript.
+
+One inconsistency in the band column, stated rather than smoothed over:
+conversations 2, 4 and 6 were run after the article rule landed and the other
+seven before it. The rule changes only which pairs are asked about — entities
+and assertions were measured unchanged — so every other column is comparable
+and the band column is not, by roughly the 15% the rule removes.
+
+The band still ranges from 10 pairs to 118, a factor of twelve, on corpora of
+comparable size. Recall ranges 0.553 to 0.729. Neither is a measurement of
+anything this project changed; both are measurements of how much the
+conversations differ.
+
+## The attribute rule: measured, and withdrawn
+
+The prompt says what `kind` may be and what `value` may be, and had never said
+what an *attribute name* is. A rule was added asking for the plainest reusable
+name and forbidding names built out of the value — `enjoyment_of_grand_canyon`
+is `enjoyment`, `kids_experience` is `experience` — and measured on
+conversation 1 against its own baseline.
+
+| | before | after |
+|---|---|---|
+| distinct attribute names | 389 | **187** |
+| assertions per name | 1.50 | **3.05** |
+| used exactly once | 82% | 77% |
+| assertions inside multi-version attributes | 40% | **71%** |
+| entities | 92 | 115 |
+| recall@10 | 0.691 | 0.667 |
+
+Read as a table it looks like a win: the vocabulary halved, reuse doubled, and
+the surface the temporal machinery can act on went from 40% of assertions to
+71%. It is not a win, and the store says why:
+
+```
+entity 1  goal     86 versions: 'starting my own business', 'to share dancing
+                   with others', 'start a dance studio', 'spread intensity...'
+entity 1  feeling  71 versions: 'excited', 'amazing', 'glad', 'positive'...
+```
+
+Eighty-six goals in one slot. Those are not successive values of one goal that
+supersede each other; they are eighty-six different goals, and `most_recent`
+returns exactly one of them. The rule traded a store where nothing ever met for
+a store where unrelated things are forced together, and "71% of assertions are
+inside a contested attribute" counts both alike. **The metric could not tell a
+value that changed from two facts colliding**, which is why it read as success.
+
+The change is reverted. Two prompt changes in this project have now been
+measured and withdrawn, and the rule that keeps being confirmed is that a
+plausible prompt improvement is worth nothing until the artefact is read.
+
+### What it actually established
+
+The attribute name is being asked to do two jobs at once:
+
+- say what **kind** of fact this is, so that a later fact about the same thing
+  finds the earlier one;
+- say **which** fact this is, so that unrelated facts do not collide.
+
+One string cannot do both, and every version of the prompt trades one failure
+for the other. Loosen it and nothing ever supersedes; tighten it and unrelated
+facts share a slot.
+
+That is not a prompt problem. It is the store's grain: `feeling` and `goal` are
+not single-valued attributes where a later value replaces an earlier one, they
+are *accumulating* ones where a later value is an additional observation.
+`rm-survivor` already distinguishes these — `valid_interval` keeps disjoint
+spans rather than picking a winner, and `two_employers_at_once_both_stand` is a
+test that exists — and `rmem.toml` already carries per-attribute policy. What
+is missing is anything that decides *which* attributes are which, and nothing
+in the pipeline currently asks.
+
+That is the next thing worth designing, and it is a design question rather than
+a wording one.
