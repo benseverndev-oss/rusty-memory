@@ -83,7 +83,7 @@ Reply with only a JSON object of this shape, and nothing else:
   ],
   "facts": [
     {{"subject": 0, "attribute": "employer", "value": "Globex",
-      "text": "Alex works at Globex", "days_ago": null}}
+      "text": "Alex works at Globex", "days_ago": null, "replaces": true}}
   ],
   "relations": [
     {{"subject": 0, "predicate": "employed_by", "object": 1, "days_ago": null}}
@@ -121,6 +121,12 @@ Rules:
 - "value" is a string, or null. Never a number and never true or false — write
   "2" and "true" if those are the values. Null means the attribute has no
   value: "he is between jobs" is a fact with a null value, not a missing fact.
+- "replaces" is whether someone can have only one of these at a time. An
+  employer, an address, an age, a mood, a marital status: true, because a new
+  one makes the last one no longer so. A pet, a hobby, a place they have been,
+  a thing they like, something they attended: false, because a new one is one
+  more and the old one is still true. Say true as well when the turn is
+  correcting something said earlier. Leave it out only if neither reading fits.
 - "days_ago" is how long before now the thing began or ended, as a whole number
   of days, or null if it is happening now. It is never negative: nothing here
   is in the future. Do not output dates or timestamps.

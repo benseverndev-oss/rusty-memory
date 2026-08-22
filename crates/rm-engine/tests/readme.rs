@@ -7,7 +7,8 @@
 
 use rm_engine::{
     Believed, BlockingKey, Comparator, Engine, FieldRule, Interval, Metric, Observation, Policy,
-    Provenance, Query, Record, Remembered, Ruleset, Source, Strategy, VectorIndex, Version,
+    Provenance, Query, Record, Remembered, Ruleset, Source, Standing, Strategy, Supersession,
+    VectorIndex, Version,
 };
 
 const MARCH: i64 = 1_710_000_000_000;
@@ -36,6 +37,10 @@ fn told(employer: &str, at: i64, session: &str, embedding: [f32; 3]) -> Observat
         value: Some(employer.to_string()),
         valid: Interval::since(at),
         provenance: Provenance::new(Source::UserAssertion, at, session),
+        // A person has one employer at a time, so a later one replaces the
+        // last. Saying so is what lets the recall below report a correction
+        // rather than the mere fact that something arrived afterwards.
+        supersession: Supersession::Corrects,
         embedding: embedding.to_vec(),
     }
 }
@@ -72,14 +77,15 @@ fn a_change_of_employer_is_two_facts_not_a_contradiction() {
         Believed::Value("Globex".into())
     );
 
-    // Both remain recallable, and the superseded one says so.
+    // Both remain recallable, and the corrected one says so.
     let hits = engine.recall(&Query::new(vec![1.0, 0.0, 0.0], 5)).unwrap();
     assert_eq!(hits.len(), 2);
     let acme = hits
         .iter()
         .find(|h| h.value.as_deref() == Some("Acme"))
         .unwrap();
-    assert!(acme.superseded);
+    assert_eq!(acme.standing, Standing::Corrected);
+    assert!(!acme.standing.still_stands());
 
     // And the raw audit trail underneath, whose element type a caller can name
     // without taking a dependency on the store crate.

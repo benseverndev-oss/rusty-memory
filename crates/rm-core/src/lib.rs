@@ -102,6 +102,61 @@ impl Provenance {
     }
 }
 
+/// What an assertion claims about the ones already in its slot.
+///
+/// A store that appends knows the order its assertions arrived in and nothing
+/// else. Order is not contradiction: "she has a dog" then "she has a cat" is
+/// two pets, and reading the second as a correction of the first is how an
+/// agent forgets the dog. Measured over ten LoCoMo conversations, 26% of every
+/// assertion in the store had a later assertion in the same slot -- and the
+/// sample is overwhelmingly things that are all still true at once:
+/// `attended` holding a support group, a workshop and a parade;
+/// `appreciates` holding five separate things.
+///
+/// The information needed to tell the two apart exists exactly once, at the
+/// moment the turn is read, and was never written down. This is where it goes.
+///
+/// The edge half of the store has had this since the beginning:
+/// `rm_extract::Closure` is a model saying "whatever employment you held for
+/// this person has ended". Attributes had no way to say the same thing, so the
+/// engine inferred it from arrival order instead.
+///
+/// # Three states, not two
+///
+/// [`Supersession::Unstated`] is not a synonym for [`Supersession::Joins`]. A
+/// snapshot written before this field existed, or a host calling
+/// `Engine::remember` directly, records assertions that never answered the
+/// question. Reading those as `Joins` would retroactively un-correct every
+/// correction ever stored; reading them as `Corrects` is the claim this type
+/// exists to stop making. So they say neither, and the read path reports the
+/// uncertainty rather than resolving it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Supersession {
+    /// This assertion replaces what the slot already held. A change of job, an
+    /// address that moved, a correction of something misheard.
+    Corrects,
+    /// This assertion joins what the slot already held; both can be true. A
+    /// second pet, another place someone has been, one more thing they like.
+    Joins,
+    /// Nobody said. The default, because it is what an assertion that predates
+    /// the question actually claims.
+    #[default]
+    Unstated,
+}
+
+impl Supersession {
+    /// Whether this is the default, for `#[serde(skip_serializing_if)]`.
+    ///
+    /// Snapshots run to tens of megabytes and are meant to be diffable, so the
+    /// state that means "nothing to say" writes nothing. It also keeps a
+    /// snapshot written before this field existed byte-identical across a
+    /// round-trip through the new shape.
+    pub fn is_unstated(&self) -> bool {
+        matches!(self, Supersession::Unstated)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

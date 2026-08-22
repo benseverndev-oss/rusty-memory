@@ -1,6 +1,6 @@
 //! Reading the engine: survivorship at query time.
 
-use rm_core::{Interval, Provenance, Source, Timestamp};
+use rm_core::{Interval, Provenance, Source, Supersession, Timestamp};
 use rm_store::StableId;
 use rm_survivor::{merge, Candidate, Held};
 
@@ -44,8 +44,54 @@ pub struct Recalled {
     pub valid: Interval,
     pub provenance: Provenance,
     pub score: f32,
-    /// A later assertion superseded this one as of the query's `tx_t`.
-    pub superseded: bool,
+    /// Where this assertion stands against the later ones in its slot, as of
+    /// the query's `tx_t`.
+    pub standing: Standing,
+}
+
+/// Where a recalled assertion stands against the later ones in its slot.
+///
+/// This used to be a `bool` named `superseded`, and it was set by asking
+/// whether anything later existed. Arrival order is not contradiction: over ten
+/// LoCoMo conversations that rule flagged 26% of every assertion in the store as
+/// replaced, and the sample is dominated by facts that are all still true --
+/// three things someone attended, five things they appreciate, two pets. An
+/// agent reading `superseded` on "she has a dog" forgets the dog.
+///
+/// So the question is now put to the party that can answer it. `rm_extract`
+/// asks the model, per fact, whether a later one of these makes the earlier one
+/// untrue, and [`Supersession`] carries the answer down to here. What is left
+/// is the case where nobody answered, and that gets its own variant rather than
+/// being folded into either of the others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// Nothing later in this slot. The latest thing said.
+    Latest,
+    /// Later assertions exist and every one of them said it was one more of the
+    /// same thing. This is still true; it is simply not the only answer.
+    ///
+    /// Distinct from [`Standing::Latest`] because a caller reading out "she has
+    /// a dog" is better off knowing there is also a cat, and distinct from
+    /// [`Standing::Unsettled`] because here somebody actually answered.
+    Joined,
+    /// A later assertion in this slot claimed to replace what came before.
+    Corrected,
+    /// A later assertion exists, and none of them said whether it replaced
+    /// this. Both may be true at once. Reported rather than resolved: a store
+    /// that guesses here is wrong a quarter of the time and never says so.
+    Unsettled,
+}
+
+impl Standing {
+    /// Whether this assertion may still be stated as current.
+    ///
+    /// True for everything but [`Standing::Corrected`], which is the point: an
+    /// unanswered question is not a correction, and a caller that only wants to
+    /// know whether it can say the fact out loud should not have to reason
+    /// about why nobody answered it.
+    pub fn still_stands(&self) -> bool {
+        !matches!(self, Standing::Corrected)
+    }
 }
 
 impl Query {
@@ -226,7 +272,7 @@ impl Engine {
                     valid: version.valid,
                     provenance: version.provenance.clone(),
                     score: hit.score,
-                    superseded: self.is_superseded(entry, version, q),
+                    standing: self.standing(entry, version, q),
                 })
             })
             .collect())
@@ -268,21 +314,50 @@ impl Engine {
         true
     }
 
-    /// Whether a later assertion about the same attribute overtook this one, as
-    /// of the query's `tx_t` (or unbounded, if the query has none).
+    /// Where an assertion stands against the later ones in its slot, as of the
+    /// query's `tx_t` (or unbounded, if the query has none).
     ///
     /// Reported rather than filtered: semantic recall of a fact that *was* true
     /// is often exactly what was wanted ("what did I believe about her employer
-    /// in May"), and dropping a superseded fact would make that unanswerable.
+    /// in May"), and dropping a corrected fact would make that unanswerable.
     /// Returning it unmarked is worse — it lets a caller state a stale fact as
     /// current. Marking it is the only option that does neither.
-    fn is_superseded(&self, entry: &AssertionRef, version: &rm_store::Version, q: &Query) -> bool {
+    ///
+    /// Strictly later on the transaction axis, so two assertions that arrived
+    /// at the same instant never rank each other. `MemoryStore::as_of` breaks
+    /// that tie by arrival because it has to return one value; nothing here has
+    /// to, and reporting an arbitrary tie-break as a correction would be a
+    /// claim about the world made out of a `Vec`'s index.
+    ///
+    /// One [`Supersession::Corrects`] among the later assertions settles it.
+    /// The rest have to be unanimous to be believed: a slot holding a
+    /// correction and an addition has been corrected, because the correction
+    /// spoke about everything under it.
+    fn standing(&self, entry: &AssertionRef, version: &rm_store::Version, q: &Query) -> Standing {
         let horizon = q.as_of.map(|(_, tx)| tx).unwrap_or(Timestamp::MAX);
-        self.store
+        let mut later = self
+            .store
             .history(entry.entity, &entry.attribute)
             .iter()
-            .any(|other| {
+            .filter(|other| {
                 other.ingested_at() <= horizon && other.ingested_at() > version.ingested_at()
             })
+            .peekable();
+        if later.peek().is_none() {
+            return Standing::Latest;
+        }
+        let mut unsettled = false;
+        for other in later {
+            match other.supersession {
+                Supersession::Corrects => return Standing::Corrected,
+                Supersession::Unstated => unsettled = true,
+                Supersession::Joins => {}
+            }
+        }
+        if unsettled {
+            Standing::Unsettled
+        } else {
+            Standing::Joined
+        }
     }
 }

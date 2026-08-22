@@ -3,7 +3,7 @@
 //! Separate from the commands so they can be tested without scraping text, and
 //! so changing how something reads never risks changing what it does.
 
-use rm_engine::Believed;
+use rm_engine::{Believed, Standing};
 
 use rm_host::command::{MentionLanding, Outcome};
 
@@ -85,7 +85,16 @@ pub fn render(outcome: &Outcome) -> String {
             let mut out = String::new();
             for h in hits {
                 let value = h.value.as_deref().unwrap_or("(no value)");
-                let stale = if h.superseded { "  [superseded]" } else { "" };
+                // Four states, not two, because "something later exists" and
+                // "something later replaced this" are different things and the
+                // second was being printed for both. `Joined` is worth its own
+                // line: a reader who sees one pet wants to know there are two.
+                let stale = match h.standing {
+                    Standing::Latest => "",
+                    Standing::Joined => "  [one of several]",
+                    Standing::Corrected => "  [corrected by a later assertion]",
+                    Standing::Unsettled => "  [a later assertion exists; neither said which replaces which]",
+                };
                 out.push_str(&format!(
                     "entity {}  {} = {value}  ({:.3}){stale}\n",
                     h.entity, h.attribute, h.score

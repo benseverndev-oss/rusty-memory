@@ -106,6 +106,34 @@ def main(path):
     for a, n in attrs.most_common(8):
         print(f"  {n:>4}  {a}")
 
+    # What the recall path would tell a reader about each assertion. Mirrors
+    # `rm_engine::Engine::standing`: strictly later on the transaction axis,
+    # one `corrects` settles the slot, otherwise unanimous `joins` leaves the
+    # fact standing and any `unstated` leaves the question open.
+    stand = collections.Counter()
+    for eid, e in entities.items():
+        for name, vs in e["attributes"].items():
+            if name == "kind":
+                continue
+            for v in vs:
+                later = [w for w in vs
+                         if w["provenance"]["observed_at"] > v["provenance"]["observed_at"]]
+                claims = {w.get("supersession", "unstated") for w in later}
+                if not later:
+                    stand["latest"] += 1
+                elif "corrects" in claims:
+                    stand["corrected"] += 1
+                elif "unstated" in claims:
+                    stand["unsettled"] += 1
+                else:
+                    stand["joined"] += 1
+
+    print("\nwhat recall would say about each assertion:")
+    for k in ("latest", "joined", "unsettled", "corrected"):
+        print(f"  {k:<10} {stand[k]:>5}  ({stand[k] / max(total, 1):.1%})")
+    print("  <- only `corrected` stops a reader stating the fact. Before the")
+    print("     model was asked, everything but `latest` read as replaced.")
+
     band = outer.get("review", {})
     print(f"\nreview band: {len(band)} pairs")
 

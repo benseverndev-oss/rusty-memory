@@ -13,7 +13,7 @@
 
 use serde_json::{json, Value};
 
-use rm_engine::{Believed, Provenance, Recalled, Source};
+use rm_engine::{Believed, Provenance, Recalled, Source, Standing};
 use rm_host::command::{MentionLanding, Outcome};
 
 /// What one tool call returns.
@@ -126,10 +126,19 @@ pub fn render(outcome: &Outcome) -> Rendered {
                     Some(v) => v.clone(),
                     None => "(asserted to have no value)".to_string(),
                 };
-                let stale = if h.superseded {
-                    "  [superseded by a later assertion]"
-                } else {
-                    ""
+                // The model reads this line and decides whether to say the
+                // fact out loud, so it has to distinguish the case where a
+                // later assertion replaced this one from the case where a
+                // later assertion merely exists. Collapsing them told an agent
+                // that a second pet had replaced the first.
+                let stale = match h.standing {
+                    Standing::Latest => "",
+                    Standing::Joined => "  [one of several under this attribute; still true]",
+                    Standing::Corrected => "  [corrected by a later assertion]",
+                    Standing::Unsettled => {
+                        "  [a later assertion exists under this attribute and did not say \
+                         whether it replaces this one -- both may be true]"
+                    }
                 };
                 text.push_str(&format!(
                     "  entity {}  {} = {value}  (score {:.3}, {}){stale}\n",
@@ -241,7 +250,14 @@ fn hit(h: &Recalled) -> Value {
         "value": h.value,
         "asserted_absent": h.value.is_none(),
         "score": h.score,
-        "superseded": h.superseded,
+        // "latest" | "joined" | "corrected" | "unsettled". A string rather
+        // than the boolean this used to be, because the boolean could only say
+        // "something later exists" and was read as "this was replaced".
+        "standing": standing_name(h.standing),
+        // Kept as the one thing a caller usually wants to branch on: whether
+        // this may still be stated as current. True for everything but a
+        // correction -- an unanswered question is not a correction.
+        "still_stands": h.standing.still_stands(),
         "valid_from": h.valid.from,
         "valid_to": h.valid.to,
         "source": source_name(source),
@@ -256,6 +272,19 @@ fn hit(h: &Recalled) -> Value {
 /// this server's contract with a model and `Source` is a library type that is
 /// free to gain variants. `External` carries the host's own label, which is the
 /// one case where the value is the informative part.
+/// The wire name for a [`Standing`].
+///
+/// Spelled out rather than derived from `Debug`, so a rename in `rm_engine`
+/// cannot silently change a field every client is parsing.
+fn standing_name(standing: Standing) -> &'static str {
+    match standing {
+        Standing::Latest => "latest",
+        Standing::Joined => "joined",
+        Standing::Corrected => "corrected",
+        Standing::Unsettled => "unsettled",
+    }
+}
+
 fn source_name(source: &Source) -> String {
     match source {
         Source::UserAssertion => "user_assertion".to_string(),
@@ -328,7 +357,7 @@ mod tests {
             valid: Interval::since(100),
             provenance: Provenance::new(Source::UserAssertion, 100, "session-a"),
             score: 0.5,
-            superseded: false,
+            standing: Standing::Latest,
         };
         let out = render(&Outcome::Recalled(vec![hit]));
         assert!(out.text.contains("no value"), "{}", out.text);
@@ -336,11 +365,8 @@ mod tests {
         assert_eq!(out.structured["hits"][0]["asserted_absent"], json!(true));
     }
 
-    #[test]
-    fn a_superseded_hit_says_so_in_both_halves() {
-        // It is returned rather than hidden -- what was believed is part of
-        // the record -- which only works if the reader is told it is stale.
-        let hit = Recalled {
+    fn stood(standing: Standing) -> Recalled {
+        Recalled {
             entity: 1,
             assertion: 0,
             attribute: "employer".into(),
@@ -348,15 +374,52 @@ mod tests {
             valid: Interval::between(100, 200),
             provenance: Provenance::new(Source::AgentInference, 150, "s"),
             score: 0.9,
-            superseded: true,
-        };
-        let out = render(&Outcome::Recalled(vec![hit]));
-        assert!(out.text.contains("superseded"), "{}", out.text);
-        assert_eq!(out.structured["hits"][0]["superseded"], json!(true));
+            standing,
+        }
+    }
+
+    #[test]
+    fn a_corrected_hit_says_so_in_both_halves() {
+        // It is returned rather than hidden -- what was believed is part of
+        // the record -- which only works if the reader is told it is stale.
+        let out = render(&Outcome::Recalled(vec![stood(Standing::Corrected)]));
+        assert!(out.text.contains("corrected"), "{}", out.text);
+        assert_eq!(out.structured["hits"][0]["standing"], json!("corrected"));
+        assert_eq!(out.structured["hits"][0]["still_stands"], json!(false));
         assert_eq!(out.structured["hits"][0]["valid_to"], json!(200));
         assert_eq!(
             out.structured["hits"][0]["source"],
             json!("agent_inference")
+        );
+    }
+
+    #[test]
+    fn a_hit_with_something_later_beside_it_is_not_rendered_as_replaced() {
+        // The distinction the boolean could not draw. Both of these have a
+        // later assertion under the same attribute; neither has been replaced,
+        // and a model told otherwise drops a fact that is still true.
+        for standing in [Standing::Joined, Standing::Unsettled] {
+            let out = render(&Outcome::Recalled(vec![stood(standing)]));
+            assert!(
+                !out.text.contains("corrected"),
+                "{standing:?} must not read as a correction: {}",
+                out.text
+            );
+            assert_eq!(
+                out.structured["hits"][0]["still_stands"],
+                json!(true),
+                "{standing:?}"
+            );
+        }
+        assert_eq!(
+            render(&Outcome::Recalled(vec![stood(Standing::Joined)])).structured["hits"][0]
+                ["standing"],
+            json!("joined")
+        );
+        assert_eq!(
+            render(&Outcome::Recalled(vec![stood(Standing::Unsettled)])).structured["hits"][0]
+                ["standing"],
+            json!("unsettled")
         );
     }
 
