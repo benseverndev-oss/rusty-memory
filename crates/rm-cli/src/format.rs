@@ -105,7 +105,9 @@ pub fn render(outcome: &Outcome) -> String {
                     Standing::Latest => "",
                     Standing::Joined => "  [one of several]",
                     Standing::Corrected => "  [corrected by a later assertion]",
-                    Standing::Unsettled => "  [a later assertion exists; neither said which replaces which]",
+                    Standing::Unsettled => {
+                        "  [a later assertion exists; neither said which replaces which]"
+                    }
                 };
                 out.push_str(&format!(
                     "entity {}  {} = {value}  ({:.3}){stale}\n",
