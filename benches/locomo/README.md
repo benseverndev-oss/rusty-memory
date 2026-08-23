@@ -1150,3 +1150,102 @@ in the pipeline currently asks.
 
 That is the next thing worth designing, and it is a design question rather than
 a wording one.
+
+## The baseline nobody had run
+
+Every result above compares the store against an earlier version of itself. This
+compares it against not having one.
+
+The pipeline embeds an *extracted fact* — one vector per assertion, over a short
+sentence the model wrote to state that fact on its own. The obvious control is
+to skip all of it: embed the raw turn text, `"<speaker>: <text>"`, one vector per
+turn, and search those. No completions, no entities, no resolution. Twenty lines.
+
+Scored the way everything else here is scored, and made fair by taking **k
+distinct turns from each side** — the store returns several assertions per turn,
+so comparing ten assertions against ten turns would flatter the turns:
+
+| conversation | questions | extracted facts | raw turns | delta |
+|---|---|---|---|---|
+| 0 | 149 | 0.685 | **0.799** | +0.114 |
+| 1 | 81 | 0.728 | **0.778** | +0.049 |
+| 2 | 152 | 0.717 | **0.796** | +0.079 |
+| **pooled** | **382** | **0.707** | **0.793** | **+0.086** |
+
+Never negative, on any conversation. The 0.707 is the number this project has
+been reporting all along, which is the check that the comparison is set up right.
+
+They are complementary — at k=10, raw turns find 53 questions the store misses
+and the store finds 20 the raw turns miss — so the obvious next move is to keep
+both. It does not work:
+
+| method | recall@10 turns |
+|---|---|
+| extracted only | 0.707 |
+| **raw turns only** | **0.793** |
+| interleave | 0.791 |
+| reciprocal rank fusion (k=10) | 0.780 |
+| reciprocal rank fusion (k=60) | 0.759 |
+
+Nothing beats the raw turns alone. The extracted-fact retriever contributes no
+recall that the turn text does not already carry.
+
+### What this does and does not say
+
+It does **not** say the store is pointless, and reading it that way would be a
+category error. Raw turns cannot answer `about(entity, attribute, valid_t,
+tx_t)`. They cannot say a fact was corrected, or that two names are one person,
+or what was believed last Tuesday about last May. None of that is retrieval and
+none of it is in this number.
+
+What it says is narrower and still bad: **finding the right turn is not a job
+the assertion index does well**, and it has been the project's headline number.
+Three prompt changes, a subject boost, a reranking sweep and a hybrid lexical
+retriever were all measured against a baseline that a twenty-line control beats.
+
+The reading that fits the evidence is that these are two different jobs sharing
+one index. Recall wants the turn; `about` wants the resolved, superseded,
+bi-temporal assertion. The assertion index is very good at the second and is
+being asked to do the first.
+
+### Ruled out on the way, each with its own measurement
+
+Read off the same 149 questions, simulated offline over a dumped top-200 so each
+policy costs nothing to test. Control is 0.671 (recall@10 over assertions, which
+is what the harness reports — the 0.707 above is the same runs re-scored over
+distinct turns, and the two are not interchangeable).
+
+| policy | recall@10 | delta |
+|---|---|---|
+| control | 0.671 | — |
+| drop tombstones (`value = None`) | 0.577 | −0.094 |
+| drop `kind` assertions | 0.678 | +0.007 |
+| drop tombstones and `kind` | 0.584 | −0.087 |
+| one hit per entity | 0.450 | −0.181 |
+| two hits per entity | 0.497 | −0.134 |
+| one hit per turn | 0.638 | +0.007 |
+
+Two of these were worth the trouble of being wrong about.
+
+**Tombstones are not dead weight.** 17% of every hit handed back has a null value
+— `family_moments = None`, `interest_in_art = None` — which reads like the model
+using null as a flag rather than as the "this attribute has no value" the prompt
+asks for. They answer nothing on their own. Dropping them costs **0.094**,
+because an assertion is a pointer to the turn it came from whether or not it
+carries a value, and the metric scores turns.
+
+**The result set is not redundant.** The top ten averages **9.0 distinct turns**,
+so there is no crowding to squeeze out: deduplicating by turn gains 0.007. The
+answer is not being pushed out by near-duplicates of itself. It simply ranks
+below ten genuinely different wrong turns — median rank **30**, with 78% of
+missed answers somewhere in the top 200.
+
+### A confound worth naming
+
+`demote_replaced` runs over whatever `k` returned, so demoting inside a top-10
+and demoting inside a top-200 give different top-tens. Taking ten from a demoted
+200 scores **0.631** against the pipeline's **0.671** — the demotion has more
+material to work with and uses it worse. Not how the pipeline runs, so not a
+result about shipped behaviour, but it invalidates any simulation that dumps
+deep and slices shallow. Sorting the dumped list back into pure similarity order
+reproduces 0.671 exactly, and that is the control every table above uses.

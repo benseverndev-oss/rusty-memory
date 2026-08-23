@@ -473,15 +473,16 @@ fn main() {
     let mut staleness = Staleness::default();
     // Off unless asked for: a run that writes a file nobody requested is a
     // surprise, and the aggregates below are what the harness is for.
-    let mut dumped = std::env::var("LOCOMO_DUMP").ok().and_then(|path| {
-        match std::fs::File::create(&path) {
-            Ok(f) => Some(std::io::BufWriter::new(f)),
-            Err(e) => {
-                eprintln!("  could not open {path} for the per-question dump: {e}");
-                None
-            }
-        }
-    });
+    let mut dumped =
+        std::env::var("LOCOMO_DUMP")
+            .ok()
+            .and_then(|path| match std::fs::File::create(&path) {
+                Ok(f) => Some(std::io::BufWriter::new(f)),
+                Err(e) => {
+                    eprintln!("  could not open {path} for the per-question dump: {e}");
+                    None
+                }
+            });
     // Swept from outside so one build can produce the whole curve, and so the
     // control (0.0) runs the identical code path rather than a different one.
     let boost_by: f32 = std::env::var("LOCOMO_BOOST")
@@ -528,7 +529,7 @@ fn main() {
         // filtering would discard the answer outright every time it guessed
         // wrong, while a boost only costs the guess its advantage. Weight 0
         // is the control and leaves the query identical.
-        let mut query = Query::new(embedding, k());
+        let mut query = Query::new(embedding.clone(), k());
         if boost_by != 0.0 {
             if let Some(subject) = eval::subject_of(question, &speaker_a, &speaker_b) {
                 query = query.boosting(eval::entities_named(&engine, subject), boost_by);
@@ -553,7 +554,51 @@ fn main() {
         // is a set operation over per-question results.
         if let Some(dump) = dumped.as_mut() {
             use std::io::Write;
-            let refs: Vec<&str> = hits.iter().map(|h| h.provenance.source_ref.as_str()).collect();
+            let refs: Vec<&str> = hits
+                .iter()
+                .map(|h| h.provenance.source_ref.as_str())
+                .collect();
+            // What came back, in words. `hits` alone says which turns were
+            // surfaced; it cannot say what the store thought they said, and
+            // "why did this rank above the answer" is unanswerable without it.
+            let shown: Vec<serde_json::Value> = hits
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "ref": h.provenance.source_ref,
+                        "attr": h.attribute,
+                        "value": h.value,
+                        "score": h.score,
+                    })
+                })
+                .collect();
+            // On a miss, look deeper than the metric does. The k-curve says
+            // recall reaches 0.926 at k=200, so most missed answers are in the
+            // index and merely ranked below the cut -- but the aggregate cannot
+            // say *how far* below, or what the assertion that should have won
+            // actually says. Both are the diagnosis.
+            // The whole ranked list, not just the winner's position. Any
+            // re-ranking policy worth trying -- drop the tombstones, prefer a
+            // value over a bare attribute, demote a near-duplicate -- is a
+            // function of this list, so dumping it once buys every one of them
+            // as an offline simulation rather than another paid run.
+            let deep = match engine.recall(&Query::new(embedding, 200)) {
+                Err(_) => serde_json::Value::Null,
+                Ok(deep_hits) => serde_json::Value::Array(
+                    deep_hits
+                        .iter()
+                        .map(|h| {
+                            serde_json::json!({
+                                "ref": h.provenance.source_ref,
+                                "attr": h.attribute,
+                                "value": h.value,
+                                "score": h.score,
+                                "entity": h.entity,
+                            })
+                        })
+                        .collect(),
+                ),
+            };
             let _ = writeln!(
                 dump,
                 "{}",
@@ -562,6 +607,8 @@ fn main() {
                     "category": category,
                     "evidence": evidence.iter().collect::<Vec<_>>(),
                     "hits": refs,
+                    "shown": shown,
+                    "deep": deep,
                     "found": found,
                 })
             );
@@ -590,7 +637,10 @@ fn main() {
         }
     }
 
-    println!("\n=== retrieval (recall@{}, scored against LoCoMo evidence turns) ===", k());
+    println!(
+        "\n=== retrieval (recall@{}, scored against LoCoMo evidence turns) ===",
+        k()
+    );
     println!("questions asked      {asked} of {}", questions.len());
     if scored.is_empty() {
         println!("nothing answerable within the ingested prefix");
