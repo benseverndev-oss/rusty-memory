@@ -158,6 +158,12 @@ Rules:
   "pottery", "self-care", "happiness". Those are facts about a person, not
   things in their own right. "the pottery studio on Vine Street" is a place and
   may be a mention; "pottery" is not.
+- A fact is something the turn says about a mention. Record what happened
+  before how it felt. "I went to the LGBTQ support group yesterday and it was
+  so powerful" says two things -- that they attended, and that it moved them --
+  and the attending is the one a later question asks about. Emit both when the
+  turn supports both, but never emit only the feeling: a turn whose facts are
+  all feelings has lost the event that caused them.
 - "text" on a mention is the phrasing the turn used. "text" on a fact is a short
   sentence stating that fact on its own, because it is searched for separately.
 - "value" is a string, or null. Never a number and never true or false — write
