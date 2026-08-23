@@ -179,6 +179,104 @@ fn main() {
         cache: &cache,
     };
 
+    // Arity, asked once per distinct attribute name rather than once per fact.
+    //
+    // This pass is free: every extraction is already in the cache from the
+    // prewarm above, so re-running them here to collect the vocabulary costs no
+    // request. Only the arity batches themselves are new, and there are a
+    // handful of them against several hundred extractions.
+    //
+    // It has to happen before the ingest loop because `Observation.supersession`
+    // is written once, when the assertion lands. A store cannot be told later
+    // that an attribute it has been filling for four hundred turns accumulates.
+    let vocabulary: Vec<String> = prepared
+        .iter()
+        .filter_map(|t| rm_engine::extract(t, &provider).ok())
+        .flat_map(|e| e.facts.into_iter().map(|f| f.attribute))
+        .collect();
+    // What each name actually holds on one entity, for the contextual pass.
+    // Built from the same cached extractions, so it too costs nothing: a name
+    // is contested when one subject carries more than one value under it.
+    let mut held: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    {
+        let mut per_slot: std::collections::BTreeMap<(usize, String), Vec<String>> =
+            Default::default();
+        for t in &prepared {
+            let Ok(e) = rm_engine::extract(t, &provider) else {
+                continue;
+            };
+            for f in &e.facts {
+                if let Some(v) = &f.value {
+                    per_slot
+                        .entry((f.subject, f.attribute.clone()))
+                        .or_default()
+                        .push(v.clone());
+                }
+            }
+        }
+        // Local mention index rather than resolved entity: the engine has not
+        // run yet. It over-groups -- index 0 is a different person in different
+        // turns -- and that is acceptable here, because the question is what
+        // kind of slot this NAME makes, and a name that accumulates for one
+        // person accumulates for the next.
+        for ((_, name), values) in per_slot {
+            let slot = held.entry(name).or_default();
+            if values.len() > slot.len() {
+                *slot = values;
+            }
+        }
+    }
+
+    let arity = if std::env::var("LOCOMO_NO_ARITY").is_ok() {
+        // The control. Same extractions, same store, every assertion
+        // `Unstated` -- which is what makes the comparison a comparison.
+        eprintln!("  arity: skipped (LOCOMO_NO_ARITY set)");
+        rm_extract::arity::Arity::default()
+    } else {
+        // Contextual first for the names that can change an answer, bare for
+        // the rest. A name holding one value reads the same either way, so
+        // being wrong about it costs nothing.
+        let (context, ctx) = rm_extract::arity::Arity::resolve_in_context(&held, &provider);
+        // The bare pass is deliberately not used. Its verdict is inert for a
+        // slot holding one value -- which is every name it answers about that
+        // the contextual pass did not -- and where the two can be compared it
+        // is wrong 66% of the time in the direction that discards a live fact.
+        // Paying for an answer that changes nothing when right and loses a fact
+        // when wrong is not a trade worth making.
+        let (bare, report) = if std::env::var("LOCOMO_BARE_ARITY").is_ok() {
+            rm_extract::arity::Arity::resolve(&vocabulary, &provider)
+        } else {
+            Default::default()
+        };
+        eprintln!(
+            "  arity in context: {} contested names, {} calls, {} answered \
+             ({} corrects / {} joins)",
+            ctx.asked,
+            ctx.calls,
+            context.len(),
+            context.corrects(),
+            context.len() - context.corrects()
+        );
+        let arity = context.or(&bare);
+        eprintln!(
+            "  arity: {} facts under {} distinct names, {} calls, {} answered \
+             ({} corrects / {} joins), {} unanswered{}",
+            vocabulary.len(),
+            report.asked,
+            report.calls,
+            arity.len(),
+            arity.corrects(),
+            arity.len() - arity.corrects(),
+            report.unanswered.len(),
+            report
+                .first_error
+                .as_deref()
+                .map(|e| format!(" -- first error: {}", first_line(e)))
+                .unwrap_or_default()
+        );
+        arity
+    };
+
     for (i, turn) in turns.iter().take(total).enumerate() {
         if i % 50 == 0 {
             eprintln!("  ingesting {i}/{total} ...");
@@ -195,7 +293,13 @@ fn main() {
         };
         match rm_engine::extract(&t, &provider) {
             Err(e) => refused.push((turn.id.clone(), e.to_string())),
-            Ok(extraction) => {
+            Ok(mut extraction) => {
+                // The one place the arity table is applied. Nothing downstream
+                // of here knows it exists: `ingest` reads `Fact.supersession`
+                // exactly as it did when the extraction prompt was filling it.
+                for fact in &mut extraction.facts {
+                    fact.supersession = arity.of(&fact.attribute);
+                }
                 for d in &extraction.dropped {
                     *dropped
                         .entry(format!("{} -- {}", d.what, first_line(&d.why)))

@@ -32,6 +32,7 @@
 //! which has not run. An extraction describes a turn; it is not a list of store
 //! operations.
 
+pub mod arity;
 mod prompt;
 
 pub use prompt::prompt;
@@ -279,7 +280,7 @@ struct WireFact {
 /// Anything unrecognised is [`Supersession::Unstated`] rather than a drop or a
 /// guess: this field is optional, so a garbled answer to it is exactly as
 /// informative as omitting it, and neither is a reason to lose the fact.
-fn claim(raw: Option<&serde_json::Value>) -> Supersession {
+pub(crate) fn claim(raw: Option<&serde_json::Value>) -> Supersession {
     let yes = match raw {
         None | Some(serde_json::Value::Null) => return Supersession::Unstated,
         Some(serde_json::Value::Bool(b)) => *b,
