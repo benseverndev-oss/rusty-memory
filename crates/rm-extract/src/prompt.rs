@@ -53,6 +53,58 @@ use crate::Turn;
 /// side effects: `extract` drops the unanchored fact and keeps the turn. Do not
 /// re-add the rule without measuring it — it has been measured once and it lost.
 ///
+/// # A third rule that was tried and removed, for a different reason
+///
+/// Measured over three conversations, 30% of missed questions had their answer
+/// in the evidence turn and *not* in what the store kept from it -- the
+/// extractor reliably keeping how a turn felt and dropping what happened in it:
+///
+/// ```text
+///   "What did Caroline research?"
+///      turn: "Researching adoption agencies -- it's been a dream to ..."
+///      kept: dream=to have a family and give a loving home to kids
+/// ```
+///
+/// This prompt says nothing about what a fact *is* or which to prefer -- six
+/// rules define mentions, and the rest describe field formats -- so the model
+/// chooses. The rule added was selection guidance rather than a per-fact
+/// question, deliberately: both rules withdrawn above added a question to
+/// answer per fact, and that is what cost them their facts.
+///
+/// It worked, in the sense that it did not cost anything:
+///
+/// ```text
+///   conversation     assertions            recall@10
+///        0        1580 -> 1584        0.671 -> 0.691
+///        1        1275 -> 1321        0.728 -> 0.741
+///        2        2533 -> 2561        0.704 -> 0.684
+/// ```
+///
+/// The first rule tried here that leaves the fact count alone, which does
+/// support the theory about *why* the other two lost. But recall does not
+/// replicate -- +0.020, +0.013, -0.020, a mean of +0.004 -- and the metric it
+/// was built to move did not move:
+///
+/// ```text
+///                              control   with the rule
+///   questions missed               115             114
+///     kept, so ranking failed       57              59
+///     IN TURN, NOT KEPT             34              32
+///     absent from the turn          24              23
+/// ```
+///
+/// Two questions in 115. The mechanism did not fire, so the small recall
+/// movement on two of three conversations is unexplained and the third
+/// conversation cancels it. Withdrawn: a rule that does nothing is still churn
+/// in a prompt this sensitive.
+///
+/// **Three instruction changes have now been tried on this prompt and all three
+/// withdrawn** -- two for costing facts, this one for doing nothing. Whatever
+/// is keeping the extractor on feelings rather than events is not reachable by
+/// telling it otherwise. If it is worth another attempt it should be a
+/// different mechanism: few-shot examples of the failing turns, a second pass
+/// over what a turn yielded, or a different model. Do not re-add a rule.
+///
 /// # A second rule that was tried and removed
 ///
 /// [`rm_core::Supersession`] needs someone to say whether a later fact under
@@ -158,12 +210,6 @@ Rules:
   "pottery", "self-care", "happiness". Those are facts about a person, not
   things in their own right. "the pottery studio on Vine Street" is a place and
   may be a mention; "pottery" is not.
-- A fact is something the turn says about a mention. Record what happened
-  before how it felt. "I went to the LGBTQ support group yesterday and it was
-  so powerful" says two things -- that they attended, and that it moved them --
-  and the attending is the one a later question asks about. Emit both when the
-  turn supports both, but never emit only the feeling: a turn whose facts are
-  all feelings has lost the event that caused them.
 - "text" on a mention is the phrasing the turn used. "text" on a fact is a short
   sentence stating that fact on its own, because it is searched for separately.
 - "value" is a string, or null. Never a number and never true or false — write
