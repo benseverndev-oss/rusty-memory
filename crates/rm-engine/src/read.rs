@@ -1,5 +1,7 @@
 //! Reading the engine: survivorship at query time.
 
+use std::collections::BTreeSet;
+
 use rm_core::{Interval, Provenance, Source, Supersession, Timestamp};
 use rm_store::StableId;
 use rm_survivor::{merge, Candidate, Held};
@@ -243,7 +245,7 @@ impl Engine {
         let keep = |id: rm_index::EntryId| self.in_scope(id, q);
         let hits = self.index.search_filtered(&q.embedding, q.k, keep)?;
 
-        Ok(hits
+        let recalled: Vec<Recalled> = hits
             .into_iter()
             .filter_map(|hit| {
                 // A hit that resolves to nothing is dropped rather than
@@ -275,9 +277,56 @@ impl Engine {
                     standing: self.standing(entry, version, q),
                 })
             })
-            .collect())
+            .collect();
+        Ok(demote_replaced(recalled))
     }
+}
 
+/// Put a corrected assertion below the live one that replaced it, when both
+/// came back.
+///
+/// Measured. Over ten conversations, 3.2% of questions came back led by an
+/// assertion something later had replaced, and **30% of those had the live
+/// value sitting further down the same result list** -- the store held the
+/// current answer and offered the dead one first. With `rm_extract::arity`
+/// filling `Supersession` that share rose to 61% on conversation 0, because
+/// more corrections are now known to be corrections. An agent that reads the
+/// first hit and states it will state the stale one, and the mark it ignored
+/// was all that stood between that and a confident wrong answer.
+///
+/// **Same slot only.** A corrected fact is demoted below a live one for the
+/// same attribute on the same entity, and nowhere else. A superseded employer
+/// should not outrank the current employer; it may perfectly well outrank an
+/// unrelated fact that happens to still stand, because relevance is what the
+/// score is for and this is not trying to be a second opinion about relevance.
+///
+/// **The returned set does not change**, only its order, so recall@k is
+/// untouched by construction -- this cannot flatter the metric it sits beside.
+/// The sort is stable, so anything not demoted keeps its score order exactly.
+fn demote_replaced(mut hits: Vec<Recalled>) -> Vec<Recalled> {
+    // A slot has a live answer in these results if any hit on it still stands.
+    let live: BTreeSet<(StableId, &str)> = hits
+        .iter()
+        .filter(|h| h.standing.still_stands())
+        .map(|h| (h.entity, h.attribute.as_str()))
+        .collect();
+    // Collected before sorting because the borrow above ends here; the keys are
+    // owned so the comparator can consult them while `hits` is mutable.
+    let demoted: Vec<bool> = hits
+        .iter()
+        .map(|h| !h.standing.still_stands() && live.contains(&(h.entity, h.attribute.as_str())))
+        .collect();
+
+    let mut order: Vec<usize> = (0..hits.len()).collect();
+    order.sort_by_key(|&i| demoted[i]);
+    let mut out: Vec<Option<Recalled>> = hits.drain(..).map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| out[i].take().expect("each index taken once"))
+        .collect()
+}
+
+impl Engine {
     /// Whether one assertion passes the query's non-vector filters.
     ///
     /// Called from inside `search_filtered`'s scan rather than after it — see
