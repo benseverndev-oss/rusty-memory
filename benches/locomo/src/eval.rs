@@ -92,6 +92,50 @@
 //! the current answer at all. Both are worth fixing and they need different
 //! work, which is the distinction the counter exists to draw.
 //!
+//! # A correction: the temporal finding was a metric artefact
+//!
+//! An earlier pass reported "temporal 15/15 -- 100% never extracted" and
+//! explained it structurally: the date lives in `valid_from` as a timestamp,
+//! never appears in any text the index matches, so "when did X happen" cannot
+//! be answered by content search. That explanation is wrong, and the 100% was
+//! an artefact of how it was measured.
+//!
+//! The test asked whether the gold answer's content words appear in what the
+//! store kept from the evidence turn. A temporal gold answer is a *date* --
+//! "7 May 2023", "2022" -- and a date never appears in an `attribute=value`
+//! pair whatever the store did. The test returned 100% for temporal by
+//! construction, and would have done so for a perfect store.
+//!
+//! Checked properly, the store holds an assertion from the evidence turn for
+//! **14 of those 15**. What it does not hold is the event:
+//!
+//! ```text
+//!   "When did Melanie paint a sunrise?"
+//!        kept: potential_occupation=counselor | skills=empathy
+//!   "When did Caroline give a speech at a school?"
+//!        kept: transition_duration=3 years
+//!   "When did Caroline go to the LGBTQ conference?"
+//!        kept: experience=felt totally accepted
+//! ```
+//!
+//! Re-scored against the question's content words for temporal (what had to be
+//! kept) rather than the gold date, over the 115 misses of three conversations:
+//!
+//! ```text
+//!   content kept, so ranking failed                57   50%
+//!   content WAS IN THE TURN and was not kept       34   30%
+//!   content not in the evidence turn either        24   21%
+//!
+//!   in the turn, not kept, by category:
+//!     single-hop   21/67  31%      temporal      5/15  33%
+//!     multi-hop     8/23  35%      open-domain   0/10   0%
+//! ```
+//!
+//! Temporal is 33%, the same as everything else. It is not structurally
+//! different and the valid interval was never the obstacle. There is one
+//! dominant extraction failure across all categories, and it is that the
+//! extractor keeps how a turn felt and drops what happened in it.
+//!
 //! Both numbers are a floor rather than a verdict. `Supersession` is filled in
 //! by tombstones and resolved survivorship only -- the prompt that asked a
 //! model to fill in the rest was withdrawn for costing 19% of the facts -- so
