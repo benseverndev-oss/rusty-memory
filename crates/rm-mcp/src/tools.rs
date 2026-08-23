@@ -115,6 +115,44 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": {"type": "object", "additionalProperties": false}
         }),
         json!({
+            "name": "decide",
+            "title": "Record a decision",
+            "description": "Record a decision so it can be found and cited later. Use this for choices with reasons behind them -- an approach taken, a library picked, a convention agreed -- not for ordinary facts, which belong in remember. Unlike remember this never guesses a shape: the title, choice, reason and context are stored under those exact names, so a decision stays findable and a later decision can retire it by title. Give a title you would search for. If this replaces an earlier decision, name it in supersedes and the old one is marked retired.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "How this decision is found again. Short and specific, like \"Store snapshots as one file\"."
+                    },
+                    "choice": {
+                        "type": "string",
+                        "description": "What was decided."
+                    },
+                    "because": {
+                        "type": "string",
+                        "description": "Why, including what it was chosen over. The part that is worth having in six months."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "What prompted the decision -- the problem or constraint in play at the time."
+                    },
+                    "supersedes": {
+                        "type": "string",
+                        "description": "The exact title of a decision this replaces. It is marked retired. A title that matches nothing is reported back rather than ignored."
+                    }
+                },
+                "required": ["title", "choice"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "decisions",
+            "title": "Decisions on record",
+            "description": "Every decision recorded, newest first, with whether it still stands. A decision that was re-decided under the same title, or superseded by a later one, is marked as replaced. Read this before proposing an approach that may already have been settled.",
+            "inputSchema": {"type": "object", "additionalProperties": false}
+        }),
+        json!({
             "name": "resolve_review",
             "title": "Answer an open question",
             "description": "Answer one open question. same=true merges the pair; same=false records that they are different and stops the pair being asked about again.",
@@ -163,6 +201,15 @@ pub enum Call {
         id: ReviewId,
         same: bool,
     },
+    Decide {
+        title: String,
+        choice: String,
+        because: Option<String>,
+        context: Option<String>,
+        supersedes: Option<String>,
+        session: String,
+    },
+    Decisions,
 }
 
 /// Why a call could not be read.
@@ -225,6 +272,15 @@ impl Call {
                 as_of: optional_integer(arguments, "as_of")?.unwrap_or(now),
             }),
             "reviews" => Ok(Call::Reviews),
+            "decisions" => Ok(Call::Decisions),
+            "decide" => Ok(Call::Decide {
+                title: string(arguments, "title")?,
+                choice: string(arguments, "choice")?,
+                because: optional_string(arguments, "because")?,
+                context: optional_string(arguments, "context")?,
+                supersedes: optional_string(arguments, "supersedes")?,
+                session: optional_string(arguments, "session")?.unwrap_or_else(|| "mcp".into()),
+            }),
             "resolve_review" => Ok(Call::ResolveReview {
                 id: non_negative(arguments, "id")? as ReviewId,
                 same: boolean(arguments, "same")?,
@@ -243,8 +299,8 @@ impl Call {
     /// business touching.
     pub fn mutates(&self) -> bool {
         match self {
-            Call::Remember { .. } | Call::ResolveReview { .. } => true,
-            Call::Recall { .. } | Call::About { .. } | Call::Reviews => false,
+            Call::Remember { .. } | Call::ResolveReview { .. } | Call::Decide { .. } => true,
+            Call::Recall { .. } | Call::About { .. } | Call::Reviews | Call::Decisions => false,
         }
     }
 }
@@ -334,6 +390,11 @@ mod tests {
             ("recall", json!({"query": "where do I work"})),
             ("about", json!({"entity": 0, "attribute": "employer"})),
             ("reviews", json!({})),
+            (
+                "decide",
+                json!({"title": "Use one file", "choice": "One snapshot per store"}),
+            ),
+            ("decisions", json!({})),
             ("resolve_review", json!({"id": 0, "same": true})),
         ];
 
@@ -565,10 +626,14 @@ mod tests {
             .unwrap()
             .mutates());
         assert!(!read("reviews", json!({})).unwrap().mutates());
+        assert!(!read("decisions", json!({})).unwrap().mutates());
+        assert!(read("decide", json!({"title": "t", "choice": "c"}))
+            .unwrap()
+            .mutates());
     }
 
     #[test]
-    fn the_table_is_five_tools_in_a_fixed_order_with_legal_names() {
+    fn the_table_is_seven_tools_in_a_fixed_order_with_legal_names() {
         // Deterministic ordering is what lets a client cache the list and
         // keeps the tool block stable in a model's prompt. The name rules are
         // the specification's: letters, digits, underscore, hyphen and dot.
@@ -578,7 +643,15 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["remember", "recall", "about", "reviews", "resolve_review"]
+            [
+                "remember",
+                "recall",
+                "about",
+                "reviews",
+                "decide",
+                "decisions",
+                "resolve_review"
+            ]
         );
         for name in &names {
             assert!(is_known(name));

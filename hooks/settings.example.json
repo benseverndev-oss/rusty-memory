@@ -1,0 +1,24 @@
+{
+  "env": {
+    "RMEM_HOOK_DIR": "/absolute/path/to/your/.rmem",
+    "RMEM_BIN": "/absolute/path/to/rmem"
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/hooks/rmem-hook.sh\" recall",
+            "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR/hooks/rmem-hook.sh\" spool",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

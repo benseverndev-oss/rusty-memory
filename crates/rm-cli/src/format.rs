@@ -117,6 +117,49 @@ pub fn render(outcome: &Outcome) -> String {
             out
         }
 
+        Outcome::Decided {
+            entity,
+            superseded,
+            supersedes_unknown,
+        } => {
+            let mut out = format!("decision recorded as entity {entity}\n");
+            if let Some((old, title)) = superseded {
+                out.push_str(&format!(
+                    "  supersedes {title:?} (entity {old}), now retired\n"
+                ));
+            }
+            if let Some(missing) = supersedes_unknown {
+                // Loud, because the decision they meant to retire is still
+                // standing and a plain success would never say so.
+                out.push_str(&format!(
+                    "  NOTHING SUPERSEDED: no decision is titled {missing:?}, so whatever it \n                     was meant to replace is still standing. Check `rmem decisions` for the \n                     exact title.\n"
+                ));
+            }
+            out
+        }
+
+        Outcome::Decisions(lines) if lines.is_empty() => {
+            "no decisions recorded yet — `rmem decide \"<title>\" \"<choice>\"`".to_string()
+        }
+        Outcome::Decisions(lines) => {
+            let mut out = String::new();
+            for d in lines {
+                // The mark is about the choice, not the status field: a
+                // decision re-decided under the same title is retired whether
+                // or not anybody wrote a status.
+                let mark = if d.still_stands { " " } else { "~" };
+                out.push_str(&format!(
+                    "{mark} entity {:<4} {} [{}]\n    {}\n",
+                    d.entity, d.title, d.status, d.choice
+                ));
+                if let Some(why) = &d.because {
+                    out.push_str(&format!("    because {why}\n"));
+                }
+            }
+            out.push_str("\n~ marks a decision something later replaced.\n");
+            out
+        }
+
         Outcome::About(Believed::Value(v)) => v.clone(),
         Outcome::About(Believed::Absent) => "no value — asserted to have none".to_string(),
         Outcome::About(Believed::Unknown) => "nothing known — this was never discussed".to_string(),

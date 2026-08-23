@@ -1,0 +1,26 @@
+# The toolchain, in one place.
+#
+# CI used to take `dtolnay/rust-toolchain@stable`, which meant the version
+# gating the branch was whatever Rust had released that week and no checkout
+# recorded it. A `sort_by` that four releases of clippy had been happy with
+# failed on 1.98 the day it landed, and the local run that was supposed to
+# catch it was on 1.94 and clean. That is not a lint anyone got wrong; it is
+# CI and the working copy answering a question neither of them was asked.
+#
+# So the version is written down. rustup reads this file ahead of whatever
+# `rustup default` was set to, so a clone, a container and the runner all
+# resolve the same compiler with no step required to make them agree.
+#
+# The cost is that a new lint now arrives as a deliberate bump rather than a
+# surprise, and until someone makes that bump this workspace is not being
+# checked by the newest clippy. Bump it on purpose: change the channel below,
+# run `cargo clippy --all-targets --all-features -- -D warnings`, and fix what
+# the new release found in that commit rather than in whichever unrelated pull
+# request happens to be open when it lands.
+[toolchain]
+channel = "1.98.0"
+# Both are used by CI, and rustup installs them when it auto-installs the
+# channel above. Naming them here is what keeps `cargo fmt` from failing on a
+# fresh machine with "no such subcommand".
+components = ["rustfmt", "clippy"]
+profile = "minimal"

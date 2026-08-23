@@ -71,18 +71,52 @@ cargo install --path crates/rm-mcp
 rmem-mcp                        # reads ./rmem.toml, serves stdin
 ```
 
-Five tools — `remember`, `recall`, `about`, `reviews`, `resolve_review` — which
-are `rmem`'s five commands over shared code rather than a second implementation
-of them. `about` is the one that differs: it takes both time axes, so an agent
-can ask what was true in May and, separately, what was known last Tuesday.
+Seven tools — `remember`, `recall`, `about`, `reviews`, `resolve_review`,
+`decide`, `decisions` — which are `rmem`'s own commands over shared code rather
+than a second implementation of them. `about` is the one that differs: it takes
+both time axes, so an agent can ask what was true in May and, separately, what
+was known last Tuesday.
+
+`decide` and `decisions` are the ADR pair. A decision is an entity with four
+attributes — `status`, `choice`, `because`, `context` — written under a title
+you would search for, and re-deciding under the same title supersedes the old
+one rather than sitting beside it, so `decisions` can say which still stand.
+Unlike `remember`, `decide` never reaches a completion model: the shape is
+known, so the fields go in directly under names that stay findable. That
+matters because extraction invents a fresh attribute name most of the time, and
+a record nobody can name twice is not a record.
 
 The answer keeps its three states across the wire. `{"believed": "absent"}` is
 "someone said there is none" and `{"believed": "unknown"}` is "it has never come
 up", and the text block says which in words too, because that is the half most
 clients put in front of a model.
 
-One process at a time per store. There is no lock file, so a server and a
-`rmem` invocation against one `memory.json` will lose each other's writes.
+Several servers and `rmem` invocations can share one `memory.json`. They take
+turns on an advisory lock held beside it, spanning each read-modify-write so
+neither can save over a snapshot the other has already changed. The wait is
+bounded at five seconds and then refuses rather than blocking forever.
+
+That bound used to be the ceiling. Every model call happened inside the lock —
+an extraction and a set of embeddings, seconds each across a network — so
+measured on a live store the fourth concurrent writer was refused outright.
+Nothing about those calls needed the store: an extraction is a function of the
+turn, an embedding of its text. They now happen before the lock is taken, and
+the lock covers resolution and a save. Same measurement afterwards: twelve
+concurrent writers, twelve distinct decisions in the store, no lost updates.
+
+The split is held by the signatures rather than by care. `commit_remember` and
+`commit_decide` take no completer and no embedder, so nothing reachable from
+inside the lock can call one.
+
+## Not leaving it to the agent
+
+An agent that *chooses* to remember forgets. `hooks/rmem-hook.sh` wires
+`UserPromptSubmit` to both directions of the store: every prompt is answered
+against what is already there before the model reads it, and every prompt is
+queued for extraction whether or not the agent thought to record it. It is not
+wired by default — it spends a completion per prompt, and that is not a choice
+to make on someone's behalf by their cloning a repo. See
+[`hooks/README.md`](hooks/README.md).
 
 ## Crates
 
@@ -121,11 +155,22 @@ runtime, no CMake, no compose file.
 
 ## Development
 
+These are the three commands CI runs, spelled the way CI spells them. They
+were not, once: the README asked for clippy without `--all-features` while CI
+asked for it with, and a local run could be clean against a check the branch
+would fail.
+
 ```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
 ```
+
+The compiler is pinned in `rust-toolchain.toml` and rustup installs it on the
+first cargo invocation, so there is no setup step and no version to agree on.
+CI reads the same file rather than naming a channel of its own. Bumping it is
+a deliberate commit — see the note in that file for why, and for what the pin
+costs.
 
 ## Licence
 

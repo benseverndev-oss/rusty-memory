@@ -42,8 +42,13 @@ rmem — a memory that resolves contradictions deterministically
     rmem review                      open questions the resolver could not answer
     rmem review confirm <id>         answer one: the same thing
     rmem review reject <id>          answer one: different things
+    rmem decide \"<title>\" \"<choice>\" [--because <why>] [--context <what prompted it>]
+                                     [--supersedes \"<title>\"]
+                                     record a decision under a stable, findable title
+    rmem decisions                   every decision, and whether it still stands
 
 Entity ids come from `remember` and `recall`. Review ids come from `review`.
+A decision is found again by its title, so write one you would search for.
 ";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,6 +72,35 @@ pub enum Command {
     ReviewList,
     ReviewConfirm(u64),
     ReviewReject(u64),
+    /// Record a decision. Unlike [`Command::Remember`] this never reaches a
+    /// completion model: the shape is known, so the fields are written
+    /// directly under names that stay findable.
+    Decide {
+        title: String,
+        choice: String,
+        because: Option<String>,
+        context: Option<String>,
+        supersedes: Option<String>,
+    },
+    Decisions,
+}
+
+/// The value after a named flag, if the flag is there.
+///
+/// A flag present with nothing after it is an error rather than `None`: someone
+/// who typed `--because` and then forgot the reason has said something
+/// different from someone who never typed it, and silently dropping it would
+/// record a decision with no stated reason and report success.
+fn flag(args: &[String], name: &str) -> Result<Option<String>, CliError> {
+    match args.iter().position(|a| a == name) {
+        None => Ok(None),
+        Some(i) => match args.get(i + 1) {
+            Some(v) if !v.starts_with("--") => Ok(Some(v.clone())),
+            _ => Err(CliError::Usage(format!(
+                "{name} needs a value after it\n\n{USAGE}"
+            ))),
+        },
+    }
 }
 
 /// Parse arguments, excluding the program name.
@@ -195,6 +229,28 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                 "review takes nothing, or `confirm <id>`, or `reject <id>`\n\n{USAGE}"
             ))),
         },
+
+        "decide" => {
+            let (Some(title), Some(choice)) = (args.get(1), args.get(2)) else {
+                return Err(CliError::Usage(format!(
+                    "decide needs a title and a choice -- the title is how it is found again\n\n{USAGE}"
+                )));
+            };
+            if title.starts_with("--") || choice.starts_with("--") {
+                return Err(CliError::Usage(format!(
+                    "decide takes the title and the choice first, before any flags\n\n{USAGE}"
+                )));
+            }
+            Ok(Command::Decide {
+                title: title.clone(),
+                choice: choice.clone(),
+                because: flag(&args, "--because")?,
+                context: flag(&args, "--context")?,
+                supersedes: flag(&args, "--supersedes")?,
+            })
+        }
+
+        "decisions" => Ok(Command::Decisions),
 
         other => Err(CliError::Usage(format!(
             "{other:?} is not an rmem command\n\n{USAGE}"

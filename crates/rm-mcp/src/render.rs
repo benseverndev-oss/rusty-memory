@@ -159,6 +159,76 @@ pub fn render(outcome: &Outcome) -> Rendered {
         // "nobody has ever mentioned an employer", and neither can an empty
         // string, so the structured half is tagged and the text says which one
         // it is in words.
+        Outcome::Decided {
+            entity,
+            superseded,
+            supersedes_unknown,
+        } => {
+            let mut text = format!("Decision recorded as entity {entity}.");
+            if let Some((old, title)) = superseded {
+                text.push_str(&format!(
+                    " It supersedes {title:?} (entity {old}), which is now marked retired."
+                ));
+            }
+            if let Some(missing) = supersedes_unknown {
+                // The model asked to retire something and nothing was retired.
+                // Saying so is the whole point: it can look up the real title
+                // and try again, which it will not do if this reads as success.
+                text.push_str(&format!(
+                    " NOTHING WAS SUPERSEDED: no decision is titled {missing:?}, so whatever                      this was meant to replace is still standing. Call decisions to see the                      exact titles."
+                ));
+            }
+            Rendered {
+                text,
+                structured: json!({
+                    "entity": entity,
+                    "superseded": superseded.as_ref().map(|(e, t)| json!({"entity": e, "title": t})),
+                    "supersedes_unknown": supersedes_unknown,
+                }),
+            }
+        }
+
+        Outcome::Decisions(lines) if lines.is_empty() => Rendered {
+            text: "No decisions have been recorded.".to_string(),
+            structured: json!({"decisions": []}),
+        },
+        Outcome::Decisions(lines) => {
+            let mut text = format!("{} decision(s), newest first:\n", lines.len());
+            for d in lines {
+                text.push_str(&format!(
+                    "  entity {}  {} [{}]{}\n    {}\n",
+                    d.entity,
+                    d.title,
+                    d.status,
+                    if d.still_stands {
+                        ""
+                    } else {
+                        "  (replaced by something later)"
+                    },
+                    d.choice
+                ));
+                if let Some(why) = &d.because {
+                    text.push_str(&format!("    because {why}\n"));
+                }
+            }
+            Rendered {
+                text,
+                structured: json!({
+                    "decisions": lines.iter().map(|d| json!({
+                        "entity": d.entity,
+                        "title": d.title,
+                        "status": d.status,
+                        "choice": d.choice,
+                        "because": d.because,
+                        // The one a caller should branch on: a decision is
+                        // current when nothing later replaced its choice,
+                        // whatever the status field happens to say.
+                        "still_stands": d.still_stands,
+                    })).collect::<Vec<_>>()
+                }),
+            }
+        }
+
         Outcome::About(Believed::Value(v)) => Rendered {
             text: v.clone(),
             structured: json!({"believed": "value", "value": v}),
