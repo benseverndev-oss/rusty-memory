@@ -36,12 +36,14 @@
 //! are reported separately and never counted as retrieval failures — a store
 //! that surfaces nothing for them is right.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 mod cache;
+mod eval;
 
 use cache::{Cache, Cached};
+use eval::{Attribution, Staleness};
 use rm_engine::{Engine, Metric, Query, VectorIndex};
 use rm_extract::Turn;
 use rm_host::config::Config;
@@ -331,6 +333,28 @@ fn main() {
     let mut adversarial_total = 0usize;
     let ingested_ids: BTreeSet<&str> = turns.iter().take(total).map(|t| t.id.as_str()).collect();
 
+    // Who said each turn that was actually ingested. The ground truth for
+    // attribution is read from this rather than from LoCoMo's category label:
+    // a quarter of category 5 is answerable by the person it names, and
+    // trusting the label would credit the store for going quiet on those.
+    let speaker_of: BTreeMap<String, String> = turns
+        .iter()
+        .take(total)
+        .map(|t| (t.id.clone(), t.speaker.clone()))
+        .collect();
+    let (speaker_a, speaker_b) = (
+        sample["conversation"]["speaker_a"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        sample["conversation"]["speaker_b"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    );
+    let mut attribution = Attribution::default();
+    let mut staleness = Staleness::default();
+
     let questions = sample["qa"].as_array().cloned().unwrap_or_default();
     let mut asked = 0usize;
     for q in &questions {
@@ -371,6 +395,19 @@ fn main() {
         let found = hits
             .iter()
             .any(|h| evidence.contains(&h.provenance.source_ref));
+
+        // Both new measurements run over every question, adversarial included:
+        // staleness is a property of what came back, and attribution is the
+        // only thing category 5 was ever testing.
+        staleness.observe(&hits);
+        let ev: Vec<String> = evidence.iter().cloned().collect();
+        match eval::subject_of(question, &speaker_a, &speaker_b) {
+            None => attribution.skipped += 1,
+            Some(subject) => match eval::expected(&ev, subject, &speaker_of) {
+                None => attribution.skipped += 1,
+                Some(want) => attribution.observe(&engine, &hits, subject, want),
+            },
+        }
 
         if category == 5 {
             adversarial_total += 1;
@@ -415,6 +452,9 @@ fn main() {
             );
         }
     }
+    attribution.report();
+    staleness.report();
+
     if adversarial_total > 0 {
         println!(
             "\nadversarial          {adversarial_hits}/{adversarial_total} surfaced something \
