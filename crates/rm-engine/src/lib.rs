@@ -2320,6 +2320,127 @@ mod tests {
     }
 
     #[test]
+    fn a_replaced_fact_does_not_outrank_the_one_that_replaced_it() {
+        // Measured: 3.2% of questions across ten conversations came back led by
+        // an assertion something later had replaced, and 30% of those had the
+        // live value sitting further down the same list -- rising to 61% once
+        // `rm_extract::arity` began filling `Supersession`. An agent that reads
+        // the first hit states the stale one.
+        //
+        // Acme is given the query's exact vector so it outscores Globex; the
+        // demotion has to beat the score, or it is not doing anything.
+        let mut e = engine();
+        e.remember(embedded(
+            "Ben Severn",
+            "employer",
+            "Acme",
+            10,
+            [1.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        e.remember(correcting(embedded(
+            "Ben Severn",
+            "employer",
+            "Globex",
+            20,
+            [0.9, 0.1, 0.0],
+        )))
+        .unwrap();
+
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 5)).unwrap();
+        assert_eq!(
+            hits.len(),
+            2,
+            "both are still returned; only the order moves"
+        );
+        assert_eq!(
+            hits[0].value.as_deref(),
+            Some("Globex"),
+            "the live value leads even though the replaced one scores higher"
+        );
+        assert_eq!(hits[1].value.as_deref(), Some("Acme"));
+        assert_eq!(hits[1].standing, Standing::Corrected);
+    }
+
+    #[test]
+    fn a_replaced_fact_keeps_its_place_when_nothing_replaced_it_here() {
+        // Same slot only, and this is the case that rule exists for. A
+        // corrected fact is not demoted below an unrelated live fact: relevance
+        // is what the score is for, and "what did I believe about her employer
+        // in May" needs the stale employer to lead when nothing current about
+        // employment came back at all.
+        let mut e = engine();
+        e.remember(embedded(
+            "Ben Severn",
+            "employer",
+            "Acme",
+            10,
+            [1.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        e.remember(correcting(embedded(
+            "Ben Severn",
+            "employer",
+            "Globex",
+            20,
+            [0.0, 1.0, 0.0],
+        )))
+        .unwrap();
+        e.remember(embedded("Ben Severn", "pet", "a dog", 30, [0.9, 0.1, 0.0]))
+            .unwrap();
+
+        // k=2 keeps Globex out of the results entirely, so Acme's slot has no
+        // live answer present and nothing should move.
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 2)).unwrap();
+        assert_eq!(
+            hits[0].value.as_deref(),
+            Some("Acme"),
+            "no live employer came back, so the stale one still leads on score"
+        );
+        assert_eq!(hits[0].standing, Standing::Corrected);
+    }
+
+    #[test]
+    fn demotion_is_stable_and_changes_no_membership() {
+        // The guarantee that lets this sit beside recall@k without flattering
+        // it: the same assertions come back, reordered.
+        let mut e = engine();
+        for (attr, value, at, v) in [
+            ("employer", "Acme", 10, [1.0, 0.0, 0.0]),
+            ("pet", "a dog", 11, [0.99, 0.01, 0.0]),
+            ("city", "Bristol", 12, [0.98, 0.02, 0.0]),
+        ] {
+            e.remember(embedded("Ben Severn", attr, value, at, v))
+                .unwrap();
+        }
+        e.remember(correcting(embedded(
+            "Ben Severn",
+            "employer",
+            "Globex",
+            20,
+            [0.5, 0.5, 0.0],
+        )))
+        .unwrap();
+
+        let hits = e.recall(&Query::new(vec![1.0, 0.0, 0.0], 10)).unwrap();
+        let values: BTreeSet<&str> = hits.iter().filter_map(|h| h.value.as_deref()).collect();
+        assert_eq!(
+            values,
+            ["Acme", "Bristol", "Globex", "a dog"].into_iter().collect(),
+            "membership is untouched"
+        );
+        // The two that were never demoted keep their score order relative to
+        // each other.
+        let pos = |v: &str| {
+            hits.iter()
+                .position(|h| h.value.as_deref() == Some(v))
+                .unwrap()
+        };
+        assert!(pos("a dog") < pos("Bristol"), "stable among the undemoted");
+        assert!(pos("Globex") < pos("Acme"), "and the replaced one is last");
+    }
+
+    #[test]
     fn recall_as_of_a_past_tx_time_does_not_see_later_knowledge() {
         let mut e = engine();
         e.remember(embedded(

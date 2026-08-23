@@ -144,6 +144,9 @@ fn one_unanchored_fact_no_longer_discards_the_mentions_that_parsed_cleanly() {
 /// The one shape salvage cannot help: there is no parsed half to keep. This
 /// remains the crate's only whole-response refusal, and these 26 are the
 /// residue the change does not touch.
+///
+/// Prose *before* the JSON, specifically. A markdown fence around it used to
+/// land here too and no longer does -- see below.
 #[test]
 fn prose_before_the_json_is_still_refused_whole() {
     let response = r#"Sure! Here's the extraction:
@@ -153,14 +156,46 @@ fn prose_before_the_json_is_still_refused_whole() {
     assert!(why.contains("expected value at line 1 column 1"), "{why}");
 }
 
-/// The same shape wearing a markdown fence, which is how a chat-tuned model
-/// most often volunteers JSON.
+/// A markdown fence, which is how a chat-tuned model most often volunteers
+/// JSON. **This test asserted the opposite until the cost was counted.**
+///
+/// It was written as `a_markdown_fence_is_still_refused_whole_too`, describing
+/// the behaviour accurately and treating it as acceptable residue beside the
+/// prose case above. It is not comparable residue. Prose around JSON is a model
+/// ignoring the instruction; a fence is a model obeying its own formatting and
+/// answering perfectly, and `serde_json` reports both as "expected value at
+/// line 1 column 1", which is what let them sit in the same bucket.
+///
+/// Counted across the extraction caches of all ten conversations rather than
+/// the one this file was written from: **386 of 7,974 responses -- 4.8% -- come
+/// back fenced**. Every one was a turn's whole set of mentions, facts and
+/// relations discarded over three backticks. The prose case, by contrast, is
+/// genuinely unrecoverable and stays refused.
 #[test]
-fn a_markdown_fence_is_still_refused_whole_too() {
-    let response =
-        "```json\n{\"mentions\": [], \"facts\": [], \"relations\": [], \"closures\": []}\n```";
+fn a_markdown_fence_is_read_rather_than_refused() {
+    let response = "```json\n{\"mentions\": [{\"kind\": \"person\", \"name\": \"Melanie\", \
+                    \"text\": \"Mel\"}], \"facts\": [], \"relations\": [], \"closures\": []}\n```";
+    let out = extract(&turn("Hey Mel!", "Caroline"), &Canned(response)).unwrap();
+    assert_eq!(out.mentions.len(), 1);
+    assert_eq!(out.mentions[0].name, "Melanie");
+    assert!(out.dropped.is_empty());
+}
+
+/// Observed **18 times across the ten conversations** and still refused: a
+/// trailing comma before a closing bracket.
+///
+/// Not fixed, and the distinction from the fence is the point. A fence is
+/// packaging around a document that is already valid, so removing it reads the
+/// model's answer unchanged. A trailing comma is inside the document and
+/// repairing it means editing what the model said -- and once a parser starts
+/// doing that, the next malformed thing is a judgement call about intent. 18 in
+/// 7,974 is not worth buying with that.
+#[test]
+fn a_trailing_comma_is_still_refused_whole() {
+    let response = "{\n  \"mentions\": [\n    {\"kind\": \"person\", \"name\": \"Jon\", \
+                    \"text\": \"I\"},\n  ],\n  \"facts\": [], \"relations\": [], \"closures\": []}";
     let why = unparsable(extract(&turn("Hey Mel!", "Caroline"), &Canned(response)).unwrap_err());
-    assert!(why.contains("expected value"), "{why}");
+    assert!(why.contains("trailing comma"), "{why}");
 }
 
 // ---- fields of the wrong type ---------------------------------------------
