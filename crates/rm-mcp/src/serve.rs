@@ -329,6 +329,30 @@ where
                     command::review_reject(engine, id)
                 }
             }
+            Call::Decide {
+                title,
+                choice,
+                because,
+                context,
+                supersedes,
+                session,
+            } => {
+                // The provider is built for its embedder alone. `decide` makes
+                // no completion call: a decision has a known shape, so nothing
+                // has to be guessed out of prose.
+                let provider = provider(config)?;
+                command::decide(
+                    engine,
+                    &title,
+                    &choice,
+                    because.as_deref(),
+                    context.as_deref(),
+                    supersedes.as_deref(),
+                    now,
+                    &session,
+                    &provider,
+                )
+            }
             // Guarded by `Call::mutates` at the one call site.
             other => unreachable!("{other:?} does not write"),
         }
@@ -355,6 +379,7 @@ where
                 as_of,
             } => command::about(engine, entity, &attribute, valid_at, as_of),
             Call::Reviews => command::review_list(engine),
+            Call::Decisions => command::decisions(engine),
             other => unreachable!("{other:?} writes"),
         }
     }

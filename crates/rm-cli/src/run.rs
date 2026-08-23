@@ -123,7 +123,10 @@ pub fn run(
     // read the store in the moment another process has replaced it.
     let mutates = matches!(
         command,
-        Command::Remember { .. } | Command::ReviewConfirm(_) | Command::ReviewReject(_)
+        Command::Remember { .. }
+            | Command::ReviewConfirm(_)
+            | Command::ReviewReject(_)
+            | Command::Decide { .. }
     );
 
     let path = config.store.path.clone();
@@ -144,6 +147,29 @@ pub fn run(
                 }
                 Command::ReviewConfirm(id) => command::review_confirm(engine, id),
                 Command::ReviewReject(id) => command::review_reject(engine, id),
+                Command::Decide {
+                    title,
+                    choice,
+                    because,
+                    context,
+                    supersedes,
+                } => {
+                    // `config.provider()` builds a completer too, and nothing
+                    // here will call it: a decision has a known shape, so it
+                    // costs embeddings and no completion at all.
+                    let provider = config.provider()?;
+                    command::decide(
+                        engine,
+                        &title,
+                        &choice,
+                        because.as_deref(),
+                        context.as_deref(),
+                        supersedes.as_deref(),
+                        now,
+                        "cli",
+                        &provider,
+                    )
+                }
                 // Guarded by `mutates` directly above, over the same variants.
                 other => unreachable!("{other:?} does not write"),
             }
@@ -165,6 +191,7 @@ pub fn run(
                     command::about(engine, entity, &attribute, now, now)
                 }
                 Command::ReviewList => command::review_list(engine),
+                Command::Decisions => command::decisions(engine),
                 Command::Init { .. } => unreachable!("handled above"),
                 other => unreachable!("{other:?} writes"),
             },
