@@ -20,7 +20,20 @@ jobs:
       # in the log, rather than implicitly inside whichever cargo step ran
       # first. It has to precede the cache, which keys on `rustc -vV`.
       - name: Toolchain
-        run: rustup show && cargo --version
+        run: |
+          rustup show
+          # The pin is only worth something if it actually bound, and a green
+          # CI does not show that on its own: the runner ships its own stable,
+          # and while that happens to equal the pin both paths give the same
+          # answer. The day they part company is exactly the day this matters,
+          # so compare them rather than trusting the coincidence.
+          want=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          got=$(rustc --version | cut -d' ' -f2)
+          if [ "$got" != "$want" ]; then
+            echo "::error::rust-toolchain.toml pins $want but rustc here is $got -- the pin did not bind"
+            exit 1
+          fi
+          echo "rustc $got, as pinned"
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
