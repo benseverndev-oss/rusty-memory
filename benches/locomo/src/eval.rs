@@ -49,27 +49,48 @@
 //! That is the claim five PRs of resolution work were making, and nothing has
 //! ever measured it.
 //!
-//! # What the two report, first time out
+//! # What the two report
 //!
-//! Over three conversations, on stores built from cached extractions so the
-//! only variable is the scoring:
+//! All ten conversations, stores built from cached extractions so the only
+//! variable is the scoring. 1,435 answerable questions and 372 misattribution
+//! traps.
+//!
+//! One margin is applied to every conversation rather than each conversation's
+//! own best. Per-conversation bests range from +0.180 to +0.489, and quoting
+//! that spread as the result would be reporting a cutoff fitted ten times:
 //!
 //! ```text
-//!   attribution   best J   +0.339  +0.428  +0.363     at margins -0.15 .. -0.05
-//!   staleness     top hit corrected   5.1%  4.8%  4.7%
-//!                 ...with the live value ranked below it   6 / 2 / 1
+//!   margin   sensitivity   specificity        J
+//!    -1.00         0.737         0.546   +0.283
+//!    -0.15         0.822         0.508   +0.330   <- pooled best
+//!    -0.10         0.868         0.433   +0.300
+//!    -0.05         0.928         0.312   +0.239
+//!    +0.00         0.969         0.153   +0.123
+//!    +1.00         1.000         0.003   +0.003
 //! ```
 //!
-//! The attribution number is the first in this project that responds to the
-//! resolution work at all. It is also nowhere near solved: J of 0.35 buys
-//! roughly 0.75 sensitivity against 0.6 specificity, so a third of the traps
-//! still get answered as though they were about the person asked after.
+//! -0.15 is also the best margin for 8 of the 10 conversations taken singly,
+//! which is the only reason to trust it as more than a fitted number.
 //!
-//! The staleness number is small and the interesting part is the second line.
-//! Of the ~5% of questions that lead with a replaced fact, almost none had the
-//! live value further down the list -- so this is not mostly a ranking bug the
-//! store could fix by reordering. It is the store not holding the current
-//! answer. Worth knowing before anyone spends a week on ranking.
+//! J of 0.33 is the first figure in this project that responds to the
+//! resolution work at all. It is also nowhere near solved: at that operating
+//! point half the traps still come back answered as though they were about the
+//! person asked after.
+//!
+//! Staleness, pooled the same way:
+//!
+//! ```text
+//!   hits corrected                            805 / 18,380   4.4%
+//!   questions whose top hit was corrected      63 / 1,973    3.2%
+//!     ...with the live value ranked below it   19 / 63        30%
+//! ```
+//!
+//! That last line was read off three conversations first and called "almost
+//! none", which was wrong -- pooled it is a third. So a third of the questions
+//! that lead with a replaced fact are a ranking failure the store could fix by
+//! reordering what it already holds, and two thirds are the store not holding
+//! the current answer at all. Both are worth fixing and they need different
+//! work, which is the distinction the counter exists to draw.
 //!
 //! Both numbers are a floor rather than a verdict. `Supersession` is filled in
 //! by tombstones and resolved survivorship only -- the prompt that asked a
