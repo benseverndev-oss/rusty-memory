@@ -7,3 +7,8 @@ target/
 # Vendored by the copy step in benches/ann-bakeoff/README.md. Third-party
 # source, and not ours to commit.
 benches/ann-bakeoff/src/goldenhnsw.rs
+
+# The hook stores and their queues. A store is machine-local state, not
+# something to share; the settings that wire the hook are personal too.
+.rmem/
+.claude/settings.local.json

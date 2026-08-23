@@ -71,18 +71,42 @@ cargo install --path crates/rm-mcp
 rmem-mcp                        # reads ./rmem.toml, serves stdin
 ```
 
-Five tools — `remember`, `recall`, `about`, `reviews`, `resolve_review` — which
-are `rmem`'s five commands over shared code rather than a second implementation
-of them. `about` is the one that differs: it takes both time axes, so an agent
-can ask what was true in May and, separately, what was known last Tuesday.
+Seven tools — `remember`, `recall`, `about`, `reviews`, `resolve_review`,
+`decide`, `decisions` — which are `rmem`'s own commands over shared code rather
+than a second implementation of them. `about` is the one that differs: it takes
+both time axes, so an agent can ask what was true in May and, separately, what
+was known last Tuesday.
+
+`decide` and `decisions` are the ADR pair. A decision is an entity with four
+attributes — `status`, `choice`, `because`, `context` — written under a title
+you would search for, and re-deciding under the same title supersedes the old
+one rather than sitting beside it, so `decisions` can say which still stand.
+Unlike `remember`, `decide` never reaches a completion model: the shape is
+known, so the fields go in directly under names that stay findable. That
+matters because extraction invents a fresh attribute name most of the time, and
+a record nobody can name twice is not a record.
 
 The answer keeps its three states across the wire. `{"believed": "absent"}` is
 "someone said there is none" and `{"believed": "unknown"}` is "it has never come
 up", and the text block says which in words too, because that is the half most
 clients put in front of a model.
 
-One process at a time per store. There is no lock file, so a server and a
-`rmem` invocation against one `memory.json` will lose each other's writes.
+A server and a `rmem` invocation can share one `memory.json`. They take turns
+on an advisory lock held beside it, spanning each read-modify-write so neither
+can save over a snapshot the other has already changed. The wait is bounded at
+five seconds and then refuses rather than blocking forever, because every
+holder is doing one operation and a longer wait means the other side is wedged
+rather than busy.
+
+## Not leaving it to the agent
+
+An agent that *chooses* to remember forgets. `hooks/rmem-hook.sh` wires
+`UserPromptSubmit` to both directions of the store: every prompt is answered
+against what is already there before the model reads it, and every prompt is
+queued for extraction whether or not the agent thought to record it. It is not
+wired by default — it spends a completion per prompt, and that is not a choice
+to make on someone's behalf by their cloning a repo. See
+[`hooks/README.md`](hooks/README.md).
 
 ## Crates
 
