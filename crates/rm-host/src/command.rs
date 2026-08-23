@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rm_engine::{
     Believed, Embedder, Engine, Ingested, Interval, Metric, Observation, Prepared, Provenance,
-    Query, Recalled, Record, Remembered, ReviewId, Source, StableId, Supersession, Timestamp,
+    Query, Recalled, Record, ReviewId, Source, StableId, Supersession, Timestamp,
 };
 use rm_extract::{Completer, Extraction, Turn};
 
@@ -114,11 +114,12 @@ pub struct DecisionLine {
     pub status: String,
     pub choice: String,
     pub because: Option<String>,
-    /// Whether anything later replaced this decision's `choice`.
+    /// Whether anything later replaced this decision.
     ///
-    /// Read from the store rather than from `status`, so a decision retired by
-    /// being re-decided under the same title reads as superseded even though
-    /// nobody set a status field.
+    /// Both ways of being replaced count: re-decided under the same title,
+    /// which writes a second `choice` and no status at all, and named by
+    /// another decision's `--supersedes`, which writes the status and leaves
+    /// the choice alone. Reading either one alone misses half the cases.
     pub still_stands: bool,
 }
 
@@ -491,6 +492,9 @@ struct FieldWrite {
 /// sequential embedding calls with the store's exclusive lock held, which made
 /// one agent recording a decision a three-second outage for every other writer.
 pub struct DecidePlan {
+    /// The title of the decision being recorded. Its identity, not a hint --
+    /// see [`commit_decide`].
+    title: String,
     observed_at: Timestamp,
     session: String,
     /// The retirement of the decision this one replaces, embedded whether or
@@ -545,6 +549,7 @@ pub fn plan_decide(
     }
 
     Ok(DecidePlan {
+        title: title.to_string(),
         observed_at,
         session: session.to_string(),
         retire,
@@ -553,8 +558,26 @@ pub fn plan_decide(
 }
 
 /// The half of [`decide`] that needs the store. Touches no network.
+///
+/// # A title is an identifier, so it is matched exactly
+///
+/// Every write below goes through [`Engine::remember_as`] against an entity
+/// found by exact title, rather than through `Engine::remember`, which would
+/// resolve the title against every similar one already in the store.
+///
+/// That resolver is right for a name somebody said in a sentence and wrong for
+/// a title somebody chose. Measured before this: `Adopt SQLite` followed by
+/// `Adopt SQLite WAL` scored above the match threshold and became one entity,
+/// keeping the first title, so the second decision existed nowhere while the
+/// command reported success. Worse with `--supersedes`, because the two halves
+/// of this function disagreed about what "the same title" meant --
+/// `find_decision` exactly, the write fuzzily -- so a decision could retire an
+/// old one by exact title and then land its own fields on that same retired
+/// entity. The store was left holding one decision, under the old title,
+/// marked superseded, and the new one was gone.
 pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, HostError> {
     let DecidePlan {
+        title,
         observed_at,
         session,
         retire,
@@ -570,16 +593,20 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
         match find_decision(engine, &old_title) {
             None => supersedes_unknown = Some(old_title),
             Some(old) => {
-                write_field(engine, &write, observed_at, &session)?;
+                write_field(engine, Some(old), &write, observed_at, &session)?;
                 superseded = Some((old, old_title));
             }
         }
     }
 
-    let mut entity = None;
+    // Resolved once, and by exact title. `None` means the store has no
+    // decision under this title and the first write below creates one; every
+    // write after that names the entity the first returned, so the fields of
+    // one decision cannot scatter across two entities.
+    let mut entity = find_decision(engine, &title);
     for write in &fields {
-        let landed = write_field(engine, write, observed_at, &session)?;
-        entity.get_or_insert(landed);
+        let landed = write_field(engine, entity, write, observed_at, &session)?;
+        entity = Some(landed);
     }
 
     Ok(Outcome::Decided {
@@ -616,16 +643,24 @@ pub fn decisions(engine: &Engine) -> Result<Outcome, HostError> {
         let Some(choice) = latest("choice") else {
             continue;
         };
+        let status = latest("status").unwrap_or_else(|| "accepted".into());
         out.push(DecisionLine {
             entity: id,
             title: record.get("name").unwrap_or_default().to_string(),
-            status: latest("status").unwrap_or_else(|| "accepted".into()),
+            // A decision stands while nothing later replaced it, and there are
+            // two ways to be replaced. Re-deciding under the same title writes
+            // a second `choice`, and nobody sets a status when they do it --
+            // which is why the history is read at all rather than trusting the
+            // field. Being named by another decision's `--supersedes` writes
+            // the status and leaves the choice alone.
+            //
+            // Reading only the first made a decision retired by `--supersedes`
+            // print as standing while printing `[superseded]` beside itself,
+            // which is the one combination that cannot be true.
+            still_stands: engine.store_history(id, "choice").len() == 1 && status != "superseded",
+            status,
             choice,
             because: latest("because"),
-            // A decision stands while nothing later replaced its choice. One
-            // version is the common case and stands trivially; a second means
-            // it was re-decided.
-            still_stands: engine.store_history(id, "choice").len() == 1,
         });
     }
     out.sort_by_key(|d| std::cmp::Reverse(d.entity));
@@ -667,8 +702,15 @@ fn embed_field(
     })
 }
 
+/// Write one decision field onto `entity`, or onto a new one when `None`.
+///
+/// [`Engine::remember_as`] rather than `Engine::remember`: the caller has
+/// already decided which entity this is, by exact title. See
+/// [`commit_decide`] for what happens when that decision is left to the
+/// resolver instead.
 fn write_field(
     engine: &mut Engine,
+    entity: Option<StableId>,
     write: &FieldWrite,
     observed_at: Timestamp,
     session: &str,
@@ -679,29 +721,28 @@ fn write_field(
         value,
         embedding,
     } = write;
-    let landed = engine
-        .remember(Observation {
-            kind: "decision".to_string(),
-            mention: Record::new().with("name", title).with("kind", "decision"),
-            attribute: attribute.to_string(),
-            value: Some(value.to_string()),
-            valid: Interval::since(observed_at),
-            // `UserAssertion`, not `ToolOutput`: nobody inferred this from a
-            // sentence. Somebody decided it and said so.
-            provenance: Provenance::new(Source::UserAssertion, observed_at, session),
-            supersession: Supersession::Corrects,
-            embedding: embedding.clone(),
-        })
+    let (landed, _) = engine
+        .remember_as(
+            entity,
+            Observation {
+                kind: "decision".to_string(),
+                mention: Record::new().with("name", title).with("kind", "decision"),
+                attribute: attribute.to_string(),
+                value: Some(value.to_string()),
+                valid: Interval::since(observed_at),
+                // `UserAssertion`, not `ToolOutput`: nobody inferred this from
+                // a sentence. Somebody decided it and said so.
+                provenance: Provenance::new(Source::UserAssertion, observed_at, session),
+                supersession: Supersession::Corrects,
+                embedding: embedding.clone(),
+            },
+        )
         .map_err(|e| HostError::Refused(e.to_string()))?;
-    Ok(match landed {
-        Remembered::Merged { entity, .. }
-        | Remembered::Created { entity, .. }
-        | Remembered::CreatedPendingReview { entity, .. } => entity,
-    })
+    Ok(landed)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testing::TempDir;
 
@@ -847,7 +888,7 @@ mod tests {
       "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
       "closures":[]}"#;
 
-    fn engine() -> Engine {
+    pub(crate) fn engine() -> Engine {
         let config: crate::config::Config = toml::from_str(crate::config::TEMPLATE).unwrap();
         Engine::new(
             VectorIndex::new(3, Metric::Cosine),
@@ -1020,6 +1061,166 @@ mod tests {
     }
 
     // ---- decisions ---------------------------------------------------------
+
+    /// Every decision in the store, as (title, entity, still standing).
+    fn recorded(e: &mut Engine) -> Vec<(String, StableId, bool)> {
+        let Outcome::Decisions(ds) = decisions(e).unwrap() else {
+            panic!("decisions did not return decisions")
+        };
+        ds.iter()
+            .map(|d| (d.title.clone(), d.entity, d.still_stands))
+            .collect()
+    }
+
+    /// Two decisions whose titles are nearly the same are still two decisions.
+    ///
+    /// They were one. `decide` wrote through `Engine::remember`, which scores a
+    /// title against every similar one already stored, and these two land above
+    /// the match threshold: the second decision's fields went onto the first
+    /// entity, which kept the *first* title, so the second existed nowhere and
+    /// the command reported success.
+    ///
+    /// The pair is not contrived -- it is the shape a real log takes, a
+    /// decision and a later refinement of it. `Pin the toolchain` against
+    /// `Pin the toolchain version` stays under the threshold and always did,
+    /// so it would not have caught this.
+    #[test]
+    fn a_decision_is_never_merged_into_one_whose_title_merely_resembles_it() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Adopt SQLite",
+            "yes",
+            None,
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Adopt SQLite WAL",
+            "also yes",
+            None,
+            None,
+            None,
+            200,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let mut titles: Vec<String> = recorded(&mut e).into_iter().map(|d| d.0).collect();
+        titles.sort();
+        assert_eq!(titles, ["Adopt SQLite", "Adopt SQLite WAL"]);
+    }
+
+    /// The same title twice is the same decision, re-decided.
+    ///
+    /// The other half of the rule above, and the one that makes supersession
+    /// work at all: exact means exact, so it still matches.
+    #[test]
+    fn deciding_again_under_the_same_title_lands_on_the_same_entity() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Adopt SQLite",
+            "yes",
+            None,
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Adopt SQLite",
+            "on reflection, no",
+            None,
+            None,
+            None,
+            200,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let all = recorded(&mut e);
+        assert_eq!(all.len(), 1, "one title is one decision: {all:?}");
+        let Outcome::About(Believed::Value(choice)) =
+            about(&e, all[0].1, "choice", Timestamp::MAX, Timestamp::MAX).unwrap()
+        else {
+            panic!("no choice on the re-decided entity")
+        };
+        assert_eq!(choice, "on reflection, no");
+    }
+
+    /// Superseding a decision does not consume the one doing the superseding.
+    ///
+    /// The sharpest form of the bug, because the two halves of `commit_decide`
+    /// disagreed about what "the same title" meant: `find_decision` matched
+    /// exactly and the write matched fuzzily. So this call retired `Adopt
+    /// SQLite` by exact title and then wrote its own fields onto that same
+    /// retired entity. The store was left holding one decision, under the old
+    /// title, marked superseded -- the new one was gone, and the command said
+    /// it had worked.
+    #[test]
+    fn the_decision_doing_the_superseding_survives_it() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Adopt SQLite",
+            "yes",
+            None,
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        let out = decide(
+            &mut e,
+            "Adopt SQLite WAL",
+            "also yes",
+            None,
+            None,
+            Some("Adopt SQLite"),
+            200,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let Outcome::Decided {
+            entity, superseded, ..
+        } = out
+        else {
+            panic!("not a decision")
+        };
+        let (old, _) = superseded.expect("it should have retired the old one");
+        assert_ne!(
+            entity, old,
+            "the new decision landed on the entity it just retired"
+        );
+
+        let all = recorded(&mut e);
+        assert_eq!(all.len(), 2, "both decisions should exist: {all:?}");
+        let stands: Vec<&(String, StableId, bool)> = all.iter().filter(|d| d.2).collect();
+        assert_eq!(
+            stands.len(),
+            1,
+            "exactly one should still stand: {stands:?}"
+        );
+        assert_eq!(stands[0].0, "Adopt SQLite WAL");
+    }
 
     #[test]
     fn a_decision_is_recorded_without_asking_a_model_anything() {
