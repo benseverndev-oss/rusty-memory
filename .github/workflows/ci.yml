@@ -14,9 +14,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No toolchain action: rust-toolchain.toml names the version, and an
+      # action that installs one would only be a second place to change it.
+      # `rustup show` is what makes the install happen here, with the version
+      # in the log, rather than implicitly inside whichever cargo step ran
+      # first. It has to precede the cache, which keys on `rustc -vV`.
+      - name: Toolchain
+        run: rustup show && cargo --version
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check

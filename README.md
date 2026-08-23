@@ -145,11 +145,22 @@ runtime, no CMake, no compose file.
 
 ## Development
 
+These are the three commands CI runs, spelled the way CI spells them. They
+were not, once: the README asked for clippy without `--all-features` while CI
+asked for it with, and a local run could be clean against a check the branch
+would fail.
+
 ```sh
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo fmt --all
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
 ```
+
+The compiler is pinned in `rust-toolchain.toml` and rustup installs it on the
+first cargo invocation, so there is no setup step and no version to agree on.
+CI reads the same file rather than naming a channel of its own. Bumping it is
+a deliberate commit — see the note in that file for why, and for what the pin
+costs.
 
 ## Licence
 
