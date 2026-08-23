@@ -379,10 +379,41 @@ fn resolve(days_ago: Option<i64>, observed_at: Timestamp) -> Result<Timestamp, S
 ///
 /// No retries. The host owns the [`Completer`], so backoff, retry and provider
 /// failover are its business and it is better placed to do them.
+/// The JSON inside a markdown code fence, or the whole string if there is none.
+///
+/// Measured, not anticipated, and twice. It first appeared in [`arity`], whose
+/// opening run parsed none of its seven batches because every response came
+/// back as ```` ```json\n{...}\n``` ````. Looking for the same shape in the
+/// extraction caches already on disk found it there too: **386 of 7,974 cached
+/// responses across the ten LoCoMo conversations — 4.8% — are fenced**, and
+/// every one of them was being refused as "not the JSON this crate asked for".
+/// A whole turn's mentions, facts and relations, thrown away over three
+/// backticks.
+///
+/// `serde_json` fails such a string at line 1 column 1, which reads exactly
+/// like a model that would not answer. It is not: the answer is right there,
+/// wrapped.
+///
+/// The prompt asks for no fence and this strips one anyway. The instruction is
+/// a request; the parser is the guarantee.
+pub(crate) fn unfenced(response: &str) -> &str {
+    let text = response.trim();
+    let Some(rest) = text.strip_prefix("```") else {
+        return text;
+    };
+    // ```json, ```JSON, or just ``` -- the language tag runs to the first
+    // newline, and a fence with no newline at all has no body to find.
+    let body = match rest.split_once('\n') {
+        Some((_tag, body)) => body,
+        None => return text,
+    };
+    body.trim().strip_suffix("```").unwrap_or(body).trim()
+}
+
 pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, ExtractError> {
     let response = completer.complete(&prompt(turn))?;
 
-    let wire: WireExtraction = serde_json::from_str(response.trim())
+    let wire: WireExtraction = serde_json::from_str(unfenced(&response))
         .map_err(|e| ExtractError::Unparsable(e.to_string()))?;
 
     let mut out = Extraction::default();
@@ -931,9 +962,45 @@ mod tests {
     fn a_response_that_is_not_the_json_asked_for_is_still_refused_whole() {
         // The one case with no good half to keep. Salvage needs something
         // parsed to salvage from.
-        for bad in ["Sure! Here you go: {}", "```json\n{}\n```", "[1,2,3]"] {
+        //
+        // A fenced response used to be in this list. It is not any more, and
+        // the test below is why -- refusing those was throwing away 4.8% of
+        // every turn in the corpus over three backticks.
+        for bad in ["Sure! Here you go: {}", "[1,2,3]", "```"] {
             let err = extract(&turn(), &Canned(bad)).unwrap_err();
             assert!(matches!(err, ExtractError::Unparsable(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn a_fenced_response_is_read_rather_than_refused() {
+        // Found by looking for `arity`'s failure mode in the extraction caches
+        // already on disk: 386 of 7,974 cached responses across the ten LoCoMo
+        // conversations come back wrapped in a markdown fence, and every one
+        // was refused as "not the JSON this crate asked for" -- a whole turn's
+        // mentions, facts and relations discarded.
+        //
+        // `serde_json` fails such a string at line 1 column 1, which reads
+        // exactly like a model that would not answer. It answered.
+        let fenced = "```json\n{\"mentions\":[{\"kind\":\"person\",\"name\":\"Ben Severn\",\"text\":\"Ben\"}],\
+                      \"facts\":[{\"subject\":0,\"attribute\":\"employer\",\"value\":\"Globex\",\
+                      \"text\":\"Ben works at Globex\",\"days_ago\":null}],\
+                      \"relations\":[],\"closures\":[]}\n```";
+        let out = extract(&turn(), &Canned(fenced)).unwrap();
+        assert_eq!(out.mentions.len(), 1);
+        assert_eq!(out.mentions[0].name, "Ben Severn");
+        assert_eq!(out.facts.len(), 1);
+        assert_eq!(out.facts[0].value.as_deref(), Some("Globex"));
+        assert!(out.dropped.is_empty(), "and nothing is reported as lost");
+    }
+
+    #[test]
+    fn a_bare_fence_and_an_upper_case_tag_are_both_read() {
+        for fenced in [
+            "```\n{\"mentions\":[],\"facts\":[],\"relations\":[],\"closures\":[]}\n```",
+            "```JSON\n{\"mentions\":[],\"facts\":[],\"relations\":[],\"closures\":[]}\n```",
+        ] {
+            assert!(extract(&turn(), &Canned(fenced)).is_ok(), "{fenced}");
         }
     }
 

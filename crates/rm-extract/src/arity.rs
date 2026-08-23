@@ -102,7 +102,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rm_core::Supersession;
 
-use crate::{claim, Completer};
+use crate::{claim, unfenced, Completer};
 
 /// How many names go in one request.
 ///
@@ -306,34 +306,6 @@ impl Arity {
             known: pairs.into_iter().map(|(k, v)| (k.into(), v)).collect(),
         }
     }
-}
-
-/// The JSON inside a markdown code fence, or the whole string if there is none.
-///
-/// Measured, not anticipated. The first real run of this asked for 512 names in
-/// 7 batches and parsed none of them: every response came back as
-/// ```` ```json\n{...}\n``` ````, and `serde_json` fails such a string at line
-/// 1 column 1 -- an error that reads like the model refused when in fact it
-/// answered perfectly. The eight-name probe used while writing the prompt came
-/// back bare, so the behaviour only appears at the batch size the code actually
-/// uses.
-///
-/// Deliberately not applied to [`crate::extract`]. That parser is unchanged and
-/// its results are the baseline every measurement in this crate is quoted
-/// against; a fence-stripper there would be a real fix and would move numbers,
-/// so it belongs in its own change with its own before and after.
-fn unfenced(response: &str) -> &str {
-    let text = response.trim();
-    let Some(rest) = text.strip_prefix("```") else {
-        return text;
-    };
-    // ```json, ```JSON, or just ``` -- the language tag runs to the first
-    // newline, and a fence with no newline at all has no body to find.
-    let body = match rest.split_once('\n') {
-        Some((_tag, body)) => body,
-        None => return text,
-    };
-    body.trim().strip_suffix("```").unwrap_or(body).trim()
 }
 
 /// The question, for one batch of names.
