@@ -51,7 +51,20 @@ use rm_providers::HttpProvider;
 use serde_json::Value;
 
 /// How many hits `recall` is asked for when scoring retrieval.
+///
+/// Overridable so the depth curve can be swept without a rebuild. The curve is
+/// a diagnostic, not a result: recall@50 is not a number to report as though it
+/// were recall@10, but the *shape* of recall against k says whether the right
+/// assertion is just outside the window or nowhere near it, and those need
+/// different work.
 const K: usize = 10;
+
+fn k() -> usize {
+    std::env::var("LOCOMO_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(K)
+}
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -458,6 +471,15 @@ fn main() {
     );
     let mut attribution = Attribution::default();
     let mut staleness = Staleness::default();
+    // Swept from outside so one build can produce the whole curve, and so the
+    // control (0.0) runs the identical code path rather than a different one.
+    let boost_by: f32 = std::env::var("LOCOMO_BOOST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    if boost_by != 0.0 {
+        eprintln!("  subject boost: +{boost_by}");
+    }
 
     let questions = sample["qa"].as_array().cloned().unwrap_or_default();
     let mut asked = 0usize;
@@ -489,7 +511,19 @@ fn main() {
                 continue;
             }
         };
-        let hits = match engine.recall(&Query::new(embedding, K)) {
+        // Boost the assertions attached to whoever the question names. A
+        // preference, not a filter: turning a name into an entity is the
+        // fallible step (the attribution eval puts it at J = 0.33), so
+        // filtering would discard the answer outright every time it guessed
+        // wrong, while a boost only costs the guess its advantage. Weight 0
+        // is the control and leaves the query identical.
+        let mut query = Query::new(embedding, k());
+        if boost_by != 0.0 {
+            if let Some(subject) = eval::subject_of(question, &speaker_a, &speaker_b) {
+                query = query.boosting(eval::entities_named(&engine, subject), boost_by);
+            }
+        }
+        let hits = match engine.recall(&query) {
             Ok(hits) => hits,
             Err(e) => {
                 eprintln!("  recall failed: {}", first_line(&e.to_string()));
@@ -523,7 +557,7 @@ fn main() {
         }
     }
 
-    println!("\n=== retrieval (recall@{K}, scored against LoCoMo evidence turns) ===");
+    println!("\n=== retrieval (recall@{}, scored against LoCoMo evidence turns) ===", k());
     println!("questions asked      {asked} of {}", questions.len());
     if scored.is_empty() {
         println!("nothing answerable within the ingested prefix");

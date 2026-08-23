@@ -349,6 +349,21 @@ impl Staleness {
     }
 }
 
+/// Every entity the store knows by this name.
+///
+/// A set rather than one id, because resolution is imperfect and the same
+/// person often ends up on more than one entity -- "Caroline" and "Caroline
+/// Reyes" may never have merged. Boosting all of them is right: they are all
+/// the subject as far as anyone can tell, and a boost costs nothing where it
+/// lands on a genuine namesake.
+pub fn entities_named(engine: &Engine, name: &str) -> Vec<StableId> {
+    engine
+        .entity_ids()
+        .into_iter()
+        .filter(|id| names(engine, *id, name))
+        .collect()
+}
+
 /// Which of the two speakers a question is about, if exactly one of them.
 ///
 /// A question naming both ("did Caroline tell Melanie about the parade") makes
