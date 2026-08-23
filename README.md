@@ -91,12 +91,22 @@ The answer keeps its three states across the wire. `{"believed": "absent"}` is
 up", and the text block says which in words too, because that is the half most
 clients put in front of a model.
 
-A server and a `rmem` invocation can share one `memory.json`. They take turns
-on an advisory lock held beside it, spanning each read-modify-write so neither
-can save over a snapshot the other has already changed. The wait is bounded at
-five seconds and then refuses rather than blocking forever, because every
-holder is doing one operation and a longer wait means the other side is wedged
-rather than busy.
+Several servers and `rmem` invocations can share one `memory.json`. They take
+turns on an advisory lock held beside it, spanning each read-modify-write so
+neither can save over a snapshot the other has already changed. The wait is
+bounded at five seconds and then refuses rather than blocking forever.
+
+That bound used to be the ceiling. Every model call happened inside the lock —
+an extraction and a set of embeddings, seconds each across a network — so
+measured on a live store the fourth concurrent writer was refused outright.
+Nothing about those calls needed the store: an extraction is a function of the
+turn, an embedding of its text. They now happen before the lock is taken, and
+the lock covers resolution and a save. Same measurement afterwards: twelve
+concurrent writers, twelve distinct decisions in the store, no lost updates.
+
+The split is held by the signatures rather than by care. `commit_remember` and
+`commit_decide` take no completer and no embedder, so nothing reachable from
+inside the lock can call one.
 
 ## Not leaving it to the agent
 

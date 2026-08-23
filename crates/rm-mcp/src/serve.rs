@@ -29,6 +29,18 @@ use rm_host::{store, HostError};
 use crate::jsonrpc::{self, Request};
 use crate::render;
 use crate::tools::{self, Call};
+
+/// A call's model calls, made before the lock and carried into it.
+///
+/// An enum rather than a bag of `Option`s so a plan cannot be paired with a
+/// call it was not built from: each arm below matches exactly one `Call`
+/// variant, and `Nothing` covers the tools that reach no model at all.
+enum Planned {
+    Remember(command::RememberPlan),
+    Decide(command::DecidePlan),
+    Recall(Vec<f32>),
+    Nothing,
+}
 use crate::version::{self, Era};
 use crate::{INSTRUCTIONS, SERVER_INFO_KEY};
 
@@ -265,13 +277,25 @@ where
             Err(e) => return Ok(refused(era, &e.to_string())),
         };
 
+        // Every model call this tool needs, made before either lock is taken.
+        // A refusal here has cost nothing and blocked nobody, which is the
+        // point: the locks below span a load, a change and a save, and
+        // `Lock::acquire` gives up after five seconds. An embedding inside
+        // that window made one write a three-second outage for every other
+        // writer, and put the ceiling at three concurrent ones.
+        let planned = match Self::plan(&self.config, &self.provider, &call, now, dimension, metric)
+        {
+            Ok(planned) => planned,
+            Err(e) => return Ok(refused(era, &e.to_string())),
+        };
+
         let outcome = if call.mutates() {
             store::with_write(&path, ruleset, policy, dimension, metric, |engine| {
-                Self::write(&self.config, &self.provider, engine, call, now)
+                Self::write(engine, call, planned)
             })
         } else {
             store::with_read(&path, ruleset, policy, dimension, metric, |engine| {
-                Self::read(&self.config, &self.provider, engine, call, now)
+                Self::read(engine, call, planned, now)
             })
         };
 
@@ -298,13 +322,40 @@ where
     ///
     /// Associated rather than a method, and taking the engine as an argument,
     /// because the engine now belongs to the lock rather than to the server.
-    fn write(
+    fn write(engine: &mut Engine, call: Call, planned: Planned) -> Result<Outcome, HostError> {
+        match (call, planned) {
+            (Call::Remember { .. }, Planned::Remember(plan)) => {
+                command::commit_remember(engine, plan)
+            }
+            (Call::Decide { .. }, Planned::Decide(plan)) => command::commit_decide(engine, plan),
+            (Call::ResolveReview { id, same }, _) => {
+                if same {
+                    command::review_confirm(engine, id)
+                } else {
+                    command::review_reject(engine, id)
+                }
+            }
+            // Guarded by `Call::mutates` at the one call site, and paired with
+            // a plan built from the same variant by `Server::plan`. Reaching
+            // here means those two were edited apart.
+            (other, _) => unreachable!("{other:?} does not write, or was not planned"),
+        }
+    }
+
+    /// The model calls a tool needs, made before any lock is taken.
+    ///
+    /// Everything here is a function of the call: an extraction reads the turn
+    /// and an embedding reads its text, and neither asks the store anything.
+    /// What genuinely needs the store -- resolving a mention against what is
+    /// already known -- stays inside the lock, in [`Server::write`].
+    fn plan(
         config: &Config,
         provider: &F,
-        engine: &mut Engine,
-        call: Call,
+        call: &Call,
         now: Timestamp,
-    ) -> Result<Outcome, HostError> {
+        dimension: usize,
+        metric: rm_engine::Metric,
+    ) -> Result<Planned, HostError> {
         match call {
             Call::Remember {
                 text,
@@ -312,22 +363,16 @@ where
                 speaker,
             } => {
                 let provider = provider(config)?;
-                command::remember(
-                    engine,
-                    &text,
+                Ok(Planned::Remember(command::plan_remember(
+                    text,
                     now,
-                    &session,
+                    session,
                     speaker.as_deref(),
                     &provider,
                     &provider,
-                )
-            }
-            Call::ResolveReview { id, same } => {
-                if same {
-                    command::review_confirm(engine, id)
-                } else {
-                    command::review_reject(engine, id)
-                }
+                    dimension,
+                    metric,
+                )?))
             }
             Call::Decide {
                 title,
@@ -341,46 +386,53 @@ where
                 // no completion call: a decision has a known shape, so nothing
                 // has to be guessed out of prose.
                 let provider = provider(config)?;
-                command::decide(
-                    engine,
-                    &title,
-                    &choice,
+                Ok(Planned::Decide(command::plan_decide(
+                    title,
+                    choice,
                     because.as_deref(),
                     context.as_deref(),
                     supersedes.as_deref(),
                     now,
-                    &session,
+                    session,
                     &provider,
-                )
+                )?))
             }
-            // Guarded by `Call::mutates` at the one call site.
-            other => unreachable!("{other:?} does not write"),
+            Call::Recall { query, .. } => {
+                let provider = provider(config)?;
+                Ok(Planned::Recall(command::plan_recall(query, &provider)?))
+            }
+            // Everything else is local work over a file on disk -- notably the
+            // review answers, which write. The question was already asked and
+            // answering it needs no model, so building a provider for them
+            // would demand a credential none of them ever uses.
+            _ => Ok(Planned::Nothing),
         }
     }
 
     /// Run a call that only reads, under the shared lock.
     fn read(
-        config: &Config,
-        provider: &F,
         engine: &Engine,
         call: Call,
+        planned: Planned,
         now: Timestamp,
     ) -> Result<Outcome, HostError> {
         let _ = now;
-        match call {
-            Call::Recall { query, k } => {
-                let provider = provider(config)?;
-                command::recall(engine, &query, k, &provider)
+        match (call, planned) {
+            (Call::Recall { k, .. }, Planned::Recall(vector)) => {
+                command::commit_recall(engine, vector, k)
             }
-            Call::About {
-                entity,
-                attribute,
-                valid_at,
-                as_of,
-            } => command::about(engine, entity, &attribute, valid_at, as_of),
-            Call::Reviews => command::review_list(engine),
-            Call::Decisions => command::decisions(engine),
-            other => unreachable!("{other:?} writes"),
+            (
+                Call::About {
+                    entity,
+                    attribute,
+                    valid_at,
+                    as_of,
+                },
+                _,
+            ) => command::about(engine, entity, &attribute, valid_at, as_of),
+            (Call::Reviews, _) => command::review_list(engine),
+            (Call::Decisions, _) => command::decisions(engine),
+            (other, _) => unreachable!("{other:?} writes, or was not planned"),
         }
     }
 }

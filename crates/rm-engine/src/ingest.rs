@@ -9,7 +9,10 @@ use rm_core::{Interval, Provenance, Source, Supersession, Timestamp};
 use rm_extract::{Extraction, Turn};
 use rm_store::StableId;
 
-use crate::{AssertionId, Engine, EngineError, Observation, Record, Remembered, ReviewId};
+use crate::{
+    AssertionId, Engine, EngineError, Metric, Observation, Record, Remembered, ReviewId,
+    VectorIndex,
+};
 
 /// Whatever went wrong producing an embedding. Opaque here: the host's
 /// service, the host's error.
@@ -80,45 +83,131 @@ pub struct Ingested {
     pub closed: Vec<Closed>,
 }
 
+/// Every vector a turn needs, produced before the store is touched.
+///
+/// The point of the type is *where* it can be built. Nothing in here is a
+/// function of the store: an embedding depends on its text and a validity
+/// check depends on the index's shape, which comes from the config rather than
+/// the snapshot. So [`prepare`] runs with no lock held and no engine loaded,
+/// and [`Engine::ingest_prepared`] -- the half that resolves entities against
+/// what is already there, and the only half that needs either -- holds the
+/// lock for a few in-memory writes instead of for two network round trips.
+///
+/// Opaque on purpose. The two vectors are positional, matching the extraction
+/// they were built from, and a caller that could reorder or truncate them
+/// would silently file one fact's embedding under another.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prepared {
+    mentions: Vec<Vec<f32>>,
+    facts: Vec<Vec<f32>>,
+}
+
+/// Embed everything an extraction will need, and check it, touching no store.
+///
+/// Takes the index's shape rather than an [`Engine`] because that is the whole
+/// point: needing an engine would mean needing a lock. `dimension` and `metric`
+/// are what the host already read out of its config and already hands to the
+/// store on every open, and the store refuses to load when the two disagree --
+/// so a vector accepted here is accepted by the index it is destined for.
+///
+/// Every embedding -- for every mention and every fact -- is produced and
+/// validated before anything is written, so a failing embedder costs nothing.
+/// That is the guarantee `Engine::remember` already makes and for the same
+/// reason: a fact in the store with no vector to find it is undetectable from
+/// outside -- no query reports it and no error names it. Embedding a fact's
+/// text lazily inside its own write loop would keep that promise for mentions
+/// only, so both passes are produced up front.
+pub fn prepare(
+    extraction: &Extraction,
+    embedder: &impl Embedder,
+    dimension: usize,
+    metric: Metric,
+) -> Result<Prepared, EngineError> {
+    // Every mention index checked before anything else, embeddings included:
+    // `extract` refuses these for its own output, but `Extraction`'s fields
+    // are `pub` and this function is `pub`, so a hand-built extraction with an
+    // out-of-range index is not a hypothetical -- it is how every test in this
+    // crate exercises ingest. Checked this early so a bad index costs nothing,
+    // the same guarantee the embedder check just below gives a failing
+    // embedder. Checked here rather than only at commit so the cost is paid
+    // before the network calls, not after them.
+    validate_extraction(extraction)?;
+
+    // An empty index of the destination's shape, used for nothing but its
+    // `check`. Cheaper than it looks -- `VectorIndex::new` stores a dimension
+    // and a metric beside two empty vectors -- and it keeps the one definition
+    // of "a vector this index would accept" in the index, rather than
+    // restating the rule here where it could drift.
+    let shape = VectorIndex::new(dimension, metric);
+
+    let mut mentions: Vec<Vec<f32>> = Vec::with_capacity(extraction.mentions.len());
+    for mention in &extraction.mentions {
+        let v = embedder.embed(&mention.text)?;
+        shape.check(&v)?;
+        mentions.push(v);
+    }
+    let mut facts: Vec<Vec<f32>> = Vec::with_capacity(extraction.facts.len());
+    for fact in &extraction.facts {
+        let v = embedder.embed(&fact.text)?;
+        shape.check(&v)?;
+        facts.push(v);
+    }
+    Ok(Prepared { mentions, facts })
+}
+
 impl Engine {
     /// Apply an extracted turn.
     ///
-    /// Every embedding -- for every mention and every fact -- is produced and
-    /// validated before anything is written, so a failing embedder costs
-    /// nothing. That is the guarantee `Engine::remember` already makes and for
-    /// the same reason: a fact in the store with no vector to find it is
-    /// undetectable from outside -- no query reports it and no error names it.
-    /// Embedding a fact's text lazily inside its own write loop would keep that
-    /// promise for mentions only, so both passes are produced up front, before
-    /// the first write of either kind.
+    /// [`prepare`] then [`Engine::ingest_prepared`]. Kept because it is the
+    /// honest shape for a single process doing one thing at a time, and
+    /// because every test in this crate is written against it. A caller that
+    /// holds a lock across this call holds it across the embedder too; that is
+    /// what the split exists to let a host avoid.
     pub fn ingest(
         &mut self,
         turn: &Turn,
         extraction: &Extraction,
         embedder: &impl Embedder,
     ) -> Result<Ingested, EngineError> {
-        // Every mention index checked before anything else, embeddings
-        // included: `extract` refuses these for its own output, but
-        // `Extraction`'s fields are `pub` and this function is `pub`, so a
-        // hand-built extraction with an out-of-range index is not a
-        // hypothetical -- it is how every test in this crate exercises
-        // `ingest`. Checked this early so a bad index costs nothing, the same
-        // guarantee the embedder check just below gives a failing embedder.
-        validate_extraction(extraction)?;
+        let (dimension, metric) = self.index_shape();
+        let prepared = prepare(extraction, embedder, dimension, metric)?;
+        self.ingest_prepared(turn, extraction, prepared)
+    }
 
-        // Every vector first, and every vector checked, before the first write.
-        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(extraction.mentions.len());
-        for mention in &extraction.mentions {
-            let v = embedder.embed(&mention.text)?;
-            self.index.check(&v)?;
-            vectors.push(v);
+    /// The half of [`Engine::ingest`] that needs the store, and only that half.
+    ///
+    /// Touches no network. Everything below is resolution and in-memory
+    /// writes, which is what makes it safe to hold a lock across this and not
+    /// across the embedding.
+    ///
+    /// `prepared` must have come from [`prepare`] over this same `extraction`
+    /// -- the vectors are positional. A mismatch is refused rather than
+    /// misfiled: with `Prepared`'s fields private, the only way to build one is
+    /// [`prepare`], and the counts are checked below against the extraction
+    /// actually passed here in case the two came from different calls.
+    pub fn ingest_prepared(
+        &mut self,
+        turn: &Turn,
+        extraction: &Extraction,
+        prepared: Prepared,
+    ) -> Result<Ingested, EngineError> {
+        // Re-validated because this is `pub` and the extraction reaching it
+        // need not be the one `prepare` saw. Cheap, and it is what lets the
+        // indexing below stay unchecked.
+        validate_extraction(extraction)?;
+        if prepared.mentions.len() != extraction.mentions.len()
+            || prepared.facts.len() != extraction.facts.len()
+        {
+            return Err(EngineError::Embed(EmbedderError(format!(
+                "the prepared embeddings do not match this extraction: {} mention and {} fact vectors against {} mentions and {} facts -- they were prepared from a different extraction, and using them would file one sentence's vector under another",
+                prepared.mentions.len(),
+                prepared.facts.len(),
+                extraction.mentions.len(),
+                extraction.facts.len(),
+            ))));
         }
-        let mut fact_vectors: Vec<Vec<f32>> = Vec::with_capacity(extraction.facts.len());
-        for fact in &extraction.facts {
-            let v = embedder.embed(&fact.text)?;
-            self.index.check(&v)?;
-            fact_vectors.push(v);
-        }
+        let vectors = prepared.mentions;
+        let fact_vectors = prepared.facts;
 
         // Every write this turn produces carries the turn's own provenance.
         // `ToolOutput` because an extraction is what a tool returned, not what

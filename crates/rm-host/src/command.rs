@@ -3,10 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use rm_engine::{
-    Believed, Embedder, Engine, Ingested, Interval, Observation, Provenance, Query, Recalled,
-    Record, Remembered, ReviewId, Source, StableId, Supersession, Timestamp,
+    Believed, Embedder, Engine, Ingested, Interval, Metric, Observation, Prepared, Provenance,
+    Query, Recalled, Record, Remembered, ReviewId, Source, StableId, Supersession, Timestamp,
 };
-use rm_extract::{Completer, Turn};
+use rm_extract::{Completer, Extraction, Turn};
 
 /// Re-exported because [`Outcome::Remembered`] carries these and a host has to
 /// be able to name them.
@@ -218,6 +218,59 @@ pub fn remember(
     completer: &impl Completer,
     embedder: &impl Embedder,
 ) -> Result<Outcome, HostError> {
+    let (dimension, metric) = engine.index_shape();
+    let plan = plan_remember(
+        text,
+        observed_at,
+        session,
+        speaker,
+        completer,
+        embedder,
+        dimension,
+        metric,
+    )?;
+    commit_remember(engine, plan)
+}
+
+/// Everything [`commit_remember`] will need from the network, and nothing else.
+///
+/// Built without an [`Engine`], which is the entire point: a host that calls
+/// this before taking its lock pays for the extraction and the embeddings on
+/// its own time rather than on every other writer's. See [`rm_engine::prepare`]
+/// for why none of this depends on the store.
+pub struct RememberPlan {
+    turn: Turn,
+    extraction: Extraction,
+    prepared: Prepared,
+}
+
+impl RememberPlan {
+    /// What the model read out of the turn, before any of it was written.
+    ///
+    /// Exposed so a caller can refuse a plan without committing it -- an empty
+    /// extraction is a completion spent for nothing, and a host that queues
+    /// writes may prefer to know that before it queues one.
+    pub fn extraction(&self) -> &Extraction {
+        &self.extraction
+    }
+}
+
+/// The half of [`remember`] that talks to models. No store, no lock.
+///
+/// `dimension` and `metric` describe the index the vectors are destined for.
+/// A caller has them already: they come from `rmem.toml`, and the store
+/// refuses to load against a config that disagrees with them.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_remember(
+    text: &str,
+    observed_at: rm_engine::Timestamp,
+    session: &str,
+    speaker: Option<&str>,
+    completer: &impl Completer,
+    embedder: &impl Embedder,
+    dimension: usize,
+    metric: Metric,
+) -> Result<RememberPlan, HostError> {
     let turn = Turn {
         text: text.to_string(),
         speaker: speaker.map(str::to_string),
@@ -227,13 +280,32 @@ pub fn remember(
 
     let extraction =
         rm_engine::extract(&turn, completer).map_err(|e| HostError::Refused(e.to_string()))?;
+    let prepared = rm_engine::prepare(&extraction, embedder, dimension, metric)
+        .map_err(|e| HostError::Refused(e.to_string()))?;
+
+    Ok(RememberPlan {
+        turn,
+        extraction,
+        prepared,
+    })
+}
+
+/// The half of [`remember`] that needs the store. Touches no network.
+pub fn commit_remember(engine: &mut Engine, plan: RememberPlan) -> Result<Outcome, HostError> {
+    let RememberPlan {
+        turn,
+        extraction,
+        prepared,
+    } = plan;
 
     // Which entities existed before, so the landings can say "recognised"
-    // rather than only naming an id.
+    // rather than only naming an id. Read here rather than in the plan: it is
+    // a fact about the store at the moment of the write, and a copy taken
+    // before the lock could name an entity another writer has since merged.
     let before: Vec<StableId> = engine.entity_ids();
 
     let ingested = engine
-        .ingest(&turn, &extraction, embedder)
+        .ingest_prepared(&turn, &extraction, prepared)
         .map_err(|e| HostError::Refused(e.to_string()))?;
 
     let landings = extraction
@@ -262,9 +334,22 @@ pub fn recall(
     k: usize,
     embedder: &impl Embedder,
 ) -> Result<Outcome, HostError> {
-    let embedding = embedder
+    commit_recall(engine, plan_recall(query, embedder)?, k)
+}
+
+/// Embed a query, touching no store.
+///
+/// `recall` takes a shared lock, so two readers never queue behind each other
+/// -- but a shared lock still holds a writer off, and holding one across a
+/// network round trip made every reader a brake on every writer.
+pub fn plan_recall(query: &str, embedder: &impl Embedder) -> Result<Vec<f32>, HostError> {
+    embedder
         .embed(query)
-        .map_err(|e| HostError::Refused(e.to_string()))?;
+        .map_err(|e| HostError::Refused(e.to_string()))
+}
+
+/// Search with an embedding [`plan_recall`] already produced.
+pub fn commit_recall(engine: &Engine, embedding: Vec<f32>, k: usize) -> Result<Outcome, HostError> {
     let hits = engine
         .recall(&Query::new(embedding, k))
         .map_err(|e| HostError::Refused(e.to_string()))?;
@@ -379,47 +464,121 @@ pub fn decide(
     session: &str,
     embedder: &impl Embedder,
 ) -> Result<Outcome, HostError> {
+    let plan = plan_decide(
+        title,
+        choice,
+        because,
+        context,
+        supersedes,
+        observed_at,
+        session,
+        embedder,
+    )?;
+    commit_decide(engine, plan)
+}
+
+/// One attribute of one decision, with its embedding already produced.
+struct FieldWrite {
+    title: String,
+    attribute: String,
+    value: String,
+    embedding: Vec<f32>,
+}
+
+/// Everything [`commit_decide`] will need from the embedder, and nothing else.
+///
+/// A decision costs no completion -- the shape is known -- but it did cost four
+/// sequential embedding calls with the store's exclusive lock held, which made
+/// one agent recording a decision a three-second outage for every other writer.
+pub struct DecidePlan {
+    observed_at: Timestamp,
+    session: String,
+    /// The retirement of the decision this one replaces, embedded whether or
+    /// not a decision by that title turns out to exist.
+    ///
+    /// Prepared unconditionally because whether it exists is a question about
+    /// the store, and asking it here would need the lock this type exists to
+    /// avoid taking. One wasted embedding on a mistyped `--supersedes` is the
+    /// cost, and only when `--supersedes` was passed at all.
+    retire: Option<(String, FieldWrite)>,
+    /// The fields of the new decision, in write order.
+    fields: Vec<FieldWrite>,
+}
+
+/// The half of [`decide`] that talks to the embedder. No store, no lock.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_decide(
+    title: &str,
+    choice: &str,
+    because: Option<&str>,
+    context: Option<&str>,
+    supersedes: Option<&str>,
+    observed_at: Timestamp,
+    session: &str,
+    embedder: &impl Embedder,
+) -> Result<DecidePlan, HostError> {
     if title.trim().is_empty() || choice.trim().is_empty() {
         return Err(HostError::Refused(
             "a decision needs a title and a choice: the title is how it is found again, and the choice is what was decided".into(),
         ));
     }
 
+    let retire = match supersedes {
+        None => None,
+        Some(old_title) => Some((
+            old_title.to_string(),
+            embed_field(old_title, "status", "superseded", embedder)?,
+        )),
+    };
+
+    let mut fields = Vec::with_capacity(DECISION_FIELDS.len());
+    for (name, value) in [
+        ("status", Some("accepted")),
+        ("choice", Some(choice)),
+        ("because", because),
+        ("context", context),
+    ] {
+        let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
+            continue;
+        };
+        fields.push(embed_field(title, name, value, embedder)?);
+    }
+
+    Ok(DecidePlan {
+        observed_at,
+        session: session.to_string(),
+        retire,
+        fields,
+    })
+}
+
+/// The half of [`decide`] that needs the store. Touches no network.
+pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, HostError> {
+    let DecidePlan {
+        observed_at,
+        session,
+        retire,
+        fields,
+    } = plan;
+
     // Retire the old one first. If this fails, nothing has been written, and a
     // caller who re-runs the command gets one attempt rather than a duplicate
     // decision beside a still-standing predecessor.
     let mut superseded = None;
     let mut supersedes_unknown = None;
-    if let Some(old_title) = supersedes {
-        match find_decision(engine, old_title) {
-            None => supersedes_unknown = Some(old_title.to_string()),
+    if let Some((old_title, write)) = retire {
+        match find_decision(engine, &old_title) {
+            None => supersedes_unknown = Some(old_title),
             Some(old) => {
-                write_field(
-                    engine,
-                    old_title,
-                    "status",
-                    "superseded",
-                    observed_at,
-                    session,
-                    embedder,
-                )?;
-                superseded = Some((old, old_title.to_string()));
+                write_field(engine, &write, observed_at, &session)?;
+                superseded = Some((old, old_title));
             }
         }
     }
 
-    let fields = [
-        ("status", Some("accepted")),
-        ("choice", Some(choice)),
-        ("because", because),
-        ("context", context),
-    ];
     let mut entity = None;
-    for (name, value) in fields {
-        let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
-            continue;
-        };
-        let landed = write_field(engine, title, name, value, observed_at, session, embedder)?;
+    for write in &fields {
+        let landed = write_field(engine, write, observed_at, &session)?;
         entity.get_or_insert(landed);
     }
 
@@ -489,19 +648,37 @@ fn find_decision(engine: &Engine, title: &str) -> Option<StableId> {
 /// own -- a search for why a decision was made has to be able to reach the
 /// reason through the decision's own title.
 #[allow(clippy::too_many_arguments)]
-fn write_field(
-    engine: &mut Engine,
+/// Embed one decision field. The embedder call, and nothing else.
+fn embed_field(
     title: &str,
     attribute: &str,
     value: &str,
-    observed_at: Timestamp,
-    session: &str,
     embedder: &impl Embedder,
-) -> Result<StableId, HostError> {
+) -> Result<FieldWrite, HostError> {
     debug_assert!(DECISION_FIELDS.contains(&attribute));
     let embedding = embedder
         .embed(&format!("decision {title}: {attribute} is {value}"))
         .map_err(|e| HostError::Refused(e.to_string()))?;
+    Ok(FieldWrite {
+        title: title.to_string(),
+        attribute: attribute.to_string(),
+        value: value.to_string(),
+        embedding,
+    })
+}
+
+fn write_field(
+    engine: &mut Engine,
+    write: &FieldWrite,
+    observed_at: Timestamp,
+    session: &str,
+) -> Result<StableId, HostError> {
+    let FieldWrite {
+        title,
+        attribute,
+        value,
+        embedding,
+    } = write;
     let landed = engine
         .remember(Observation {
             kind: "decision".to_string(),
@@ -513,7 +690,7 @@ fn write_field(
             // sentence. Somebody decided it and said so.
             provenance: Provenance::new(Source::UserAssertion, observed_at, session),
             supersession: Supersession::Corrects,
-            embedding,
+            embedding: embedding.clone(),
         })
         .map_err(|e| HostError::Refused(e.to_string()))?;
     Ok(match landed {
@@ -677,6 +854,169 @@ mod tests {
             config.ruleset().unwrap(),
             config.policy_for_engine().unwrap(),
         )
+    }
+
+    // ---- the lock and the network ------------------------------------------
+
+    /// Can an exclusive lock on this store be taken right now?
+    ///
+    /// A second handle on the same file: `flock` conflicts between open file
+    /// descriptions, so this contends with a lock the same process holds
+    /// exactly as another process would.
+    fn lock_is_free(store: &std::path::Path) -> bool {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(crate::store::lock_path(store))
+            .unwrap();
+        f.try_lock().is_ok()
+    }
+
+    /// A provider that checks, on every call, whether the store is locked.
+    struct ProbesTheLock<'a> {
+        inner: StubProvider,
+        store: &'a std::path::Path,
+        calls: std::cell::Cell<usize>,
+        always_free: std::cell::Cell<bool>,
+    }
+
+    impl<'a> ProbesTheLock<'a> {
+        fn new(store: &'a std::path::Path, responses: Vec<&str>) -> Self {
+            ProbesTheLock {
+                inner: StubProvider::new(responses),
+                store,
+                calls: std::cell::Cell::new(0),
+                always_free: std::cell::Cell::new(true),
+            }
+        }
+
+        fn probe(&self) {
+            self.calls.set(self.calls.get() + 1);
+            if !lock_is_free(self.store) {
+                self.always_free.set(false);
+            }
+        }
+    }
+
+    impl Embedder for ProbesTheLock<'_> {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, rm_engine::EmbedderError> {
+            self.probe();
+            self.inner.embed(text)
+        }
+    }
+
+    impl Completer for ProbesTheLock<'_> {
+        fn complete(&self, prompt: &str) -> Result<String, rm_extract::CompleterError> {
+            self.probe();
+            self.inner.complete(prompt)
+        }
+    }
+
+    /// The store's lock is free the whole time a model is being called.
+    ///
+    /// This is what the plan/commit split is *for*, stated as something
+    /// observable rather than as a shape. Every model call used to happen
+    /// inside `with_write`, so an extraction and a set of embeddings -- seconds
+    /// each, across a network -- were held against every other writer, and
+    /// `Lock::acquire` gives up after five. Measured on a live store before
+    /// this change, the fourth concurrent writer was refused.
+    ///
+    /// The compiler already enforces most of it: `commit_remember` and
+    /// `commit_decide` take no embedder and no completer, so nothing reached
+    /// from inside the lock *can* call one. This covers the other half -- that
+    /// the plan really is built before the lock is taken -- which no signature
+    /// can state.
+    #[test]
+    fn the_store_lock_is_free_while_a_model_is_being_called() {
+        let dir = TempDir::new();
+        let store = dir.path().join("memory.json");
+        let config: crate::config::Config = toml::from_str(crate::config::TEMPLATE).unwrap();
+        let (ruleset, policy) = (
+            config.ruleset().unwrap(),
+            config.policy_for_engine().unwrap(),
+        );
+        let shape = || {
+            (
+                config.ruleset().unwrap(),
+                config.policy_for_engine().unwrap(),
+                3,
+                Metric::Cosine,
+            )
+        };
+
+        // A turn: one completion for the extraction, then one embedding per
+        // mention and per fact.
+        let probe = ProbesTheLock::new(&store, vec![EXTRACTION]);
+        let plan = plan_remember(
+            "Ben moved to Chicago.",
+            100,
+            "test",
+            Some("Ben"),
+            &probe,
+            &probe,
+            3,
+            Metric::Cosine,
+        )
+        .unwrap();
+        // Not vacuous: the probe has to have actually run. A plan that called
+        // no model would pass the assertion below while proving nothing.
+        assert!(
+            probe.calls.get() > 1,
+            "the probe saw {} calls -- it must see the completion and at least one embedding, or it is asserting nothing",
+            probe.calls.get()
+        );
+        assert!(
+            probe.always_free.get(),
+            "the store was locked while a model was being called"
+        );
+
+        let (r, p, d, m) = shape();
+        crate::store::with_write(&store, r, p, d, m, |engine| commit_remember(engine, plan))
+            .unwrap();
+
+        // The same again for a decision, which reaches no completer but did
+        // hold the lock across four sequential embeddings.
+        let probe = ProbesTheLock::new(&store, vec![]);
+        let plan = plan_decide(
+            "Pin the toolchain",
+            "rust-toolchain.toml names the version",
+            Some("CI and a working copy were answering different questions"),
+            None,
+            None,
+            200,
+            "test",
+            &probe,
+        )
+        .unwrap();
+        assert_eq!(
+            probe.calls.get(),
+            3,
+            "status, choice and because -- one embedding each"
+        );
+        assert!(
+            probe.always_free.get(),
+            "the store was locked while a decision was being embedded"
+        );
+
+        let (r, p, d, m) = shape();
+        crate::store::with_write(&store, r, p, d, m, |engine| commit_decide(engine, plan)).unwrap();
+
+        // And the guard that makes the two assertions above mean something:
+        // the probe *can* see a held lock. Without this the test would pass
+        // just as happily against a `lock_is_free` that always said yes.
+        let mut saw_locked = None;
+        crate::store::with_write(&store, ruleset, policy, 3, Metric::Cosine, |_| {
+            saw_locked = Some(lock_is_free(&store));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            saw_locked,
+            Some(false),
+            "the probe cannot detect a held lock, so it proves nothing about an unheld one"
+        );
     }
 
     // ---- decisions ---------------------------------------------------------

@@ -121,6 +121,15 @@ pub fn run(
     // load, the change and the save; `with_read` takes a shared one and writes
     // nothing. Reading under a lock is not ceremony: without it a `recall` can
     // read the store in the moment another process has replaced it.
+    /// A command's model calls, made before the lock and carried into it.
+    ///
+    /// An enum rather than two `Option`s so the two cannot both be set, and so
+    /// the match below pairs each plan with the command it was built from.
+    enum Planned {
+        Remember(command::RememberPlan),
+        Decide(command::DecidePlan),
+    }
+
     let mutates = matches!(
         command,
         Command::Remember { .. }
@@ -130,72 +139,113 @@ pub fn run(
     );
 
     let path = config.store.path.clone();
+
+    // # Every model call happens above the lock, not inside it
+    //
+    // Both brackets below take a lock that spans a load, a change and a save.
+    // What used to happen inside them was an extraction and a set of
+    // embeddings -- seconds each, because the model is across a network -- and
+    // `Lock::acquire` waits five seconds before refusing. Measured on a live
+    // store, that put the ceiling at three concurrent writers: the fourth
+    // waited out the bound and was told nothing was written.
+    //
+    // Nothing about the network calls needed the store. An extraction is a
+    // function of the turn and an embedding is a function of its text, so the
+    // plan is built here, unlocked, and the closure below is left holding
+    // nothing but in-memory work. The one part that genuinely reads the store
+    // -- resolving a mention against everything already known -- never leaves
+    // the lock, which is why this is a reordering and not a weakening.
     if mutates {
-        store::with_write(&path, ruleset, policy, dimension, metric, |engine| {
-            match command {
-                Command::Remember { text, speaker } => {
-                    let provider = config.provider()?;
-                    command::remember(
-                        engine,
-                        &text,
-                        now,
-                        "cli",
-                        speaker.as_deref(),
-                        &provider,
-                        &provider,
-                    )
-                }
-                Command::ReviewConfirm(id) => command::review_confirm(engine, id),
-                Command::ReviewReject(id) => command::review_reject(engine, id),
-                Command::Decide {
+        // Built before the lock is taken, and deliberately not inside a
+        // closure that runs under it. `config.provider()` reads the API key
+        // out of the environment and refuses when it is unset, which is a
+        // failure worth having before a lock is held rather than during.
+        let planned = match &command {
+            Command::Remember { text, speaker } => {
+                let provider = config.provider()?;
+                Some(Planned::Remember(command::plan_remember(
+                    text,
+                    now,
+                    "cli",
+                    speaker.as_deref(),
+                    &provider,
+                    &provider,
+                    dimension,
+                    metric,
+                )?))
+            }
+            Command::Decide {
+                title,
+                choice,
+                because,
+                context,
+                supersedes,
+            } => {
+                // `config.provider()` builds a completer too, and nothing
+                // here will call it: a decision has a known shape, so it
+                // costs embeddings and no completion at all.
+                let provider = config.provider()?;
+                Some(Planned::Decide(command::plan_decide(
                     title,
                     choice,
-                    because,
-                    context,
-                    supersedes,
-                } => {
-                    // `config.provider()` builds a completer too, and nothing
-                    // here will call it: a decision has a known shape, so it
-                    // costs embeddings and no completion at all.
-                    let provider = config.provider()?;
-                    command::decide(
-                        engine,
-                        &title,
-                        &choice,
-                        because.as_deref(),
-                        context.as_deref(),
-                        supersedes.as_deref(),
-                        now,
-                        "cli",
-                        &provider,
-                    )
+                    because.as_deref(),
+                    context.as_deref(),
+                    supersedes.as_deref(),
+                    now,
+                    "cli",
+                    &provider,
+                )?))
+            }
+            // The review answers write, but they answer a question the
+            // resolver already asked. No model is involved either way.
+            _ => None,
+        };
+
+        store::with_write(&path, ruleset, policy, dimension, metric, |engine| {
+            match (command, planned) {
+                (Command::Remember { .. }, Some(Planned::Remember(plan))) => {
+                    command::commit_remember(engine, plan)
                 }
-                // Guarded by `mutates` directly above, over the same variants.
-                other => unreachable!("{other:?} does not write"),
+                (Command::Decide { .. }, Some(Planned::Decide(plan))) => {
+                    command::commit_decide(engine, plan)
+                }
+                (Command::ReviewConfirm(id), _) => command::review_confirm(engine, id),
+                (Command::ReviewReject(id), _) => command::review_reject(engine, id),
+                // Guarded by `mutates` directly above, over the same variants,
+                // and the two planned arms are built from those same variants
+                // just above -- so a mismatch here is this function having been
+                // edited in one place and not the other.
+                (other, _) => unreachable!("{other:?} does not write, or was not planned"),
             }
         })
         .map_err(CliError::from)
     } else {
-        store::with_read(
-            &path,
-            ruleset,
-            policy,
-            dimension,
-            metric,
-            |engine| match command {
-                Command::Recall { query, k } => {
-                    let provider = config.provider()?;
-                    command::recall(engine, &query, k, &provider)
+        // Same reordering on the read side. A shared lock lets readers run
+        // together, but it still holds a writer off, so a `recall` that
+        // embedded its query under the lock made every reader a brake on
+        // every writer.
+        let query_vector = match &command {
+            Command::Recall { query, .. } => {
+                let provider = config.provider()?;
+                Some(command::plan_recall(query, &provider)?)
+            }
+            _ => None,
+        };
+
+        store::with_read(&path, ruleset, policy, dimension, metric, |engine| {
+            match (command, query_vector) {
+                (Command::Recall { k, .. }, Some(vector)) => {
+                    command::commit_recall(engine, vector, k)
                 }
-                Command::About { entity, attribute } => {
+                (Command::About { entity, attribute }, _) => {
                     command::about(engine, entity, &attribute, now, now)
                 }
-                Command::ReviewList => command::review_list(engine),
-                Command::Decisions => command::decisions(engine),
-                Command::Init { .. } => unreachable!("handled above"),
-                other => unreachable!("{other:?} writes"),
-            },
-        )
+                (Command::ReviewList, _) => command::review_list(engine),
+                (Command::Decisions, _) => command::decisions(engine),
+                (Command::Init { .. }, _) => unreachable!("handled above"),
+                (other, _) => unreachable!("{other:?} writes, or was not planned"),
+            }
+        })
         .map_err(CliError::from)
     }
 }

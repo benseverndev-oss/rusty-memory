@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rm_store::MemoryStore;
 use serde::{Deserialize, Serialize};
 
-pub use ingest::{Closed, Embedder, EmbedderError, Ingested};
+pub use ingest::{prepare, Closed, Embedder, EmbedderError, Ingested, Prepared};
 pub use policy::Policy;
 pub use read::{Believed, Query, Recalled, Standing};
 pub use review::{PendingReview, ReviewId, Settled};
