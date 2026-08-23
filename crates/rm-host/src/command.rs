@@ -469,7 +469,7 @@ pub fn decisions(engine: &Engine) -> Result<Outcome, HostError> {
             still_stands: engine.store_history(id, "choice").len() == 1,
         });
     }
-    out.sort_by(|a, b| b.entity.cmp(&a.entity));
+    out.sort_by_key(|d| std::cmp::Reverse(d.entity));
     Ok(Outcome::Decisions(out))
 }
 
