@@ -31,6 +31,54 @@ pub struct Query {
     pub entity: Option<StableId>,
     pub source: Option<Source>,
     pub session: Option<String>,
+    /// Entities whose assertions are worth more for this query, and how much.
+    ///
+    /// A *boost*, not a filter, and the distinction is the whole design.
+    /// [`Query::entity`] answers "only tell me about Alice", which is right
+    /// when the caller knows the subject. A question does not come with that
+    /// knowledge — it comes with a name, and turning a name into an entity is
+    /// exactly the fallible step. Measured on this corpus the store separates
+    /// the right subject from the wrong one at J = 0.33, so filtering on it
+    /// would discard the answer outright every time it guessed wrong, while a
+    /// boost only costs the guess its advantage.
+    ///
+    /// Empty and zero mean an unboosted query, which is what
+    /// [`Query::new`] builds.
+    ///
+    /// # It did not help on LoCoMo, and the reason is the corpus
+    ///
+    /// This was built because 98% of that benchmark's remaining recall gap is
+    /// ranking rather than storage -- the store holds an assertion from an
+    /// evidence turn for 99.3% of questions and gets one into the top ten for
+    /// 70.9%. Boosting the subject looked like the lever.
+    ///
+    /// Swept over three conversations it is flat and then falls:
+    ///
+    /// ```text
+    ///   boost      +0.00   +0.02   +0.05   +0.10   +0.20   +0.50
+    ///   recall     0.671   0.671   0.671   0.664   0.651   0.651
+    /// ```
+    ///
+    /// Because a LoCoMo conversation has two speakers who between them own
+    /// **93-98% of every assertion in the store**. Boosting one of them adds a
+    /// constant to more than half the index, which reorders almost nothing at
+    /// small weights and, at large ones, promotes the subject's irrelevant
+    /// facts over the other speaker's relevant ones. "Is this about the
+    /// subject" carries almost no information when everything is about one of
+    /// two people.
+    ///
+    /// So the null is about the corpus, not the mechanism: a store whose
+    /// assertions are spread over hundreds of entities is the case this is for,
+    /// and LoCoMo cannot show it either way. Kept, tested, and documented as
+    /// unproven rather than quietly deleted or quietly shipped as a win.
+    pub boost: BTreeSet<StableId>,
+    /// Added to the similarity of a boosted entity's assertions.
+    ///
+    /// Cosine similarity lives in `[-1, 1]`, so this is on that scale: 0.05 is
+    /// a nudge between near-ties, 0.5 outranks almost anything unboosted. The
+    /// right value is not obvious and is not guessed here — `benches/locomo`
+    /// sweeps it.
+    pub boost_by: f32,
 }
 
 /// One recalled assertion.
@@ -110,7 +158,21 @@ impl Query {
             entity: None,
             source: None,
             session: None,
+            boost: BTreeSet::new(),
+            boost_by: 0.0,
         }
+    }
+
+    /// Prefer assertions attached to these entities, by `weight`.
+    ///
+    /// See [`Query::boost`] for why this is a preference and not a filter.
+    /// An empty set or a zero weight leaves the query unchanged, so a caller
+    /// that failed to identify a subject can pass what it found without
+    /// branching.
+    pub fn boosting(mut self, entities: impl IntoIterator<Item = StableId>, weight: f32) -> Self {
+        self.boost = entities.into_iter().collect();
+        self.boost_by = weight;
+        self
     }
 
     pub fn as_of(mut self, valid_t: Timestamp, tx_t: Timestamp) -> Self {
@@ -243,7 +305,20 @@ impl Engine {
     /// failure, and reintroducing it one layer up would waste the work.
     pub fn recall(&self, q: &Query) -> Result<Vec<Recalled>, EngineError> {
         let keep = |id: rm_index::EntryId| self.in_scope(id, q);
-        let hits = self.index.search_filtered(&q.embedding, q.k, keep)?;
+        // The boost runs inside the scan for the same reason the filter does.
+        // Re-ranking a fetched top-`k` could only ever promote assertions that
+        // raw similarity had already surfaced, and the one this exists to
+        // rescue is the assertion about the right person sitting at rank 40.
+        let boost = |id: rm_index::EntryId, score: f32| {
+            if q.boost.is_empty() {
+                return score;
+            }
+            match self.assertions.get(&id) {
+                Some(entry) if q.boost.contains(&entry.entity) => score + q.boost_by,
+                _ => score,
+            }
+        };
+        let hits = self.index.search_adjusted(&q.embedding, q.k, keep, boost)?;
 
         let recalled: Vec<Recalled> = hits
             .into_iter()

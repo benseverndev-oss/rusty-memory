@@ -374,6 +374,30 @@ impl VectorIndex {
         k: usize,
         keep: impl Fn(EntryId) -> bool,
     ) -> Result<Vec<Hit>, IndexError> {
+        self.search_adjusted(query, k, keep, |_, score| score)
+    }
+
+    /// The `k` best entries for which `keep` returns true, ranked by `adjust`ed
+    /// score rather than raw similarity.
+    ///
+    /// `adjust` receives the entry and its similarity and returns the score to
+    /// rank by. It runs *inside* the scan, for the same reason `keep` does: a
+    /// caller that fetched a top-`k` and re-ranked it afterwards would only
+    /// ever promote entries that were already in the top-`k`, which is not a
+    /// re-rank at all -- it is a reordering of whatever raw similarity happened
+    /// to surface, and the entry the adjustment exists to rescue is precisely
+    /// the one sitting at rank 40.
+    ///
+    /// The returned [`Hit::score`] is the adjusted score, because that is what
+    /// the ordering means. A caller needing the raw similarity should compute
+    /// it or return it through the closure.
+    pub fn search_adjusted(
+        &self,
+        query: &[f32],
+        k: usize,
+        keep: impl Fn(EntryId) -> bool,
+        adjust: impl Fn(EntryId, f32) -> f32,
+    ) -> Result<Vec<Hit>, IndexError> {
         let q = self.prepare(query)?;
         if k == 0 {
             return Ok(Vec::new());
@@ -389,7 +413,7 @@ impl VectorIndex {
                 let v = &self.vectors[start..start + self.dim];
                 Hit {
                     id,
-                    score: self.score(&q, v),
+                    score: adjust(id, self.score(&q, v)),
                 }
             })
             .collect();

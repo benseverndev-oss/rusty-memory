@@ -2441,6 +2441,120 @@ mod tests {
     }
 
     #[test]
+    fn a_boost_lifts_the_right_subject_past_a_closer_stranger() {
+        // The case the whole thing exists for. A question about Ben pulls up
+        // Ada's fact because that is the sentence it sounds like; boosting Ben
+        // puts his answer first without discarding hers.
+        let mut e = engine();
+        let Remembered::Created { entity: ben, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                10,
+                [0.8, 0.6, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("expected a new entity")
+        };
+        e.remember(embedded(
+            "Ada Lovelace",
+            "employer",
+            "Globex",
+            11,
+            [1.0, 0.0, 0.0],
+        ))
+        .unwrap();
+
+        let q = Query::new(vec![1.0, 0.0, 0.0], 2);
+        let plain = e.recall(&q).unwrap();
+        assert_eq!(
+            plain[0].value.as_deref(),
+            Some("Globex"),
+            "unboosted, the closer stranger leads"
+        );
+
+        let boosted = e.recall(&q.clone().boosting([ben], 0.5)).unwrap();
+        assert_eq!(boosted[0].value.as_deref(), Some("Acme"));
+        assert_eq!(
+            boosted.len(),
+            2,
+            "and the other one is still there -- this is a preference, not a filter"
+        );
+    }
+
+    #[test]
+    fn a_boost_reaches_past_k_rather_than_reordering_what_k_surfaced() {
+        // The property that makes this worth putting inside the scan. Ben's
+        // fact is the least similar of the four, so a caller that fetched the
+        // top two and re-ranked them could never find it.
+        let mut e = engine();
+        let Remembered::Created { entity: ben, .. } = e
+            .remember(embedded(
+                "Ben Severn",
+                "employer",
+                "Acme",
+                10,
+                [0.1, 0.99, 0.0],
+            ))
+            .unwrap()
+        else {
+            panic!("expected a new entity")
+        };
+        for (name, value, at, v) in [
+            ("Ada Lovelace", "employer", 11, [1.0, 0.0, 0.0]),
+            ("Cal Vaughn", "employer", 12, [0.98, 0.02, 0.0]),
+            ("Dee Okafor", "employer", 13, [0.96, 0.04, 0.0]),
+        ] {
+            e.remember(embedded(name, value, "Globex", at, v)).unwrap();
+        }
+
+        let q = Query::new(vec![1.0, 0.0, 0.0], 2);
+        assert!(
+            !e.recall(&q)
+                .unwrap()
+                .iter()
+                .any(|h| h.value.as_deref() == Some("Acme")),
+            "unboosted, Ben is nowhere near the top two"
+        );
+        let boosted = e.recall(&q.clone().boosting([ben], 0.9)).unwrap();
+        assert_eq!(
+            boosted[0].value.as_deref(),
+            Some("Acme"),
+            "boosting has to be able to reach an assertion k never surfaced"
+        );
+    }
+
+    #[test]
+    fn an_empty_boost_changes_nothing() {
+        // A caller that could not identify a subject passes what it found
+        // without branching, and gets the query it would have had.
+        let mut e = engine();
+        e.remember(embedded(
+            "Ben Severn",
+            "employer",
+            "Acme",
+            10,
+            [1.0, 0.0, 0.0],
+        ))
+        .unwrap();
+        e.remember(embedded(
+            "Ada Lovelace",
+            "employer",
+            "Globex",
+            11,
+            [0.9, 0.1, 0.0],
+        ))
+        .unwrap();
+
+        let q = Query::new(vec![1.0, 0.0, 0.0], 5);
+        let plain = e.recall(&q).unwrap();
+        assert_eq!(plain, e.recall(&q.clone().boosting([], 0.5)).unwrap());
+        assert_eq!(plain, e.recall(&q.clone().boosting([1, 2], 0.0)).unwrap());
+    }
+
+    #[test]
     fn recall_as_of_a_past_tx_time_does_not_see_later_knowledge() {
         let mut e = engine();
         e.remember(embedded(
