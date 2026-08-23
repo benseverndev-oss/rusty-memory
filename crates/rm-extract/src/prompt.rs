@@ -89,6 +89,11 @@ use crate::Turn;
 /// name, away from extraction, and cached. Conversation 0 has 418 distinct
 /// names against 616 facts. That is the next thing to try, and it cannot cost
 /// an extraction anything, because it does not touch one.
+///
+/// That was tried, and it is [`crate::arity`]. Asking about a bare name turned
+/// out to underdetermine the answer and was rejected on its own measurement;
+/// asking about the names that appear in a contested slot, with their values
+/// shown, works well enough to ship. The numbers are in that module.
 pub fn prompt(turn: &Turn) -> String {
     let speaker = match &turn.speaker {
         Some(name) => format!(
