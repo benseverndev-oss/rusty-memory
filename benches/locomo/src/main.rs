@@ -471,6 +471,17 @@ fn main() {
     );
     let mut attribution = Attribution::default();
     let mut staleness = Staleness::default();
+    // Off unless asked for: a run that writes a file nobody requested is a
+    // surprise, and the aggregates below are what the harness is for.
+    let mut dumped = std::env::var("LOCOMO_DUMP").ok().and_then(|path| {
+        match std::fs::File::create(&path) {
+            Ok(f) => Some(std::io::BufWriter::new(f)),
+            Err(e) => {
+                eprintln!("  could not open {path} for the per-question dump: {e}");
+                None
+            }
+        }
+    });
     // Swept from outside so one build can produce the whole curve, and so the
     // control (0.0) runs the identical code path rather than a different one.
     let boost_by: f32 = std::env::var("LOCOMO_BOOST")
@@ -533,6 +544,28 @@ fn main() {
         let found = hits
             .iter()
             .any(|h| evidence.contains(&h.provenance.source_ref));
+
+        // One JSON object per question, for analysis the aggregates cannot do.
+        // Recall@10 says how often the right turn was surfaced; it cannot say
+        // *which* questions failed, and every interesting comparison from here
+        // -- is a second retriever complementary or merely worse, does a
+        // different embedding rescue the same questions or different ones --
+        // is a set operation over per-question results.
+        if let Some(dump) = dumped.as_mut() {
+            use std::io::Write;
+            let refs: Vec<&str> = hits.iter().map(|h| h.provenance.source_ref.as_str()).collect();
+            let _ = writeln!(
+                dump,
+                "{}",
+                serde_json::json!({
+                    "question": question,
+                    "category": category,
+                    "evidence": evidence.iter().collect::<Vec<_>>(),
+                    "hits": refs,
+                    "found": found,
+                })
+            );
+        }
 
         // Both new measurements run over every question, adversarial included:
         // staleness is a property of what came back, and attribution is the
