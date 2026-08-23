@@ -205,6 +205,20 @@ pub struct PolicyConfig {
     pub attribute: BTreeMap<String, String>,
 }
 
+/// What [`Config::read_for_init`] found at `rmem.toml`'s path.
+pub enum InitConfig {
+    /// No file was there yet -- the ordinary first run.
+    Absent(Config),
+    /// A file was there, and it parsed.
+    Loaded(Config),
+    /// A file was there and did not parse. Carries the same
+    /// [`HostError::Config`] [`Config::load`] would have returned, so a caller
+    /// that decides to refuse can hand it straight back, and a caller that
+    /// decides to proceed anyway -- `init --force` -- still has its words to
+    /// show rather than inventing new ones.
+    Unparsable(HostError),
+}
+
 impl Config {
     /// Read a config file.
     pub fn load(path: &Path) -> Result<Config, HostError> {
@@ -229,10 +243,35 @@ impl Config {
     /// whoever wrote that file with no way to learn it never took effect,
     /// and the `--force` overwrite that follows a successful probe would
     /// then throw the broken file away without them ever seeing why.
+    ///
+    /// `init --force` is the one caller that may want the fallback anyway --
+    /// see `Config::read_for_init`, which this is now built on top of and
+    /// which draws that distinction explicitly rather than leaving it to a
+    /// second, diverging copy of this match.
     pub fn load_or_template(path: &Path) -> Result<Config, HostError> {
+        match Self::read_for_init(path)? {
+            InitConfig::Absent(config) | InitConfig::Loaded(config) => Ok(config),
+            InitConfig::Unparsable(e) => Err(e),
+        }
+    }
+
+    /// What trying to read a config for `rmem init` turned up.
+    ///
+    /// Three outcomes rather than two, because `init` and `init --force` need
+    /// to tell them apart and a plain `Result` cannot: [`InitConfig::Absent`]
+    /// and [`InitConfig::Unparsable`] both end in a template-backed
+    /// [`Config`], but only one of them is silent about it, and which one is
+    /// silent depends on whether the caller passed `--force`. That decision
+    /// belongs to the caller, not here -- this only reports what was found.
+    pub fn read_for_init(path: &Path) -> Result<InitConfig, HostError> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse(path, &text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::from_template()),
+            Ok(text) => match Self::parse(path, &text) {
+                Ok(config) => Ok(InitConfig::Loaded(config)),
+                Err(e) => Ok(InitConfig::Unparsable(e)),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(InitConfig::Absent(Config::from_template()))
+            }
             Err(e) => Err(HostError::Config(format!(
                 "could not read {}: {e}",
                 path.display()
@@ -400,6 +439,8 @@ impl Config {
 
     /// A provider built from this file and the environment.
     pub fn provider(&self) -> Result<HttpProvider, HostError> {
+        validate_base_url(&self.provider.base_url)?;
+
         // `api_key_env` holds the NAME of a variable, and the likeliest way to
         // get this file wrong is to put the key there instead -- the field is
         // called `api_key_env` and a key is what you have in your hand.
@@ -767,6 +808,87 @@ fn strategy(name: &str, where_: &str) -> Result<Strategy, HostError> {
             "{where_} in rmem.toml names a strategy this build does not know; use one of most_complete, longest_value, majority_vote, confidence_majority, first_non_null, unanimous_or_null, most_recent, valid_interval. {NOT_REPEATED}"
         ))),
     }
+}
+
+/// Reject a `base_url` that cannot be a base URL to append a path onto.
+///
+/// Hand-rolled rather than pulled in from the `url` crate, which is already in
+/// the dependency tree via `ureq` but not a direct dependency of this crate --
+/// adding it as one would be the minimal-dependency discipline the rest of
+/// this workspace holds to giving way the moment a real parser looked
+/// convenient. What is checked is narrow on purpose: the scheme is `http://`
+/// or `https://`, the authority names a host and carries no userinfo, and
+/// nothing after the scheme carries a query or a fragment.
+///
+/// # What this closes
+///
+/// `HttpProvider` builds every request as `format!("{base_url}/{path}")`
+/// after trimming one trailing slash, so `base_url =
+/// "https://host/v1?key=X"` silently becomes
+/// `https://host/v1?key=X/embeddings` -- the query string swallows the path
+/// this crate meant to append, so the request never reaches `/embeddings` at
+/// all, and nothing about that fails loudly: the URL is well-formed and
+/// `ureq` sends it exactly as written. A fragment does the same thing one
+/// character later, and userinfo (`user:pass@host`) is accepted by an HTTP
+/// client but is not a shape any provider's base URL legitimately takes, so
+/// there is no cost to refusing it alongside the other two.
+///
+/// # What this does not close
+///
+/// `rm_providers::ProviderError`'s own doc comment names the residual this
+/// workspace has left open on purpose: a provider that echoes the request
+/// path back in an error body -- a 404 naming the route it could not find is
+/// ordinary -- can return a credential that was pasted into `base_url` as a
+/// *path segment* rather than as userinfo or a query. `https://host/v1` with
+/// `sk-proj-XXXX` spliced into the path is structurally indistinguishable
+/// from `https://host/openai/v1` or an Azure deployment path -- both are
+/// ordinary, load-bearing shapes for a provider's base URL -- so telling them
+/// apart means guessing at the *value*, which is the thing six leaks on this
+/// branch have already shown cannot be done reliably. This function narrows
+/// that residual by closing the two shapes that do not require guessing at a
+/// value; it does not close it.
+fn validate_base_url(base_url: &str) -> Result<(), HostError> {
+    const WHERE: &str = "rmem.toml's [provider] base_url";
+
+    let after_scheme = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"));
+    let Some(after_scheme) = after_scheme else {
+        return Err(HostError::Config(format!(
+            "{WHERE} must start with http:// or https://. {NOT_REPEATED}"
+        )));
+    };
+
+    // The authority ends at the first `/`, `?` or `#` -- whichever comes
+    // first marks the end of `host[:port]` and the start of path, query or
+    // fragment. `rest` is everything from there on, checked below for the
+    // two shapes that swallow whatever this crate appends to it.
+    let split = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (authority, rest) = after_scheme.split_at(split);
+
+    if authority.is_empty() {
+        return Err(HostError::Config(format!(
+            "{WHERE} must name a host after the scheme. {NOT_REPEATED}"
+        )));
+    }
+    if authority.contains('@') {
+        return Err(HostError::Config(format!(
+            "{WHERE} must not carry a username or password before the host -- the \"user@\" part of a URL. {NOT_REPEATED}"
+        )));
+    }
+    if rest.contains('?') {
+        return Err(HostError::Config(format!(
+            "{WHERE} must not carry a query string (\"?...\"); the path this crate appends would land inside the query rather than after it. {NOT_REPEATED}"
+        )));
+    }
+    if rest.contains('#') {
+        return Err(HostError::Config(format!(
+            "{WHERE} must not carry a fragment (\"#...\"). {NOT_REPEATED}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1337,6 +1459,92 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
             err.contains("most_recent"),
             "and what a strategy may be: {err}"
         );
+    }
+
+    #[test]
+    fn a_base_url_that_cannot_be_a_base_url_is_refused_before_a_provider_is_ever_built() {
+        // `HttpProvider` builds every request as `format!("{base_url}/{path}")`,
+        // so `base_url = "https://host/v1?key=X"` silently becomes
+        // `https://host/v1?key=X/embeddings` -- the query swallows the path
+        // this crate meant to append, and nothing about that fails loudly.
+        // Awkward fixtures, deliberately: an uppercase scheme (this hand-rolled
+        // check only recognises the literal lowercase prefixes, unlike a real
+        // client which treats a scheme case-insensitively -- narrower on
+        // purpose, and the fixture pins that narrowing rather than assuming
+        // it), userinfo, a query, a fragment, an empty host, and a bare word
+        // that never had a scheme at all.
+        for bad in [
+            "HTTPS://host/v1",
+            "ftp://host/v1",
+            "not-a-url",
+            "https://",
+            "https:///v1",
+            "https://user:pass@host/v1",
+            "https://host/v1?key=X",
+            "https://host?key=X",
+            "https://host/v1#fragment",
+        ] {
+            let mut config = parse(TEMPLATE).unwrap();
+            config.provider.base_url = bad.to_string();
+            match config.provider() {
+                Err(HostError::Config(_)) => {}
+                Err(other) => panic!("{bad:?} should be a config error, got {other:?}"),
+                Ok(_) => panic!("{bad:?} cannot be a base URL to append a path onto"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_base_url_with_an_explicit_port_or_a_deep_path_is_accepted() {
+        // The awkward fixtures above must not overreach: a `:port` in the
+        // authority is not userinfo, and a multi-segment path is not a query
+        // or a fragment. Both are ordinary shapes a real provider's base URL
+        // takes -- Azure deployments in particular nest several segments deep
+        // -- and rejecting them would be exactly the false positive this
+        // narrow a check has to avoid.
+        for ok in [
+            "https://api.openai.com/v1",
+            "https://host:443/v1",
+            "http://localhost:8080",
+            "https://host/openai/deployments/gpt-4o/v1",
+        ] {
+            let mut config = parse(TEMPLATE).unwrap();
+            config.provider.base_url = ok.to_string();
+            config.provider.api_key_env = "RMEM_TEST_DEFINITELY_UNSET_FOR_BASE_URL".to_string();
+            match config.provider() {
+                Err(HostError::MissingKey) => {}
+                Err(other) => panic!("{ok:?} is a valid base URL, got {other:?}"),
+                Ok(_) => panic!("{ok:?}: RMEM_TEST_DEFINITELY_UNSET_FOR_BASE_URL is not set"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_base_url_refusal_never_repeats_the_value_that_was_written() {
+        // The categorical rule: an error names a field, a location or a
+        // config key, never a value read out of the file. The awkward
+        // fixture: a canary containing a backtick, spliced into the query
+        // shape -- the one this crate's own doc comment says a fuzz proved
+        // unfilterable when it reaches a message at all.
+        let canary = "CANARY-`-0123456789abcdef";
+        for bad in [
+            format!("https://host/v1?key={canary}"),
+            format!("https://{canary}@host/v1"),
+            format!("not-a-url-{canary}"),
+        ] {
+            let mut config = parse(TEMPLATE).unwrap();
+            config.provider.base_url = bad.clone();
+            let err = match config.provider() {
+                Err(e) => e,
+                Ok(_) => panic!("{bad:?} cannot be a base URL to append a path onto"),
+            };
+            let text = err.to_string();
+            assert!(!text.contains(canary), "{text}");
+            assert!(!text.contains('`'), "{text}");
+            let debug = format!("{err:?}");
+            assert!(!debug.contains(canary), "{debug}");
+            assert!(text.contains("base_url"), "{text}");
+        }
     }
 
     #[test]
