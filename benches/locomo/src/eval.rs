@@ -258,7 +258,9 @@ impl Attribution {
         // shape, and a flat one is the honest report that no cutoff works.
         println!("  margin   answered right   refused right   separation (J)");
         let mut best = (f32::NEG_INFINITY, 0.0f32);
-        for margin in [-1.0f32, -0.15, -0.10, -0.05, -0.02, 0.0, 0.02, 0.05, 0.10, 1.0] {
+        for margin in [
+            -1.0f32, -0.15, -0.10, -0.05, -0.02, 0.0, 0.02, 0.05, 0.10, 1.0,
+        ] {
             let (ar, _, rr, _) = self.at(margin);
             let sens = ar as f64 / answerable as f64;
             let spec = rr as f64 / refusable as f64;
@@ -518,11 +520,7 @@ mod tests {
         // else" is the trap; "some of it does" is an ordinary multi-hop
         // question, and 100% of multi-hop questions in the corpus are that.
         assert_eq!(
-            expected(
-                &["D1:1".into(), "D2:3".into()],
-                "Caroline",
-                &speakers()
-            ),
+            expected(&["D1:1".into(), "D2:3".into()], "Caroline", &speakers()),
             Some(Expected::Answer)
         );
     }

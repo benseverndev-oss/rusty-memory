@@ -389,6 +389,59 @@ impl Engine {
         })
     }
 
+    /// Record an observation about an entity the caller has already identified.
+    ///
+    /// [`Engine::remember`] works out which entity an observation belongs to by
+    /// scoring its mention against everything already known. That is right when
+    /// the identity has to be inferred from what somebody said, which is the
+    /// case this engine was built for.
+    ///
+    /// It is wrong when the caller holds the identifier itself -- a decision's
+    /// title, a row key, an id from another system. There, "close enough" is
+    /// not a better answer than "not found": it is a silently wrong one. A
+    /// decision recorded as `Adopt SQLite WAL` scored above the match threshold
+    /// against an existing `Adopt SQLite` and was written onto it, keeping the
+    /// older title, so the new decision existed nowhere and the command that
+    /// wrote it reported success.
+    ///
+    /// So this door takes the answer instead of computing it. `None` creates a
+    /// new entity. Nothing is scored, no review is filed, and no existing
+    /// entity is considered however close its name -- which is the guarantee,
+    /// not an optimisation.
+    ///
+    /// Naming an entity the store does not have is [`EngineError::UnknownEntity`],
+    /// on the same rule as every other write path here: asking *about* an
+    /// unknown entity is a question with a true answer, writing to one is a bug
+    /// in the caller.
+    pub fn remember_as(
+        &mut self,
+        entity: Option<StableId>,
+        obs: Observation,
+    ) -> Result<(StableId, AssertionId), EngineError> {
+        // Door first, as in `remember`: a refusal costs nothing, and in
+        // particular does not leave a fresh entity behind with no assertion on
+        // it -- which `create_entity` below would do if the vector were only
+        // checked on the way into the index.
+        self.index.check(&obs.embedding)?;
+
+        let entity = match entity {
+            Some(id) => {
+                if self.identity_of(id).is_none() {
+                    return Err(EngineError::UnknownEntity(id));
+                }
+                // Fold in any field this mention carries that the entity does
+                // not, exactly as `remember` does when it merges. Without this
+                // an entity identified from outside never gains blocking keys,
+                // and would be invisible to `remember` for evermore.
+                self.remember_identity(id, &obs.mention);
+                id
+            }
+            None => self.create_entity(&obs),
+        };
+        let assertion = self.write(entity, &obs)?;
+        Ok((entity, assertion))
+    }
+
     /// Entities sharing at least one blocking key with this mention.
     ///
     /// Deduplicated: a pair sharing several keys is one candidate, not several.

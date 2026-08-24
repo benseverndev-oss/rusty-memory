@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rm_engine::{
     Believed, Embedder, Engine, Ingested, Interval, Metric, Observation, Prepared, Provenance,
-    Query, Recalled, Record, Remembered, ReviewId, Source, StableId, Supersession, Timestamp,
+    Query, Recalled, Record, ReviewId, Source, StableId, Supersession, Timestamp,
 };
 use rm_extract::{Completer, Extraction, Turn};
 
@@ -104,6 +104,10 @@ pub enum Outcome {
         supersedes_unknown: Option<String>,
     },
     Decisions(Vec<DecisionLine>),
+    /// One decision read in full. `None` when no decision has that title --
+    /// reported rather than empty, because "no such decision" and "a decision
+    /// with nothing in it" are different answers.
+    Decision(Option<Box<DecisionDetail>>),
 }
 
 /// One decision as a caller sees it.
@@ -114,12 +118,49 @@ pub struct DecisionLine {
     pub status: String,
     pub choice: String,
     pub because: Option<String>,
-    /// Whether anything later replaced this decision's `choice`.
+    /// Whether the `choice` shown beside this is the one that stands.
     ///
-    /// Read from the store rather than from `status`, so a decision retired by
-    /// being re-decided under the same title reads as superseded even though
-    /// nobody set a status field.
+    /// About the value being displayed, not about the title's whole past. A
+    /// title re-decided under itself shows its *latest* choice, and that choice
+    /// stands -- marking it replaced said the opposite of what the line shows.
+    /// What makes it false is another decision superseding this one, which is
+    /// the case where the displayed value really is out of date.
+    ///
+    /// The count of earlier choices has not gone away; it is [`Self::revisions`],
+    /// which is a different question and now reads as one.
     pub still_stands: bool,
+    /// How many times this title has been decided. One unless it was
+    /// re-decided under itself.
+    pub revisions: usize,
+    /// The decision that replaced this one, when the chain records it.
+    ///
+    /// Marking a decision retired without naming its successor tells a reader
+    /// that the answer they are holding is wrong and leaves them no way to the
+    /// right one. `None` on a decision that stands, and also on one retired
+    /// before supersession was recorded as an edge.
+    pub superseded_by: Option<(StableId, String)>,
+}
+
+/// One decision, in full, with the chain it sits in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionDetail {
+    pub entity: StableId,
+    pub title: String,
+    pub status: String,
+    pub choice: String,
+    pub because: Option<String>,
+    pub context: Option<String>,
+    pub still_stands: bool,
+    /// What this decision replaced, most recent first, following the chain back
+    /// as far as it goes.
+    pub supersedes: Vec<(StableId, String)>,
+    /// What replaced this decision, and what replaced that, ending at whatever
+    /// stands now. Empty when this is the one that stands.
+    pub superseded_by: Vec<(StableId, String)>,
+    /// Every `choice` this title has held, oldest first, with when it was
+    /// recorded. One entry is a decision made once; more is a decision
+    /// re-decided under the same title.
+    pub history: Vec<(Timestamp, String)>,
 }
 
 /// The attributes a decision is recorded under, and whether each admits one
@@ -137,6 +178,17 @@ pub struct DecisionLine {
 /// and that is precisely what `Standing::Corrected` should say about the old
 /// one.
 const DECISION_FIELDS: [&str; 4] = ["status", "choice", "because", "context"];
+
+/// The edge a decision draws to the one it replaced.
+///
+/// An edge rather than a field on either side, because a supersession is a
+/// fact about the *pair*. Written on the old decision it would be a
+/// `superseded_by` that the next supersession has to correct; written on the
+/// new one it would be a `supersedes` that says nothing when you are holding
+/// the old one and asking what happened to it. As an edge it is one write and
+/// both directions read it -- `edges_from` for what this replaced,
+/// `edges_into` for what replaced this.
+pub const SUPERSEDES: &str = "supersedes";
 
 /// Write a config, with the embedding dimension taken from the model.
 ///
@@ -491,6 +543,9 @@ struct FieldWrite {
 /// sequential embedding calls with the store's exclusive lock held, which made
 /// one agent recording a decision a three-second outage for every other writer.
 pub struct DecidePlan {
+    /// The title of the decision being recorded. Its identity, not a hint --
+    /// see [`commit_decide`].
+    title: String,
     observed_at: Timestamp,
     session: String,
     /// The retirement of the decision this one replaces, embedded whether or
@@ -545,6 +600,7 @@ pub fn plan_decide(
     }
 
     Ok(DecidePlan {
+        title: title.to_string(),
         observed_at,
         session: session.to_string(),
         retire,
@@ -553,8 +609,26 @@ pub fn plan_decide(
 }
 
 /// The half of [`decide`] that needs the store. Touches no network.
+///
+/// # A title is an identifier, so it is matched exactly
+///
+/// Every write below goes through [`Engine::remember_as`] against an entity
+/// found by exact title, rather than through `Engine::remember`, which would
+/// resolve the title against every similar one already in the store.
+///
+/// That resolver is right for a name somebody said in a sentence and wrong for
+/// a title somebody chose. Measured before this: `Adopt SQLite` followed by
+/// `Adopt SQLite WAL` scored above the match threshold and became one entity,
+/// keeping the first title, so the second decision existed nowhere while the
+/// command reported success. Worse with `--supersedes`, because the two halves
+/// of this function disagreed about what "the same title" meant --
+/// `find_decision` exactly, the write fuzzily -- so a decision could retire an
+/// old one by exact title and then land its own fields on that same retired
+/// entity. The store was left holding one decision, under the old title,
+/// marked superseded, and the new one was gone.
 pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, HostError> {
     let DecidePlan {
+        title,
         observed_at,
         session,
         retire,
@@ -570,16 +644,46 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
         match find_decision(engine, &old_title) {
             None => supersedes_unknown = Some(old_title),
             Some(old) => {
-                write_field(engine, &write, observed_at, &session)?;
+                write_field(engine, Some(old), &write, observed_at, &session)?;
                 superseded = Some((old, old_title));
             }
         }
     }
 
-    let mut entity = None;
+    // Resolved once, and by exact title. `None` means the store has no
+    // decision under this title and the first write below creates one; every
+    // write after that names the entity the first returned, so the fields of
+    // one decision cannot scatter across two entities.
+    let mut entity = find_decision(engine, &title);
     for write in &fields {
-        let landed = write_field(engine, write, observed_at, &session)?;
-        entity.get_or_insert(landed);
+        let landed = write_field(engine, entity, write, observed_at, &session)?;
+        entity = Some(landed);
+    }
+
+    // The link, once both ends exist. Retiring the old decision above set its
+    // status and nothing else, which left the chain unrecoverable: a reader
+    // holding a decision marked `superseded` could see that something replaced
+    // it and had no way to find out what. That is the one question a decision
+    // log exists to answer.
+    //
+    // Written after the fields because the new decision may not have had an
+    // entity until the loop above created one, and an edge needs both ends.
+    if let (Some((old, _)), Some(new)) = (&superseded, entity) {
+        // A decision that supersedes itself is not a chain, it is a loop, and
+        // `rm_store::relate` refuses it -- which would abort a `decide` whose
+        // fields are already written. It arises from `--supersedes` naming the
+        // decision being written, so it is checked rather than risked.
+        if new != *old {
+            engine
+                .relate(
+                    new,
+                    SUPERSEDES,
+                    *old,
+                    Interval::since(observed_at),
+                    Provenance::new(Source::UserAssertion, observed_at, &session),
+                )
+                .map_err(|e| HostError::Refused(e.to_string()))?;
+        }
     }
 
     Ok(Outcome::Decided {
@@ -616,20 +720,124 @@ pub fn decisions(engine: &Engine) -> Result<Outcome, HostError> {
         let Some(choice) = latest("choice") else {
             continue;
         };
+        let status = latest("status").unwrap_or_else(|| "accepted".into());
+        // Read once: it decides the mark and it is shown on the line.
+        let superseded_by = engine
+            .edges_into(id, Timestamp::MAX, Timestamp::MAX)
+            .iter()
+            .find(|e| e.predicate == SUPERSEDES)
+            .map(|e| (e.subject, title_of(engine, e.subject)));
         out.push(DecisionLine {
             entity: id,
             title: record.get("name").unwrap_or_default().to_string(),
-            status: latest("status").unwrap_or_else(|| "accepted".into()),
+            // A decision stands while nothing later replaced it, and there are
+            // two ways to be replaced. Re-deciding under the same title writes
+            // a second `choice`, and nobody sets a status when they do it --
+            // which is why the history is read at all rather than trusting the
+            // field. Being named by another decision's `--supersedes` writes
+            // the status and leaves the choice alone.
+            //
+            // Reading only the first made a decision retired by `--supersedes`
+            // print as standing while printing `[superseded]` beside itself,
+            // which is the one combination that cannot be true.
+            still_stands: superseded_by.is_none() && status != "superseded",
+            revisions: engine.store_history(id, "choice").len(),
+            superseded_by,
+            status,
             choice,
             because: latest("because"),
-            // A decision stands while nothing later replaced its choice. One
-            // version is the common case and stands trivially; a second means
-            // it was re-decided.
-            still_stands: engine.store_history(id, "choice").len() == 1,
         });
     }
     out.sort_by_key(|d| std::cmp::Reverse(d.entity));
     Ok(Outcome::Decisions(out))
+}
+
+/// One decision in full, found by exact title.
+///
+/// The command the log exists for. `decisions` says *that* something was
+/// replaced; this says by what, and walks the chain to whatever stands now, so
+/// a reader who arrives at a retired decision is carried to the live one
+/// rather than left to guess.
+pub fn decision(engine: &Engine, title: &str) -> Result<Outcome, HostError> {
+    let Some(id) = find_decision(engine, title) else {
+        return Ok(Outcome::Decision(None));
+    };
+    let latest = |a: &str| {
+        engine
+            .store_history(id, a)
+            .last()
+            .and_then(|v| v.value.clone())
+    };
+    let history: Vec<(Timestamp, String)> = engine
+        .store_history(id, "choice")
+        .iter()
+        .filter_map(|v| Some((v.provenance.observed_at, v.value.clone()?)))
+        .collect();
+    let status = latest("status").unwrap_or_else(|| "accepted".into());
+    let superseded_by = chain(engine, id, Direction::Forward);
+
+    Ok(Outcome::Decision(Some(Box::new(DecisionDetail {
+        entity: id,
+        title: title.to_string(),
+        choice: latest("choice").unwrap_or_default(),
+        because: latest("because"),
+        context: latest("context"),
+        still_stands: superseded_by.is_empty() && status != "superseded",
+        status,
+        supersedes: chain(engine, id, Direction::Back),
+        superseded_by,
+        history,
+    }))))
+}
+
+/// Which way along the supersession edges to walk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// Towards what this decision replaced.
+    Back,
+    /// Towards whatever stands now.
+    Forward,
+}
+
+/// Follow the supersession edges from `start`, not including it.
+///
+/// Cycle-guarded. `commit_decide` refuses to link a decision to itself, but a
+/// longer loop -- A supersedes B, B supersedes A, written by two commands that
+/// each looked reasonable -- is reachable, and a walk that trusted the data
+/// would hang rather than report it. The visited set costs nothing on a chain
+/// of realistic length and turns an infinite loop into a short answer.
+fn chain(engine: &Engine, start: StableId, dir: Direction) -> Vec<(StableId, String)> {
+    let mut out = Vec::new();
+    let mut seen = vec![start];
+    let mut at = start;
+    loop {
+        let edges = match dir {
+            Direction::Back => engine.edges_from(at, Timestamp::MAX, Timestamp::MAX),
+            Direction::Forward => engine.edges_into(at, Timestamp::MAX, Timestamp::MAX),
+        };
+        let next = edges
+            .iter()
+            .find(|e| e.predicate == SUPERSEDES)
+            .map(|e| match dir {
+                Direction::Back => e.object,
+                Direction::Forward => e.subject,
+            });
+        let Some(next) = next else { return out };
+        if seen.contains(&next) {
+            return out;
+        }
+        seen.push(next);
+        out.push((next, title_of(engine, next)));
+        at = next;
+    }
+}
+
+/// The title a decision entity carries, or a placeholder naming the entity.
+fn title_of(engine: &Engine, id: StableId) -> String {
+    engine
+        .identity_of(id)
+        .and_then(|r| r.get("name").map(str::to_string))
+        .unwrap_or_else(|| format!("(untitled entity {id})"))
 }
 
 /// The entity a decision with this title lives on, if the store has one.
@@ -667,8 +875,15 @@ fn embed_field(
     })
 }
 
+/// Write one decision field onto `entity`, or onto a new one when `None`.
+///
+/// [`Engine::remember_as`] rather than `Engine::remember`: the caller has
+/// already decided which entity this is, by exact title. See
+/// [`commit_decide`] for what happens when that decision is left to the
+/// resolver instead.
 fn write_field(
     engine: &mut Engine,
+    entity: Option<StableId>,
     write: &FieldWrite,
     observed_at: Timestamp,
     session: &str,
@@ -679,29 +894,28 @@ fn write_field(
         value,
         embedding,
     } = write;
-    let landed = engine
-        .remember(Observation {
-            kind: "decision".to_string(),
-            mention: Record::new().with("name", title).with("kind", "decision"),
-            attribute: attribute.to_string(),
-            value: Some(value.to_string()),
-            valid: Interval::since(observed_at),
-            // `UserAssertion`, not `ToolOutput`: nobody inferred this from a
-            // sentence. Somebody decided it and said so.
-            provenance: Provenance::new(Source::UserAssertion, observed_at, session),
-            supersession: Supersession::Corrects,
-            embedding: embedding.clone(),
-        })
+    let (landed, _) = engine
+        .remember_as(
+            entity,
+            Observation {
+                kind: "decision".to_string(),
+                mention: Record::new().with("name", title).with("kind", "decision"),
+                attribute: attribute.to_string(),
+                value: Some(value.to_string()),
+                valid: Interval::since(observed_at),
+                // `UserAssertion`, not `ToolOutput`: nobody inferred this from
+                // a sentence. Somebody decided it and said so.
+                provenance: Provenance::new(Source::UserAssertion, observed_at, session),
+                supersession: Supersession::Corrects,
+                embedding: embedding.clone(),
+            },
+        )
         .map_err(|e| HostError::Refused(e.to_string()))?;
-    Ok(match landed {
-        Remembered::Merged { entity, .. }
-        | Remembered::Created { entity, .. }
-        | Remembered::CreatedPendingReview { entity, .. } => entity,
-    })
+    Ok(landed)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testing::TempDir;
 
@@ -847,7 +1061,7 @@ mod tests {
       "relations":[{"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
       "closures":[]}"#;
 
-    fn engine() -> Engine {
+    pub(crate) fn engine() -> Engine {
         let config: crate::config::Config = toml::from_str(crate::config::TEMPLATE).unwrap();
         Engine::new(
             VectorIndex::new(3, Metric::Cosine),
@@ -1021,6 +1235,166 @@ mod tests {
 
     // ---- decisions ---------------------------------------------------------
 
+    /// Every decision in the store, as (title, entity, still standing).
+    fn recorded(e: &mut Engine) -> Vec<(String, StableId, bool)> {
+        let Outcome::Decisions(ds) = decisions(e).unwrap() else {
+            panic!("decisions did not return decisions")
+        };
+        ds.iter()
+            .map(|d| (d.title.clone(), d.entity, d.still_stands))
+            .collect()
+    }
+
+    /// Two decisions whose titles are nearly the same are still two decisions.
+    ///
+    /// They were one. `decide` wrote through `Engine::remember`, which scores a
+    /// title against every similar one already stored, and these two land above
+    /// the match threshold: the second decision's fields went onto the first
+    /// entity, which kept the *first* title, so the second existed nowhere and
+    /// the command reported success.
+    ///
+    /// The pair is not contrived -- it is the shape a real log takes, a
+    /// decision and a later refinement of it. `Pin the toolchain` against
+    /// `Pin the toolchain version` stays under the threshold and always did,
+    /// so it would not have caught this.
+    #[test]
+    fn a_decision_is_never_merged_into_one_whose_title_merely_resembles_it() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Adopt SQLite",
+            "yes",
+            None,
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Adopt SQLite WAL",
+            "also yes",
+            None,
+            None,
+            None,
+            200,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let mut titles: Vec<String> = recorded(&mut e).into_iter().map(|d| d.0).collect();
+        titles.sort();
+        assert_eq!(titles, ["Adopt SQLite", "Adopt SQLite WAL"]);
+    }
+
+    /// The same title twice is the same decision, re-decided.
+    ///
+    /// The other half of the rule above, and the one that makes supersession
+    /// work at all: exact means exact, so it still matches.
+    #[test]
+    fn deciding_again_under_the_same_title_lands_on_the_same_entity() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Adopt SQLite",
+            "yes",
+            None,
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Adopt SQLite",
+            "on reflection, no",
+            None,
+            None,
+            None,
+            200,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let all = recorded(&mut e);
+        assert_eq!(all.len(), 1, "one title is one decision: {all:?}");
+        let Outcome::About(Believed::Value(choice)) =
+            about(&e, all[0].1, "choice", Timestamp::MAX, Timestamp::MAX).unwrap()
+        else {
+            panic!("no choice on the re-decided entity")
+        };
+        assert_eq!(choice, "on reflection, no");
+    }
+
+    /// Superseding a decision does not consume the one doing the superseding.
+    ///
+    /// The sharpest form of the bug, because the two halves of `commit_decide`
+    /// disagreed about what "the same title" meant: `find_decision` matched
+    /// exactly and the write matched fuzzily. So this call retired `Adopt
+    /// SQLite` by exact title and then wrote its own fields onto that same
+    /// retired entity. The store was left holding one decision, under the old
+    /// title, marked superseded -- the new one was gone, and the command said
+    /// it had worked.
+    #[test]
+    fn the_decision_doing_the_superseding_survives_it() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Adopt SQLite",
+            "yes",
+            None,
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        let out = decide(
+            &mut e,
+            "Adopt SQLite WAL",
+            "also yes",
+            None,
+            None,
+            Some("Adopt SQLite"),
+            200,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let Outcome::Decided {
+            entity, superseded, ..
+        } = out
+        else {
+            panic!("not a decision")
+        };
+        let (old, _) = superseded.expect("it should have retired the old one");
+        assert_ne!(
+            entity, old,
+            "the new decision landed on the entity it just retired"
+        );
+
+        let all = recorded(&mut e);
+        assert_eq!(all.len(), 2, "both decisions should exist: {all:?}");
+        let stands: Vec<&(String, StableId, bool)> = all.iter().filter(|d| d.2).collect();
+        assert_eq!(
+            stands.len(),
+            1,
+            "exactly one should still stand: {stands:?}"
+        );
+        assert_eq!(stands[0].0, "Adopt SQLite WAL");
+    }
+
     #[test]
     fn a_decision_is_recorded_without_asking_a_model_anything() {
         // The point of the separate path. `StubProvider` errors if asked to
@@ -1129,9 +1503,165 @@ mod tests {
         let queue: Vec<_> = lines.iter().filter(|l| l.title == "Pick a queue").collect();
         assert_eq!(queue.len(), 1, "one decision, two versions of its choice");
         assert_eq!(queue[0].choice, "NATS", "the latest choice is the answer");
+        // `still_stands` is about the choice on the line, and the line shows
+        // NATS. This used to assert the opposite -- the field then counted any
+        // earlier choice as a replacement -- and the rendering that came out of
+        // it marked "Pick a queue -> NATS" as replaced, which is the answer
+        // being current and told otherwise. The fact that assertion cared about
+        // is the revision count, which says it without contradicting the line.
         assert!(
-            !queue[0].still_stands,
-            "and the store knows the earlier one was replaced"
+            queue[0].still_stands,
+            "NATS is the current choice and nothing supersedes this decision"
+        );
+        assert_eq!(
+            queue[0].revisions, 2,
+            "and the store still knows there was an earlier choice"
+        );
+    }
+
+    /// A retired decision names what replaced it, and the chain leads to the
+    /// one that stands.
+    ///
+    /// The question a decision log exists to answer, and it had no answer:
+    /// `--supersedes` wrote `status = superseded` on the old decision and
+    /// nothing else, so a reader holding it could see that something replaced
+    /// it and had no way to find out what. Checked over two hops, because one
+    /// hop can be faked by reading the status.
+    #[test]
+    fn a_retired_decision_leads_to_the_one_that_stands() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        for (title, choice, replaces) in [
+            ("Store as one JSON file", "whole-file rewrite", None),
+            (
+                "Store in SQLite",
+                "incremental",
+                Some("Store as one JSON file"),
+            ),
+            ("Store in Postgres", "a server", Some("Store in SQLite")),
+        ] {
+            decide(&mut e, title, choice, None, None, replaces, 100, "t", &stub).unwrap();
+        }
+
+        let Outcome::Decision(Some(d)) = decision(&e, "Store as one JSON file").unwrap() else {
+            panic!("the oldest decision should be readable")
+        };
+        assert!(!d.still_stands);
+        assert_eq!(
+            d.superseded_by
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["Store in SQLite", "Store in Postgres"],
+            "the walk should reach the decision that stands, not stop at the first hop"
+        );
+
+        // And back the other way, from the live one.
+        let Outcome::Decision(Some(d)) = decision(&e, "Store in Postgres").unwrap() else {
+            panic!()
+        };
+        assert!(d.still_stands);
+        assert!(d.superseded_by.is_empty());
+        assert_eq!(
+            d.supersedes
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["Store in SQLite", "Store as one JSON file"]
+        );
+    }
+
+    /// A cycle in the chain is reported, not walked forever.
+    ///
+    /// `commit_decide` refuses to link a decision to itself, so the short loop
+    /// cannot be written. A longer one can: two commands that each looked
+    /// reasonable leave A superseding B and B superseding A, and a walk that
+    /// trusted the data would hang instead of answering.
+    #[test]
+    fn a_supersession_cycle_terminates() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(&mut e, "A", "first", None, None, None, 100, "t", &stub).unwrap();
+        decide(
+            &mut e,
+            "B",
+            "second",
+            None,
+            None,
+            Some("A"),
+            200,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        // Closes the loop: A now supersedes B, which already supersedes A.
+        decide(&mut e, "A", "third", None, None, Some("B"), 300, "t", &stub).unwrap();
+
+        let Outcome::Decision(Some(d)) = decision(&e, "A").unwrap() else {
+            panic!()
+        };
+        // Exactly one hop each way, then the revisit stops it. Asserted
+        // exactly rather than as a bound: a walk that returned nothing would
+        // also satisfy "did not loop forever", and would be a different bug
+        // wearing this test as cover.
+        assert_eq!(
+            d.supersedes
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["B"],
+            "one hop back, then the cycle is noticed"
+        );
+        assert_eq!(
+            d.superseded_by
+                .iter()
+                .map(|(_, t)| t.as_str())
+                .collect::<Vec<_>>(),
+            ["B"],
+            "and one hop forward"
+        );
+    }
+
+    /// Naming yourself in `--supersedes` does not abort the write.
+    ///
+    /// `rm_store::relate` refuses a self-edge, and the fields are already
+    /// written by the time the edge is drawn -- so an unchecked `relate` would
+    /// fail a command whose work had landed.
+    #[test]
+    fn a_decision_may_not_supersede_itself_and_is_still_recorded() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e, "Only one", "first", None, None, None, 100, "t", &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Only one",
+            "second",
+            None,
+            None,
+            Some("Only one"),
+            200,
+            "t",
+            &stub,
+        )
+        .expect("naming itself must not fail the write");
+
+        let Outcome::Decision(Some(d)) = decision(&e, "Only one").unwrap() else {
+            panic!()
+        };
+        assert_eq!(d.choice, "second");
+        assert!(d.supersedes.is_empty(), "no self-edge was drawn");
+    }
+
+    /// A title the store does not have is said so, not answered emptily.
+    #[test]
+    fn reading_a_decision_that_does_not_exist_says_so() {
+        let e = engine();
+        assert_eq!(
+            decision(&e, "never recorded").unwrap(),
+            Outcome::Decision(None)
         );
     }
 

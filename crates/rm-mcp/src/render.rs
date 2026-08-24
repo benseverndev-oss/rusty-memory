@@ -188,6 +188,74 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }
         }
 
+        Outcome::Decision(None) => Rendered {
+            text: "No decision has that title. Titles are matched exactly -- call `decisions` to see them as recorded.".to_string(),
+            structured: json!({"found": false}),
+        },
+        Outcome::Decision(Some(d)) => {
+            let mut text = format!("{} [{}]\n  {}\n", d.title, d.status, d.choice);
+            if let Some(why) = &d.because {
+                text.push_str(&format!("  because {why}\n"));
+            }
+            if let Some(ctx) = &d.context {
+                text.push_str(&format!("  context {ctx}\n"));
+            }
+            // Loud, and first after the fields, because the model reading this
+            // is about to act on the choice above. "It stands" and "it does
+            // not, here is what does" are the two things it needs before it
+            // uses any of it.
+            if d.still_stands {
+                text.push_str("\nTHIS IS THE DECISION THAT STANDS.\n");
+            } else if let Some((id, t)) = d.superseded_by.last() {
+                text.push_str(&format!(
+                    "\nDO NOT ACT ON THE CHOICE ABOVE -- IT WAS REPLACED.\nWhat stands now is entity {id}, {t:?}. Read that one.\n"
+                ));
+            } else {
+                text.push_str(
+                    "\nThis title was re-decided; the choice above is the latest under it.\n",
+                );
+            }
+            if !d.supersedes.is_empty() {
+                text.push_str("\nIt replaced, most recent first:\n");
+                for (id, t) in &d.supersedes {
+                    text.push_str(&format!("  entity {id}  {t}\n"));
+                }
+            }
+            if d.history.len() > 1 {
+                text.push_str(&format!(
+                    "\nDecided {} times under this title, oldest first:\n",
+                    d.history.len()
+                ));
+                for (at, choice) in &d.history {
+                    text.push_str(&format!("  {at}  {choice}\n"));
+                }
+            }
+            Rendered {
+                text,
+                structured: json!({
+                    "found": true,
+                    "entity": d.entity,
+                    "title": d.title,
+                    "status": d.status,
+                    "choice": d.choice,
+                    "because": d.because,
+                    "context": d.context,
+                    // The field to branch on. False means the choice above is
+                    // out of date and `superseded_by` names what is not.
+                    "still_stands": d.still_stands,
+                    "supersedes": d.supersedes.iter()
+                        .map(|(id, t)| json!({"entity": id, "title": t}))
+                        .collect::<Vec<_>>(),
+                    "superseded_by": d.superseded_by.iter()
+                        .map(|(id, t)| json!({"entity": id, "title": t}))
+                        .collect::<Vec<_>>(),
+                    "history": d.history.iter()
+                        .map(|(at, c)| json!({"recorded_at": at, "choice": c}))
+                        .collect::<Vec<_>>(),
+                }),
+            }
+        }
+
         Outcome::Decisions(lines) if lines.is_empty() => Rendered {
             text: "No decisions have been recorded.".to_string(),
             structured: json!({"decisions": []}),
@@ -200,10 +268,10 @@ pub fn render(outcome: &Outcome) -> Rendered {
                     d.entity,
                     d.title,
                     d.status,
-                    if d.still_stands {
-                        ""
-                    } else {
-                        "  (replaced by something later)"
+                    match &d.superseded_by {
+                        Some((_, t)) => format!("  (replaced by {t:?})"),
+                        None if d.revisions > 1 => format!("  (revised {} times)", d.revisions),
+                        None => String::new(),
                     },
                     d.choice
                 ));
