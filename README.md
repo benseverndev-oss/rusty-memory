@@ -109,6 +109,24 @@ Re-deciding under the same title is the other way a decision changes, and it is
 a different thing: the title keeps its entity, the new choice is what stands,
 and `decision` shows every choice it has held with the date each was recorded.
 
+A decision's `status` is one of `proposed`, `accepted`, `rejected` or
+`deprecated` — a closed vocabulary, because the point of a status is that a
+reader can branch on it, and an open one lets `rejected`, `Rejected` and
+`declined` mean one thing to a person and three to a program. `superseded` is
+not settable: it claims a *specific* other decision replaced this one, and
+written alone it produces the state the edge exists to prevent, so it is
+refused with a pointer to `--supersedes`.
+
+The status that earns the feature is `rejected`. An option considered and turned
+down, with the reason it lost, is the entry that stops a settled question being
+reopened — and it is exactly what could not be recorded before, since every
+decision was accepted and the only way to write a rejection was to accept the
+word "no".
+
+```sh
+rmem decide "Retrieval reranking" "a cross-encoder over the top 200"   --status rejected   --because "the k-curve is still 0.926 at k=200 -- there is nothing to rerank into"
+```
+
 The answer keeps its three states across the wire. `{"believed": "absent"}` is
 "someone said there is none" and `{"believed": "unknown"}` is "it has never come
 up", and the text block says which in words too, because that is the half most

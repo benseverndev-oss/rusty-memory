@@ -165,7 +165,12 @@ pub fn render(outcome: &Outcome) -> String {
                     out.push_str(&format!("    revised {} times\n", d.revisions));
                 }
             }
-            out.push_str("\n~ marks a decision something later replaced.\n");
+            // The mark used to mean "replaced", which was the only way to
+            // stop standing when `accepted` and `superseded` were the whole
+            // vocabulary. With `proposed`, `rejected` and `deprecated` it has
+            // to mean the more useful thing -- do not act on this -- and the
+            // status beside each one says which reason applies.
+            out.push_str("\n~ marks a decision that is not in force: see its status.\n");
             out
         }
 

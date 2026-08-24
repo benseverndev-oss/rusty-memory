@@ -117,7 +117,7 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": "decide",
             "title": "Record a decision",
-            "description": "Record a decision so it can be found and cited later. Use this for choices with reasons behind them -- an approach taken, a library picked, a convention agreed -- not for ordinary facts, which belong in remember. Unlike remember this never guesses a shape: the title, choice, reason and context are stored under those exact names, so a decision stays findable and a later decision can retire it by title. Give a title you would search for. If this replaces an earlier decision, name it in supersedes and the old one is marked retired.",
+            "description": "Record a decision so it can be found and cited later. Use this for choices with reasons behind them -- an approach taken, a library picked, a convention agreed -- not for ordinary facts, which belong in remember. Unlike remember this never guesses a shape: the title, choice, reason and context are stored under those exact names, so a decision stays findable and a later decision can retire it by title. Give a title you would search for. Record options you considered and turned down too, with status rejected and the reason in because -- a rejected option with its reason is what stops the same question being reopened later. If this replaces an earlier decision, name it in supersedes and the old one is marked retired.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -129,9 +129,14 @@ pub fn definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "What was decided."
                     },
+                    "status": {
+                        "type": "string",
+                        "enum": ["proposed", "accepted", "rejected", "deprecated"],
+                        "description": "Where this decision stands. Defaults to accepted. Use proposed for something still being weighed, rejected for an option considered and turned down, deprecated for one being phased out. Not settable to superseded -- that means a specific other decision replaced this one, so use supersedes on that decision instead, which records both ends."
+                    },
                     "because": {
                         "type": "string",
-                        "description": "Why, including what it was chosen over. The part that is worth having in six months."
+                        "description": "Why, including what it was chosen over. The part that is worth having in six months. On a rejected option this is the measurement or reason it lost, which is the whole value of recording it."
                     },
                     "context": {
                         "type": "string",
@@ -221,6 +226,7 @@ pub enum Call {
     Decide {
         title: String,
         choice: String,
+        status: Option<String>,
         because: Option<String>,
         context: Option<String>,
         supersedes: Option<String>,
@@ -300,6 +306,7 @@ impl Call {
             "decide" => Ok(Call::Decide {
                 title: string(arguments, "title")?,
                 choice: string(arguments, "choice")?,
+                status: optional_string(arguments, "status")?,
                 because: optional_string(arguments, "because")?,
                 context: optional_string(arguments, "context")?,
                 supersedes: optional_string(arguments, "supersedes")?,
