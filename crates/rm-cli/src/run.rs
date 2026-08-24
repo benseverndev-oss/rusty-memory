@@ -283,9 +283,21 @@ pub fn run(
                 (Command::Recall { k, .. }, Some(vector)) => {
                     command::commit_recall(engine, vector, k, weak_below)
                 }
-                (Command::About { entity, attribute }, _) => {
-                    command::about(engine, entity, &attribute, now, now)
-                }
+                (
+                    Command::About {
+                        entity,
+                        attribute,
+                        valid_at,
+                        as_of,
+                    },
+                    _,
+                ) => command::about(
+                    engine,
+                    entity,
+                    &attribute,
+                    valid_at.unwrap_or(now),
+                    as_of.unwrap_or(now),
+                ),
                 (Command::ReviewList, _) => command::review_list(engine),
                 (Command::Decisions { status }, _) => command::decisions(engine, status.as_deref()),
                 (Command::Decision { title }, _) => command::decision(engine, &title),

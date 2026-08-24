@@ -40,7 +40,10 @@ rmem — a memory that resolves contradictions deterministically
     rmem remember \"<turn>\" [--speaker <name>]
                                      extract a turn and record what it said
     rmem recall \"<query>\" [-k N]     find assertions near a query (default 5)
-    rmem about <entity> <attribute>  what the store believes an attribute holds
+    rmem about <entity> <attribute> [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
+                                     what the store believes an attribute holds;
+                                     --valid-at asks what was true then, --as-of
+                                     what the store knew then
     rmem review                      open questions the resolver could not answer
     rmem review confirm <id>         answer one: the same thing
     rmem review reject <id>          answer one: different things
@@ -73,6 +76,10 @@ pub enum Command {
     About {
         entity: u64,
         attribute: String,
+        /// What was true then. `None` is now.
+        valid_at: Option<Timestamp>,
+        /// What the store knew then. `None` is now.
+        as_of: Option<Timestamp>,
     },
     ReviewList,
     ReviewConfirm(u64),
@@ -231,9 +238,22 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                     "{entity:?} is not an entity id -- they are numbers, printed by `remember` and `recall`\n\n{USAGE}"
                 ))
             })?;
+            // Both axes read as the *end* of the day they name, so a query
+            // naming today sees what was recorded this morning. See
+            // `rm_host::time::parse_day_end`.
+            let day = |name: &str| -> Result<Option<Timestamp>, CliError> {
+                match flag(&args, name)? {
+                    None => Ok(None),
+                    Some(d) => rm_host::time::parse_day_end(&d)
+                        .map(Some)
+                        .map_err(CliError::Usage),
+                }
+            };
             Ok(Command::About {
                 entity,
                 attribute: attribute.clone(),
+                valid_at: day("--valid-at")?,
+                as_of: day("--as-of")?,
             })
         }
 
@@ -341,6 +361,51 @@ mod tests {
         }
     }
 
+    /// `about` can ask along both axes, and a date names the whole day.
+    ///
+    /// The pair is the point of a bi-temporal store, and until now only the
+    /// MCP door could ask it: this one always passed `now, now`, so a store
+    /// that could record when a decision held had no way to be asked.
+    #[test]
+    fn about_can_ask_along_both_axes() {
+        assert_eq!(
+            parse_args(&["about", "3", "choice"]).unwrap(),
+            Command::About {
+                entity: 3,
+                attribute: "choice".into(),
+                valid_at: None,
+                as_of: None,
+            },
+            "no flags means now on both, decided downstream"
+        );
+
+        let Ok(Command::About {
+            valid_at, as_of, ..
+        }) = parse_args(&[
+            "about",
+            "3",
+            "choice",
+            "--valid-at",
+            "2026-03-14",
+            "--as-of",
+            "2026-08-24",
+        ])
+        else {
+            panic!("both flags should parse")
+        };
+        // The end of each day, not the start -- otherwise a query naming the
+        // day something was recorded cannot see it.
+        assert_eq!(valid_at, Some(1_773_446_400_000 + 86_399_999));
+        assert_eq!(as_of, Some(1_787_529_600_000 + 86_399_999));
+
+        for bad in ["2026-13-01", "yesterday", "03/14/2026"] {
+            assert!(
+                parse_args(&["about", "3", "choice", "--valid-at", bad]).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
     /// `decisions` takes a status to filter by, and takes none to mean all.
     #[test]
     fn decisions_parses_its_filter() {
@@ -391,7 +456,9 @@ mod tests {
             parse_args(&["about", "3", "employer"]).unwrap(),
             Command::About {
                 entity: 3,
-                attribute: "employer".into()
+                attribute: "employer".into(),
+                valid_at: None,
+                as_of: None,
             }
         );
         assert_eq!(parse_args(&["review"]).unwrap(), Command::ReviewList);
