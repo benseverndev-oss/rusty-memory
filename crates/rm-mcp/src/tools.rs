@@ -32,7 +32,44 @@ use rm_engine::{ReviewId, StableId, Timestamp};
 /// Fixed because the specification asks for it: a deterministic `tools/list`
 /// lets a client cache the list, and keeps the tool block stable in a model's
 /// prompt from one call to the next.
+/// The environment variable naming which tools to expose.
+///
+/// A comma-separated list of names; unset means all of them.
+pub const TOOLS_ENV: &str = "RMEM_TOOLS";
+
+/// The tools this server offers, honouring [`TOOLS_ENV`].
+///
+/// # Why a session should be able to ask for fewer
+///
+/// The tool table is sent on every turn of every session that has this server
+/// configured, whether or not it is used. Measured: eight tools are about 1,700
+/// tokens, which is roughly what a thirty-decision log costs to read in full --
+/// so a project that only ever consults decisions pays a log's worth of context
+/// per turn to advertise five tools it will never call.
+///
+/// Names that match nothing are ignored rather than refused. This is read at
+/// startup on a path with no good way to report, and a server that will not
+/// start because a list has a typo in it is worse than one that offers fewer
+/// tools than expected -- which `tools/list` shows plainly.
 pub fn definitions() -> Vec<Value> {
+    let all = all_definitions();
+    let Ok(wanted) = std::env::var(TOOLS_ENV) else {
+        return all;
+    };
+    let wanted: Vec<&str> = wanted
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if wanted.is_empty() {
+        return all;
+    }
+    all.into_iter()
+        .filter(|t| wanted.contains(&t["name"].as_str().unwrap_or_default()))
+        .collect()
+}
+
+fn all_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "remember",
@@ -47,11 +84,11 @@ pub fn definitions() -> Vec<Value> {
                     },
                     "speaker": {
                         "type": "string",
-                        "description": "Who said it. Resolves \"I\", \"me\" and \"my\" to them, and lists them as a mention so facts about them have something to attach to. Omit only when the turn genuinely has no identified speaker -- a log line, a document. Dialogue is mostly first person, and without this a turn about the speaker names nobody."
+                        "description": "Who said it. Omit only when the turn genuinely has none -- a log line, a document. Without it a first-person turn names nobody and most of its facts are lost."
                     },
                     "session": {
                         "type": "string",
-                        "description": "A name for the conversation this turn belongs to. Recorded with every assertion the turn produces. Defaults to \"mcp\"."
+                        "description": "A name for the conversation this turn belongs to."
                     }
                 },
                 "required": ["text"],
@@ -97,11 +134,11 @@ pub fn definitions() -> Vec<Value> {
                     },
                     "valid_at": {
                         "type": "integer",
-                        "description": "Epoch milliseconds. What was true at this moment. Defaults to now."
+                        "description": "Epoch milliseconds. What was true then. Defaults to now."
                     },
                     "as_of": {
                         "type": "integer",
-                        "description": "Epoch milliseconds. What was known at this moment; anything learned later is not consulted. Defaults to now."
+                        "description": "Epoch milliseconds. What was known then. Defaults to now."
                     }
                 },
                 "required": ["entity", "attribute"],
@@ -132,11 +169,11 @@ pub fn definitions() -> Vec<Value> {
                     "status": {
                         "type": "string",
                         "enum": ["proposed", "accepted", "rejected", "deprecated"],
-                        "description": "Where this decision stands. Defaults to accepted. Use proposed for something still being weighed, rejected for an option considered and turned down, deprecated for one being phased out. Not settable to superseded -- that means a specific other decision replaced this one, so use supersedes on that decision instead, which records both ends."
+                        "description": "Where this decision stands. Defaults to accepted. Record an option you turned down as rejected, with the reason in because."
                     },
                     "because": {
                         "type": "string",
-                        "description": "Why, including what it was chosen over. The part that is worth having in six months. On a rejected option this is the measurement or reason it lost, which is the whole value of recording it."
+                        "description": "Why, including what it was chosen over, and for a rejected option the reason it lost."
                     },
                     "context": {
                         "type": "string",
@@ -144,11 +181,11 @@ pub fn definitions() -> Vec<Value> {
                     },
                     "supersedes": {
                         "type": "string",
-                        "description": "The exact title of a decision this replaces. It is marked retired. A title that matches nothing is reported back rather than ignored."
+                        "description": "The exact title of a decision this replaces."
                     },
                     "decided_at": {
                         "type": "string",
-                        "description": "The day the decision was actually made, as YYYY-MM-DD, when that is not today. Use it when recording something settled earlier -- reconstructing a log from history, or writing up a choice made last week. This sets when the decision held from, not when the store learned it: the store still records that it heard this today, so asking what it believed last month gives the answer it would have given then."
+                        "description": "The day it was made, as YYYY-MM-DD, if that is not today. Sets when it held from, not when the store heard it."
                     }
                 },
                 "required": ["title", "choice"],
@@ -283,13 +320,42 @@ impl Call {
     /// `now` is passed in for the same reason the engine takes no clock: a
     /// caller that cannot control the time cannot test anything depending on
     /// it, and here it is the default for both of `about`'s axes.
-    pub fn read(name: &str, arguments: &Value, now: Timestamp) -> Result<Call, Unreadable> {
+    /// Who to record a write against.
+    ///
+    /// The client names itself once, in the handshake, and that is the half
+    /// worth trusting: a `session` argument is chosen per call, and an agent
+    /// that forgets it leaves the write anonymous. In a store one agent uses
+    /// that is a cosmetic gap; in one several share it is the difference
+    /// between a log and a pile.
+    ///
+    /// So the client's own name is always present, and a session the caller
+    /// supplies is appended to it rather than replacing it. Neither can hide
+    /// the other.
+    fn attributed(arguments: &Value, client: Option<&str>) -> Result<String, Unreadable> {
+        let session = optional_string(arguments, "session")?;
+        Ok(match (client, session) {
+            (Some(c), Some(s)) => format!("{c}/{s}"),
+            (Some(c), None) => c.to_string(),
+            // No handshake identity: a client that did not name itself, which
+            // the specification allows. The old default, so nothing that worked
+            // before now records less.
+            (None, Some(s)) => s,
+            (None, None) => "mcp".to_string(),
+        })
+    }
+
+    pub fn read(
+        name: &str,
+        arguments: &Value,
+        now: Timestamp,
+        client: Option<&str>,
+    ) -> Result<Call, Unreadable> {
         match name {
             "remember" => Ok(Call::Remember {
                 text: string(arguments, "text")?,
                 // The CLI passes "cli" here, so the default names this server
                 // rather than inheriting a label that would be wrong.
-                session: optional_string(arguments, "session")?.unwrap_or_else(|| "mcp".into()),
+                session: Call::attributed(arguments, client)?,
                 // Optional, and deliberately not defaulted to anything. A
                 // guessed speaker is worse than none: the prompt resolves "I"
                 // to whoever is named, so a wrong name attributes the turn to
@@ -332,7 +398,7 @@ impl Call {
                 because: optional_string(arguments, "because")?,
                 context: optional_string(arguments, "context")?,
                 supersedes: optional_string(arguments, "supersedes")?,
-                session: optional_string(arguments, "session")?.unwrap_or_else(|| "mcp".into()),
+                session: Call::attributed(arguments, client)?,
             }),
             "resolve_review" => Ok(Call::ResolveReview {
                 id: non_negative(arguments, "id")? as ReviewId,
@@ -432,7 +498,7 @@ mod tests {
     const NOW: Timestamp = 1_000;
 
     fn read(name: &str, args: Value) -> Result<Call, Unreadable> {
-        Call::read(name, &args, NOW)
+        Call::read(name, &args, NOW, None)
     }
 
     #[test]
@@ -486,6 +552,51 @@ mod tests {
             read(name, args.clone())
                 .unwrap_or_else(|e| panic!("{name} could not read its own schema's example: {e}"));
         }
+    }
+
+    /// A write carries who made it, whether or not the caller remembered to say.
+    ///
+    /// In a store one agent uses this is cosmetic. In one several share it is
+    /// the difference between a log and a pile, and asking each agent to pass a
+    /// `session` argument is asking for the writes where it was forgotten.
+    #[test]
+    fn a_write_is_attributed_to_the_client_that_made_it() {
+        let with =
+            |client: Option<&str>, args: Value| match Call::read("decide", &args, NOW, client)
+                .unwrap()
+            {
+                Call::Decide { session, .. } => session,
+                other => panic!("{other:?}"),
+            };
+        let bare = json!({"title": "T", "choice": "C"});
+
+        // The handshake name alone.
+        assert_eq!(
+            with(Some("claude-code 2.1"), bare.clone()),
+            "claude-code 2.1"
+        );
+
+        // Both, and neither hides the other: an agent can name its conversation
+        // without erasing which agent it was.
+        assert_eq!(
+            with(
+                Some("claude-code 2.1"),
+                json!({"title":"T","choice":"C","session":"refactor"})
+            ),
+            "claude-code 2.1/refactor"
+        );
+
+        // A client that named itself in the handshake and nothing else still
+        // gets attribution, which is the case this exists for.
+        assert_eq!(with(Some("agent-B"), bare.clone()), "agent-B");
+
+        // No handshake identity: the specification allows it, and nothing that
+        // worked before now records less.
+        assert_eq!(with(None, bare), "mcp");
+        assert_eq!(
+            with(None, json!({"title":"T","choice":"C","session":"s"})),
+            "s"
+        );
     }
 
     #[test]

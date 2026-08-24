@@ -17,13 +17,27 @@
 //! stderr, which the specification leaves free for exactly this.
 
 use std::io::Write;
-use std::path::Path;
 use std::process::ExitCode;
 
 use rm_host::config::Config;
 use rm_mcp::Server;
 
 const CONFIG: &str = "rmem.toml";
+
+/// An environment variable naming the config to use instead of `./rmem.toml`.
+///
+/// Several agents sharing one store is the point, and each of them runs in its
+/// own directory. Without this every project would need its own `rmem.toml`
+/// pointing at the same store, and one of them would eventually point somewhere
+/// else -- a divergence nothing reports, because two stores are not an error.
+const CONFIG_ENV: &str = "RMEM_CONFIG";
+
+/// The config this process should read.
+fn config_path() -> std::path::PathBuf {
+    std::env::var_os(CONFIG_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(CONFIG))
+}
 
 /// The environment variable holding the bearer token clients must present.
 ///
@@ -86,7 +100,7 @@ fn serve_http(addr: &str) -> ExitCode {
     let _ = writeln!(std::io::stderr(), "serving MCP over HTTP on {bound}");
     rm_mcp::http::serve(
         listener,
-        Path::new(CONFIG).to_path_buf(),
+        config_path().as_path().to_path_buf(),
         Config::provider,
         guard,
         now,
@@ -98,7 +112,7 @@ fn main() -> ExitCode {
     // Built here rather than inside the server, and passed in as a factory, so
     // that the tools which never embed anything never demand an API key. The
     // closure is `Config::provider` itself: the server holds the config.
-    let mut server = match Server::open(Path::new(CONFIG), Config::provider) {
+    let mut server = match Server::open(config_path().as_path(), Config::provider) {
         Ok(server) => server,
         Err(e) => {
             // To stderr, and before a single byte reaches stdout. A config
