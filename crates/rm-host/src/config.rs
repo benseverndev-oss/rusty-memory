@@ -116,6 +116,51 @@ kind = "prefix"
 field = "name"
 n = 3
 
+[retrieval]
+# Below this similarity, `recall` says the nearest thing it found is a weak
+# match. It still returns every hit -- this labels, it never filters.
+#
+# Off by default, and the reason is worth reading before turning it on.
+#
+# # It is a weak signal
+#
+# Measured against LoCoMo's adversarial questions, whose premise the
+# conversation does not support: 382 answerable against 112 unanswerable over
+# three conversations. Of six candidate signals the top hit's raw score
+# separated best (Youden's J = 0.494). Every shape-based signal -- the gap to
+# the tenth hit, the ratio to the mean, the spread -- did worse, which is the
+# opposite of what you would guess.
+#
+# J hides the trade, and the trade is bad:
+#
+#     keep 99% of answerable questions  ->  refuses  4.5% of unanswerable
+#     keep 95%                          ->  refuses 14.3%
+#     keep 90%                          ->  refuses 36.6%
+#     best J (cutoff 0.706)             ->  keeps 62.8%, refuses 86.6%
+#
+# That is why it labels rather than filters. Dropping enough unanswerable
+# queries to matter costs a tenth to a third of the real answers, and a memory
+# that loses a third of what it knows to look confident is worse than one that
+# answers and says how sure it is.
+#
+# # And it does not travel
+#
+# 0.62 was picked off the table above and then tried on this project's own
+# decision log, where it marked a question with a perfect answer -- "should we
+# add a reranker", nearest hit 0.531 -- as having nothing near it. Same
+# embedding model, different corpus, and the scale moved out from under the
+# number. Decision text and conversational turns simply do not land in the same
+# range.
+#
+# So there is no default worth shipping. A cutoff that has not been measured
+# against the corpus it will run on produces confident warnings on good answers,
+# which is worse than the silence it was meant to fix. 0.0 turns it off.
+#
+# To set it, run your own questions past the store and look at where the
+# answers land against where the misses do. The bench in `benches/locomo` is
+# the worked example.
+weak_below = 0.0
+
 [policy]
 # How competing values for one attribute are resolved, at read time.
 default = "most_recent"
@@ -151,6 +196,11 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub resolution: ResolutionConfig,
     pub policy: PolicyConfig,
+    /// Defaulted, so a config written before this section existed still loads
+    /// rather than being refused for a field its author could not have known
+    /// about.
+    #[serde(default)]
+    pub retrieval: RetrievalConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +245,36 @@ pub struct BlockingConfig {
     pub field: String,
     #[serde(default)]
     pub n: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalConfig {
+    /// Below this similarity, `recall` notes that its nearest hit is weak.
+    ///
+    /// Defaulted rather than required, so a config written before this section
+    /// existed still loads. The default is the measured one; see `TEMPLATE`.
+    #[serde(default = "default_weak_below")]
+    pub weak_below: f32,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        RetrievalConfig {
+            weak_below: default_weak_below(),
+        }
+    }
+}
+
+/// Off.
+///
+/// Not a placeholder for a number nobody measured: a cutoff that has not been
+/// calibrated against the corpus it runs on marks good answers as weak, which
+/// is worse than the silence it replaces. See `TEMPLATE` for the measurement
+/// and for why 0.62 -- the best figure from the LoCoMo sweep -- was withdrawn
+/// after it fired on a question this project can answer perfectly well.
+fn default_weak_below() -> f32 {
+    0.0
 }
 
 #[derive(Debug, Deserialize)]
@@ -509,6 +589,7 @@ const SCHEMA: &[(&str, &[&str])] = &[
     ("[resolution]", &["review_at", "match_at"]),
     ("[[resolution.field]]", &["field", "comparator", "m", "u"]),
     ("[[resolution.blocking]]", &["kind", "field", "n"]),
+    ("[retrieval]", &["weak_below"]),
     ("[policy]", &["default"]),
 ];
 

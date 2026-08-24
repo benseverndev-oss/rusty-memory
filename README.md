@@ -124,8 +124,16 @@ decision was accepted and the only way to write a rejection was to accept the
 word "no".
 
 ```sh
-rmem decide "Retrieval reranking" "a cross-encoder over the top 200"   --status rejected   --because "the k-curve is still 0.926 at k=200 -- there is nothing to rerank into"
+rmem decide "Retrieval reranking" "a cross-encoder over the top 200" \
+  --status rejected \
+  --because "the k-curve is still 0.926 at k=200 -- there is nothing to rerank into"
 ```
+
+That example is not invented. `docs/seed-decision-log.sh` records this project's
+own log — thirty decisions from eleven merged pull requests, the options tried
+and turned down with the numbers that killed them, and the three supersession
+chains that actually happened. Run it against an empty store to see what the
+thing reads like holding real history rather than a demo.
 
 The answer keeps its three states across the wire. `{"believed": "absent"}` is
 "someone said there is none" and `{"believed": "unknown"}` is "it has never come
