@@ -98,6 +98,61 @@ pub fn default_strategies() -> Vec<Strategy> {
     ]
 }
 
+/// How the two implementations' refusals line up.
+///
+/// Two failure modes counted separately, because they are not equally bad.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RefusalScore {
+    pub both_refused: usize,
+    pub both_answered: usize,
+    /// The engine refused where the reference answered. The store is useless
+    /// here: an answer was available and it declined to give it.
+    pub engine_only: usize,
+    /// The engine answered where the reference refused. The store is silently
+    /// wrong here, which is the worse of the two.
+    pub reference_only: usize,
+}
+
+impl RefusalScore {
+    pub fn exact(&self) -> bool {
+        self.engine_only == 0 && self.reference_only == 0
+    }
+}
+
+/// Refusal agreement over `seeds`.
+///
+/// Ties are turned up and backdating down, so the refusal paths are actually
+/// reached: `ValidInterval` refuses only when `valid.from` and `observed_at`
+/// both collide, and a backdated assertion rarely collides on the first.
+pub fn refusal_agreement(
+    seeds: impl Iterator<Item = u64>,
+    strategies: &[Strategy],
+) -> RefusalScore {
+    let params = Params {
+        len: 10,
+        alphabet: 3,
+        tie_pct: 60,
+        backdate_pct: 10,
+        ..Params::default()
+    };
+    let mut score = RefusalScore::default();
+    for seed in seeds {
+        let history = generate(seed, &params);
+        let candidates: Vec<_> = history.iter().map(|a| a.candidate()).collect();
+        for strategy in strategies {
+            let e = engine_merge(&candidates, strategy).is_err();
+            let r = reference::merge(&candidates, strategy).is_err();
+            match (e, r) {
+                (true, true) => score.both_refused += 1,
+                (false, false) => score.both_answered += 1,
+                (true, false) => score.engine_only += 1,
+                (false, true) => score.reference_only += 1,
+            }
+        }
+    }
+    score
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +185,42 @@ mod tests {
             separated,
             "MostRecent and FirstNonNull agreed on all 50 seeds, which cannot be right"
         );
+    }
+
+    #[test]
+    fn refusals_line_up_exactly() {
+        let score = refusal_agreement(0..300, &default_strategies());
+        assert!(score.exact(), "{score:?}");
+    }
+
+    #[test]
+    fn the_refusal_paths_are_actually_reached() {
+        // Without this, a suite in which nothing ever refuses reports perfect
+        // refusal correctness and has measured nothing.
+        let score = refusal_agreement(0..300, &default_strategies());
+        // A floor rather than `> 0`: a single refusal in 2,400 comparisons
+        // would satisfy "> 0" while leaving the paths effectively unreached.
+        // The measured figure is 450 refused / 1,950 answered.
+        let total = score.both_refused + score.both_answered;
+        assert!(
+            score.both_refused * 20 > total,
+            "refusals fell below 5% of comparisons, so the paths are barely              exercised: {score:?}"
+        );
+    }
+
+    #[test]
+    fn both_outcomes_are_reached_not_just_one() {
+        // And the mirror: a suite in which *everything* refuses would satisfy
+        // the test above while measuring just as little.
+        let score = refusal_agreement(0..300, &default_strategies());
+        assert!(score.both_answered > 0, "everything refused: {score:?}");
+    }
+
+    #[test]
+    fn source_priority_refuses_together_on_unranked_sources() {
+        let ranked = Strategy::SourcePriority(vec![rm_core::Source::UserAssertion]);
+        let score = refusal_agreement(0..100, &[ranked]);
+        assert!(score.exact(), "{score:?}");
     }
 
     #[test]
