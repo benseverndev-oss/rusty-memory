@@ -287,6 +287,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rm-embed"
+version = "0.0.0"
+dependencies = [
+ "rm-engine",
+]
+
+[[package]]
 name = "rm-engine"
 version = "0.0.0"
 dependencies = [
@@ -322,6 +329,7 @@ dependencies = [
 name = "rm-host"
 version = "0.0.0"
 dependencies = [
+ "rm-embed",
  "rm-engine",
  "rm-extract",
  "rm-providers",
@@ -341,6 +349,7 @@ dependencies = [
 name = "rm-mcp"
 version = "0.0.0"
 dependencies = [
+ "rm-embed",
  "rm-engine",
  "rm-host",
  "serde_json",

@@ -69,9 +69,24 @@ impl Engine {
     /// Ordered containers throughout, so the bytes are stable for a given state
     /// and a snapshot diffs against its predecessor rather than reshuffling.
     pub fn snapshot(&self) -> String {
+        self.persisted(self.index.snapshot())
+    }
+
+    /// The snapshot that goes to disk, with the vectors left for
+    /// [`Engine::vectors_le`] to write beside it.
+    ///
+    /// [`Engine::snapshot`] keeps the self-contained shape, and is still what
+    /// round-trips through [`Engine::open`]. This is the pair the host uses,
+    /// because measured on a real store the vectors were 96.9% of the file and
+    /// every write rewrote all of them to record one assertion.
+    pub fn snapshot_meta(&self) -> String {
+        self.persisted(self.index.snapshot_meta())
+    }
+
+    fn persisted(&self, index: String) -> String {
         let p = Persisted {
             store: self.store.snapshot(),
-            index: self.index.snapshot(),
+            index,
             identity: self.identity.clone(),
             assertions: self.assertions.clone(),
             review: self.review.clone(),
@@ -107,7 +122,50 @@ impl Engine {
     /// checks its `next_id`, `VectorIndex::open` rebuilds its id-to-row map and
     /// checks its rows. What is left here is only what neither of them can see:
     /// whether the two agree with each other, and with this crate's own state.
+    /// The vectors, to be written beside the snapshot.
+    ///
+    /// [`Engine::snapshot`] no longer carries them: measured on a real store
+    /// they were 96.9% of it, and every write rewrote all of them to record one
+    /// assertion. See [`rm_index::VectorIndex::snapshot_meta`].
+    pub fn vectors_le(&self) -> Vec<u8> {
+        self.index.vectors_le()
+    }
+
+    /// Restore from a snapshot and the vector file beside it.
+    ///
+    /// `vectors` is `None` for a store written before the two were split, whose
+    /// snapshot still carries its own. That is not a legacy path to be tidied
+    /// away later -- it is what lets an existing store be opened and migrated
+    /// on its next save rather than refused.
+    pub fn open_split(
+        snapshot: &str,
+        vectors: Option<&[u8]>,
+        ruleset: Ruleset,
+        policy: Policy,
+    ) -> Result<Engine, EngineError> {
+        match vectors {
+            None => Engine::open(snapshot, ruleset, policy),
+            Some(bytes) => Engine::restore(snapshot, ruleset, policy, |meta| {
+                VectorIndex::open_split(meta, bytes)
+            }),
+        }
+    }
+
     pub fn open(snapshot: &str, ruleset: Ruleset, policy: Policy) -> Result<Engine, EngineError> {
+        Engine::restore(snapshot, ruleset, policy, VectorIndex::open)
+    }
+
+    /// The shared body, told how to turn `index` into one.
+    ///
+    /// A closure rather than two copies: everything below is the same for both
+    /// shapes, and the pair drifting apart is a store that opens through one
+    /// door and not the other.
+    fn restore(
+        snapshot: &str,
+        ruleset: Ruleset,
+        policy: Policy,
+        open_index: impl FnOnce(&str) -> Result<VectorIndex, rm_index::IndexError>,
+    ) -> Result<Engine, EngineError> {
         let p: Persisted = serde_json::from_str(snapshot)
             .map_err(|e| EngineError::CorruptSnapshot(e.to_string()))?;
 
@@ -118,7 +176,7 @@ impl Engine {
         // `IndexError` both convert, so a corrupt one arrives as itself rather
         // than flattened into a string that loses which invariant broke.
         let store = MemoryStore::open(&p.store)?;
-        let index = VectorIndex::open(&p.index)?;
+        let index = open_index(&p.index)?;
 
         // The counters name the *next* id to hand out, so anything at or below
         // an id already in use is a snapshot that lies on its first write

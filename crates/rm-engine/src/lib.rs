@@ -1272,6 +1272,103 @@ mod tests {
         obs
     }
 
+    /// The store's own motivating example, asked of the engine.
+    ///
+    /// `rm_store`'s module docs open with it: "In September a user mentions
+    /// they changed jobs back in July. The valid time starts in July; the
+    /// transaction time starts in September." The whole argument for carrying
+    /// two axes is that a single-axis store has to choose, and choosing is
+    /// wrong either way.
+    ///
+    /// So: what did they hold in August, asked now? They changed in July, so
+    /// the answer is the new employer. `MemoryStore::as_of` gets this right --
+    /// it filters `v.valid.contains(valid_t)` directly. `Engine::about` runs
+    /// survivorship first, and `rm_survivor::Candidate` carries a value and a
+    /// provenance and no interval at all, so the valid time cannot reach the
+    /// strategy that is supposed to use it. `timeline` builds its spans from
+    /// `provenance.observed_at`.
+    ///
+    /// It failed when it was written. `rm_survivor::Candidate` carried a value
+    /// and a provenance and no interval, so `Strategy::ValidInterval` cut its
+    /// timeline at `provenance.observed_at` and answered August with the old
+    /// employer. The candidate carries its validity now.
+    #[test]
+    fn a_job_change_mentioned_late_is_true_from_when_it_happened() {
+        const JANUARY: Timestamp = 100;
+        const JULY: Timestamp = 700;
+        const AUGUST: Timestamp = 800;
+        const SEPTEMBER: Timestamp = 900;
+        const NOW: Timestamp = 1000;
+
+        let mut e = engine().with_policy(Policy::new(Strategy::ValidInterval));
+        let mut said = |value: &str, valid_from: Timestamp, heard: Timestamp| {
+            e.remember(Observation {
+                kind: "person".to_string(),
+                // `city` too: `test_ruleset` wants a corroborating field to
+                // put a name-only match above the line, so a mention without
+                // one lands on a fresh entity and this test would measure the
+                // resolver rather than the timeline.
+                mention: Record::new()
+                    .with("name", "Ben Severn")
+                    .with("city", "Bristol"),
+                attribute: "employer".to_string(),
+                value: Some(value.to_string()),
+                // The two axes, set apart. This is the whole point.
+                valid: Interval::since(valid_from),
+                provenance: Provenance::new(Source::UserAssertion, heard, "s"),
+                supersession: Supersession::Unstated,
+                embedding: vec![1.0, 0.0, 0.0],
+            })
+            .unwrap()
+        };
+
+        // Told in January, true from January.
+        let Remembered::Created { entity, .. } = said("Acme", JANUARY, JANUARY) else {
+            panic!("setup")
+        };
+        // Told in September, true from July.
+        said("Globex", JULY, SEPTEMBER);
+
+        // What the store itself says, which is right: it filters both axes.
+        assert_eq!(
+            e.store_history(entity, "employer").len(),
+            2,
+            "both assertions are kept"
+        );
+
+        // The data is recorded correctly. A version says Globex, and its valid
+        // interval contains August -- so nothing is lost on the way in, and
+        // `MemoryStore::as_of` would answer this by filtering
+        // `v.valid.contains(valid_t)` directly. What follows is the read path
+        // losing it.
+        assert!(
+            e.store_history(entity, "employer")
+                .iter()
+                .any(|v| { v.value.as_deref() == Some("Globex") && v.valid.contains(AUGUST) }),
+            "the store holds a Globex version valid in August; the loss is downstream"
+        );
+
+        // In August they were at Globex -- they changed in July. Asked now, so
+        // transaction time is not the obstacle.
+        assert_eq!(
+            e.about(entity, "employer", AUGUST, NOW).unwrap(),
+            Believed::Value("Globex".into()),
+            "they changed jobs in July, so in August they were at Globex --              the timeline is cut at when the store was *told*, not when it was true"
+        );
+
+        // And the answers either side stay right.
+        assert_eq!(
+            e.about(entity, "employer", JANUARY + 1, NOW).unwrap(),
+            Believed::Value("Acme".into()),
+            "in January they really were at Acme"
+        );
+        assert_eq!(
+            e.about(entity, "employer", AUGUST, AUGUST).unwrap(),
+            Believed::Value("Acme".into()),
+            "asked in August, the store had not been told yet -- transaction              time is a separate question and this one it gets right"
+        );
+    }
+
     fn engine() -> Engine {
         Engine::new(
             VectorIndex::new(3, Metric::Cosine),

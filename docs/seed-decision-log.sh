@@ -98,6 +98,9 @@ d "still_stands means in force" "accepted and unsuperseded" \
   --because "with five statuses, unsuperseded and actionable stopped being the same predicate, and \"can I act on this\" is the question a reader has" \
   --supersedes "still_stands means the displayed choice stands"
 
+d "Embed locally with subword hashing" "hash character n-grams into the vector, no model file" --status proposed   --because "fully owned and dependency-free, and the decision path needs no key at all -- but 6/12 against the service's 10/12 on paraphrased queries, because it has morphology and no semantics"
+d "Distil a static word table from the embedding API" "embed a vocabulary once, then look up and pool" --status rejected   --because "best pooling reaches 6/12, exactly tying free hashing, for a bootstrap pass and a weights artifact; an API embedding of one word is a one-word document, and the model's geometry is not linear in words -- model2vec distils the token embedding layer, which the API does not expose"
+
 echo; echo -n "proposed "
 d "Index raw turn text beside assertions" "one vector per turn as well as one per assertion" --status proposed \
   --because "raw turns beat the pipeline by 0.086 pooled over three conversations, never negative -- but fusing the two loses to raw turns alone, so the shape is unsettled"

@@ -266,14 +266,23 @@ impl Engine {
 
         let candidates: Vec<Candidate<'_>> = versions
             .iter()
-            .map(|v| match &v.value {
-                Some(s) => Candidate::new(Some(s.as_str()), &v.provenance),
-                // A stored `None` is a tombstone — a positive claim of
-                // absence — and has to compete as one. `Candidate::new(None,
-                // ..)` would instead read as the source saying nothing, which
-                // drops the tombstone out of the comparison entirely and lets
-                // an earlier value win by default.
-                None => Candidate::absent(&v.provenance),
+            .map(|v| {
+                let c = match &v.value {
+                    Some(s) => Candidate::new(Some(s.as_str()), &v.provenance),
+                    // A stored `None` is a tombstone — a positive claim of
+                    // absence — and has to compete as one. `Candidate::new(
+                    // None, ..)` would instead read as the source saying
+                    // nothing, which drops the tombstone out of the comparison
+                    // entirely and lets an earlier value win by default.
+                    None => Candidate::absent(&v.provenance),
+                };
+                // Over the span it actually held, rather than the default of
+                // "valid from when it was heard". Without this the store
+                // records both axes and the read path sees one: a job change
+                // mentioned in September and true from July answered with the
+                // old employer for August, which is the case `rm_store`'s
+                // module docs open with.
+                c.over(v.valid)
             })
             .collect();
 

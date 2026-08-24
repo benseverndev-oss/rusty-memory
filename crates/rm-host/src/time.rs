@@ -56,6 +56,21 @@ pub fn parse_day(text: &str) -> Result<Timestamp, String> {
     Ok(days_from_civil(y, m, d) * MS_PER_DAY)
 }
 
+/// `YYYY-MM-DD` as the *last* millisecond of that day, in UTC.
+///
+/// What a date means when it is used as a point in time, rather than as the
+/// moment something began.
+///
+/// `--at` writes the start of a day, because a decision made on the 14th held
+/// from the 14th. A question asked *about* the 14th means something else: "what
+/// was true then" and "what did we know by then" both want the day to be over.
+/// Read at the start instead, and a decision recorded at nine in the morning is
+/// invisible to a query naming its own day -- which is the first thing anybody
+/// tries.
+pub fn parse_day_end(text: &str) -> Result<Timestamp, String> {
+    parse_day(text).map(|start| start + MS_PER_DAY - 1)
+}
+
 fn days_in_month(y: i64, m: u32) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -123,6 +138,30 @@ mod tests {
             let ms = parse_day(day).unwrap_or_else(|e| panic!("{day}: {e}"));
             assert_eq!(format_day(ms), day, "round trip for {day}");
         }
+    }
+
+    /// A date used as a point in time covers the whole day it names.
+    #[test]
+    fn a_day_as_a_point_in_time_is_its_last_millisecond() {
+        let start = parse_day("2026-03-14").unwrap();
+        let end = parse_day_end("2026-03-14").unwrap();
+        assert_eq!(
+            end - start,
+            86_399_999,
+            "the whole day, less one millisecond"
+        );
+        assert_eq!(
+            format_day(end),
+            "2026-03-14",
+            "and still that day, not the next"
+        );
+        // The case this exists for: something recorded during the day is
+        // visible to a query naming that day.
+        let nine_am = start + 9 * 3_600_000;
+        assert!(nine_am <= end);
+        assert!(nine_am > start);
+        // A bad date is refused here too, not only by `parse_day`.
+        assert!(parse_day_end("2026-02-30").is_err());
     }
 
     #[test]

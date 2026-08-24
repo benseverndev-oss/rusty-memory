@@ -147,10 +147,32 @@ where the distances between them are not wrong but meaningless. That is the
 failure this project refuses everywhere else it appears, so it is refused here
 too, naming what it found.
 
-Reading *back* along the valid axis — "what did this hold in March" — is an
-`about` with both timestamps, which the MCP server takes and the `rmem` binary
-does not yet expose. The store records it either way; only one of the two front
-doors can currently ask.
+Reading back along either axis is an `about` with a date on it:
+
+```sh
+rmem about 30 choice --as-of 2026-03-01      # what the store knew then
+rmem about 30 choice --valid-at 2026-03-01   # what was true then
+```
+
+A date names a whole day and both flags read it as the *end* of that day, so a
+query naming today sees what was recorded this morning.
+
+`--as-of` works on anything: transaction time is filtered before survivorship
+runs, so asking what the store knew before it knew anything answers `nothing
+known`.
+
+`--valid-at` needs an attribute whose policy keeps a timeline. Survivorship runs
+first, and most strategies collapse a history to one winner — a winner has no
+timeline, so there is nothing for a valid time to index into. Only an attribute
+under `valid_interval` can be asked, which is `employer` in the template and
+whatever else you configure.
+
+That timeline used to be cut at **observation** times rather than valid ones, so
+the case this store's design opens with — told in September that a job changed
+in July, asked what held in August — answered with the old employer.
+`rm_survivor::Candidate` carried a value and a provenance and no interval at
+all, so the strategy named for the valid interval could not see one. It carries
+its validity now, and the timeline is cut where the values actually changed.
 
 A decision's `status` is one of `proposed`, `accepted`, `rejected` or
 `deprecated` — a closed vocabulary, because the point of a status is that a
@@ -209,6 +231,92 @@ queued for extraction whether or not the agent thought to record it. It is not
 wired by default — it spends a completion per prompt, and that is not a choice
 to make on someone's behalf by their cloning a repo. See
 [`hooks/README.md`](hooks/README.md).
+
+## Where a store lives
+
+Two files. `memory.json` holds everything the store remembers — assertions,
+identities, the review queue — and `memory.vec` holds the vectors, as a flat run
+of little-endian `f32` rows.
+
+They were one file, and measured on a real store the vectors were **96.9%** of
+it: 1536 floats per assertion, written as JSON numbers at roughly thirteen bytes
+for each four-byte float, and all of them rewritten to record one decision.
+Splitting them took the part that is parsed and re-serialised on every write
+from 918 KB to 70 KB on a 33-decision log — **13× smaller** — and the vectors
+became 702 KB of bytes rather than 848 KB of text.
+
+The shape is Qdrant's dense storage: same-sized rows, and a map from id to row.
+The design only — Qdrant is Apache 2.0 and this is MIT, and a few hundred lines
+is not worth carrying somebody else's licence for.
+
+The vectors are written first and the snapshot second, because the snapshot's
+rename is the commit. A crash between them leaves rows nothing points at, which
+the next open neither reads nor minds; the other order would leave a snapshot
+naming rows that are not there.
+
+**A store written before the split still opens.** Its snapshot carries its own
+vectors, there is no `.vec` beside it, and the next save writes both. Refusing
+it would lose an existing store rather than move it.
+
+**What this does not yet do** is write incrementally. Both files are still
+replaced whole, so a save is O(store) rather than O(one row) — the win is that
+the expensive half, encoding and parsing two million JSON floats, is gone. Row
+writes in place need the engine to track which rows changed, and that is a
+separate piece of work.
+
+## Many agents, one store
+
+```sh
+rmem-mcp                          # stdio: one client, one machine
+RMEM_TOKEN=... rmem-mcp --http 0.0.0.0:8899
+```
+
+stdio serves one client on one box. The store is a file and the lock is a
+`flock` on a sidecar beside it, so "many agents" has meant many processes on one
+filesystem. A memory several agents *share* — where one records a decision and
+another is corrected by it — needs a socket.
+
+`--http` is MCP's Streamable HTTP transport. There is no SSE: the stream exists
+for servers that send messages of their own, and this one never does, so every
+response is a single JSON object. Each connection gets its own server, because
+the protocol version is negotiated per client.
+
+It is safe by default and refuses rather than warns:
+
+- a request carrying `Origin` gets **403** — that is a browser, this server has
+  no browser clients, and the specification requires the check by name because a
+  page on any site can point at a loopback port
+- binding anything but loopback without `RMEM_TOKEN` **refuses to start**, since
+  a memory on an open port with no credential is not a deployment anyone chooses
+  on purpose
+- `GET` gets **405**: the stream it would open carries server-initiated
+  messages, and there are none
+
+**No TLS and no OAuth.** The specification's authorization chapter describes an
+OAuth 2.1 resource server, which a bearer token is not. Anything facing a
+hostile network wants a reverse proxy in front that terminates TLS and does the
+real thing.
+
+## Vectors without a service
+
+`[provider] embedder = "local"` computes vectors here instead of asking a
+remote model. `rm_embed` is subword hashing — about a hundred lines of
+arithmetic, no dependency, no model file, deterministic across machines and
+releases.
+
+With it, the whole decision path is offline: `decide` reaches no completion
+model by design, so `decide`, `recall`, `decisions` and `reindex` need no API
+key and open no socket.
+
+It costs recall, and the number is in `benches/locomo/README.md`. On this
+project's own decision log, asked in words other than the title's own, it
+places the right decision first **6 times in 12** where
+`text-embedding-3-small` manages **10**. It has morphology and no semantics:
+nothing lexical connects *talking* to *speaking*. Asked by exact title both are
+perfect, which is why that is the wrong test to judge it by.
+
+Switching is not free — vectors from the two are not comparable — but it is
+reversible: `rmem reindex` rebuilds the index under whichever is configured.
 
 ## Crates
 

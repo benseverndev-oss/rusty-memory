@@ -30,6 +30,30 @@ use crate::jsonrpc::{self, Request};
 use crate::render;
 use crate::tools::{self, Call};
 
+/// Where this server gets vectors: the injected provider, or a local embedder.
+///
+/// The provider reaches `Server` through a factory so a test can hand it a
+/// script instead of a socket. Reading `[provider] embedder` and building the
+/// embedder straight from the config would walk around that seam -- which is
+/// exactly what happened, and two protocol tests caught it by failing.
+///
+/// So the choice is made here and the injected provider is still used for the
+/// remote case. Owned rather than borrowed because the factory returns an
+/// owned provider.
+enum Vectors<P> {
+    Injected(P),
+    Local(rm_embed::Hashed),
+}
+
+impl<P: Embedder> Embedder for Vectors<P> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, rm_engine::EmbedderError> {
+        match self {
+            Vectors::Injected(p) => p.embed(text),
+            Vectors::Local(h) => h.embed(text),
+        }
+    }
+}
+
 /// A call's model calls, made before the lock and carried into it.
 ///
 /// An enum rather than a bag of `Option`s so a plan cannot be paired with a
@@ -348,6 +372,20 @@ where
     /// and an embedding reads its text, and neither asks the store anything.
     /// What genuinely needs the store -- resolving a mention against what is
     /// already known -- stays inside the lock, in [`Server::write`].
+    /// The embedder for this call, honouring `[provider] embedder` without
+    /// walking around the factory the remote one arrives through.
+    fn vectors(config: &Config, provider: &F) -> Result<Vectors<P>, HostError> {
+        match config.provider.embedder.as_str() {
+            "local" => Ok(Vectors::Local(rm_embed::Hashed::new(
+                config.provider.dimension,
+            ))),
+            "http" => Ok(Vectors::Injected(provider(config)?)),
+            other => Err(HostError::Config(format!(
+                "rmem.toml's [provider] embedder is {other:?}, which this build does not know; use \"http\" or \"local\"."
+            ))),
+        }
+    }
+
     fn plan(
         config: &Config,
         provider: &F,
@@ -384,10 +422,10 @@ where
                 supersedes,
                 session,
             } => {
-                // The provider is built for its embedder alone. `decide` makes
-                // no completion call: a decision has a known shape, so nothing
-                // has to be guessed out of prose.
-                let provider = provider(config)?;
+                // An embedder alone. `decide` makes no completion call: a
+                // decision has a known shape, so nothing has to be guessed out
+                // of prose.
+                let embedder = Self::vectors(config, provider)?;
                 Ok(Planned::Decide(command::plan_decide(
                     title,
                     choice,
@@ -398,12 +436,12 @@ where
                     *decided_at,
                     now,
                     session,
-                    &provider,
+                    &embedder,
                 )?))
             }
             Call::Recall { query, .. } => {
-                let provider = provider(config)?;
-                Ok(Planned::Recall(command::plan_recall(query, &provider)?))
+                let embedder = Self::vectors(config, provider)?;
+                Ok(Planned::Recall(command::plan_recall(query, &embedder)?))
             }
             // Everything else is local work over a file on disk -- notably the
             // review answers, which write. The question was already asked and
