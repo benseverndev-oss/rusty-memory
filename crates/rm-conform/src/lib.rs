@@ -17,6 +17,7 @@
 //! unless the expected answer is worked out without asking the code under test.
 
 pub mod differential;
+pub mod engine_harness;
 pub mod generate;
 pub mod history;
 pub mod reference;

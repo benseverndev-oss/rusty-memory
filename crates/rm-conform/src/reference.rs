@@ -27,6 +27,26 @@ pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcom
     }
 }
 
+/// What held at `t`, distinguishing an asserted absence from no coverage.
+///
+/// Implemented here rather than calling `Outcome::held_at`, because the read
+/// path applies this *after* merging and it is therefore part of what is being
+/// scored, not a neutral accessor.
+///
+/// Note what this means for a `Survivor`: it has no time dimension, so it holds
+/// at every `t` and valid time does not bite at all. Only a `Timeline` -- that
+/// is, only `Strategy::ValidInterval` -- answers "what was true when".
+pub fn held_at(outcome: &Outcome, t: rm_core::Timestamp) -> Option<&Held> {
+    match outcome {
+        Outcome::Survivor(v) => v.as_ref(),
+        Outcome::Timeline(facts) => facts
+            .iter()
+            // Half-open `[from, to)`, per `Interval`'s own docs.
+            .find(|f| f.valid.from <= t && f.valid.to.is_none_or(|to| t < to))
+            .map(|f| &f.value),
+    }
+}
+
 /// Assertions only. Silence is not a claim and never competes.
 fn claims<'a, 'b>(candidates: &'b [Candidate<'a>]) -> Vec<&'b Candidate<'a>> {
     candidates
