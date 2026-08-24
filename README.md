@@ -161,19 +161,18 @@ query naming today sees what was recorded this morning.
 runs, so asking what the store knew before it knew anything answers `nothing
 known`.
 
-**`--valid-at` is narrower than it looks, and worth understanding before relying
-on it.** Survivorship runs first, and most strategies collapse a history to one
-winner — a winner has no timeline, so the valid time is discarded. Only an
-attribute under `valid_interval` produces a timeline that can be asked. That is
-`employer` in the template, and nothing else by default.
+`--valid-at` needs an attribute whose policy keeps a timeline. Survivorship runs
+first, and most strategies collapse a history to one winner — a winner has no
+timeline, so there is nothing for a valid time to index into. Only an attribute
+under `valid_interval` can be asked, which is `employer` in the template and
+whatever else you configure.
 
-Worse, the timeline `valid_interval` builds is cut at **observation** times
-rather than valid ones, so a decision backdated with `--at` does not move it:
-both spans sit at the moment the store was told. The two axes are recorded
-faithfully and `rm_store::as_of` filters on both, but the survivor between them
-only sees one. So `--at` and `--valid-at` do not currently compose, and saying
-so here is cheaper than letting somebody find out from an answer that looks
-right.
+That timeline used to be cut at **observation** times rather than valid ones, so
+the case this store's design opens with — told in September that a job changed
+in July, asked what held in August — answered with the old employer.
+`rm_survivor::Candidate` carried a value and a provenance and no interval at
+all, so the strategy named for the valid interval could not see one. It carries
+its validity now, and the timeline is cut where the values actually changed.
 
 A decision's `status` is one of `proposed`, `accepted`, `rejected` or
 `deprecated` — a closed vocabulary, because the point of a status is that a

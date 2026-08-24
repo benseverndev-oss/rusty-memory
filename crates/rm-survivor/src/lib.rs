@@ -126,12 +126,28 @@ impl Held {
 pub struct Candidate<'a> {
     pub value: Asserted<'a>,
     pub provenance: &'a Provenance,
+    /// When this held in the world, as against when it was heard.
+    ///
+    /// [`Strategy::ValidInterval`] is named for this and could not see it: the
+    /// type carried a value and a provenance and nothing else, so the timeline
+    /// it built was cut at `provenance.observed_at` and was a transaction-time
+    /// timeline wearing a valid-time name. Asked the case `rm_store`'s own docs
+    /// open with -- told in September that a job changed in July, what held in
+    /// August -- it answered with the old employer.
+    ///
+    /// Defaults to [`Interval::since`] the observation, which is what the old
+    /// behaviour assumed everywhere, so a caller that does not know better gets
+    /// exactly what it got before.
+    pub valid: Interval,
 }
 
 impl<'a> Candidate<'a> {
     /// A candidate from an optional value. `None` means the source said
     /// *nothing*; for a source asserting the field is empty, use
     /// [`Candidate::absent`].
+    ///
+    /// Valid from the moment it was observed. A caller that knows when the
+    /// value actually held says so with [`Candidate::over`].
     pub fn new(value: Option<&'a str>, provenance: &'a Provenance) -> Self {
         Candidate {
             value: match value {
@@ -139,6 +155,7 @@ impl<'a> Candidate<'a> {
                 None => Asserted::Silent,
             },
             provenance,
+            valid: Interval::since(provenance.observed_at),
         }
     }
 
@@ -147,7 +164,14 @@ impl<'a> Candidate<'a> {
         Candidate {
             value: Asserted::Absent,
             provenance,
+            valid: Interval::since(provenance.observed_at),
         }
+    }
+
+    /// The same candidate, over the span it actually held.
+    pub fn over(mut self, valid: Interval) -> Self {
+        self.valid = valid;
+        self
     }
 }
 
@@ -469,11 +493,18 @@ fn timeline(candidates: &[Candidate<'_>]) -> Result<Vec<Fact>, Refused> {
 
     // Stable sort: candidates sharing a timestamp keep their input order, which
     // matters for the conflict check below reporting the caller's own ordering.
-    asserted.sort_by_key(|c| c.provenance.observed_at);
+    // By when each held, with the observation breaking ties. Valid time is the
+    // axis this strategy is named for; observation is what orders two things
+    // said to have begun at the same moment, and is a total order because the
+    // store stamps every write.
+    asserted.sort_by_key(|c| (c.valid.from, c.provenance.observed_at));
 
     for pair in asserted.windows(2) {
         let (a, b) = (pair[0], pair[1]);
-        if a.provenance.observed_at == b.provenance.observed_at && a.value != b.value {
+        if a.valid.from == b.valid.from
+            && a.provenance.observed_at == b.provenance.observed_at
+            && a.value != b.value
+        {
             return Err(Refused(format!(
                 "{:?} and {:?} were both observed at {}, so neither supersedes the other \
                  and no validity range can be assigned. Distinguish their observation \
@@ -491,7 +522,7 @@ fn timeline(candidates: &[Candidate<'_>]) -> Result<Vec<Fact>, Refused> {
         }
         facts.push(Fact {
             value,
-            valid: Interval::since(c.provenance.observed_at),
+            valid: Interval::since(c.valid.from),
         });
     }
 

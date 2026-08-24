@@ -1288,11 +1288,11 @@ mod tests {
     /// strategy that is supposed to use it. `timeline` builds its spans from
     /// `provenance.observed_at`.
     ///
-    /// Written to fail, and ignored so it records the defect without gating
-    /// the branch on it. It is the question the project says it exists to
-    /// answer, in the project's own example. Remove the `ignore` with the fix.
+    /// It failed when it was written. `rm_survivor::Candidate` carried a value
+    /// and a provenance and no interval, so `Strategy::ValidInterval` cut its
+    /// timeline at `provenance.observed_at` and answered August with the old
+    /// employer. The candidate carries its validity now.
     #[test]
-    #[ignore = "known gap: rm_survivor::Candidate carries no valid interval, so                 Strategy::ValidInterval cuts its timeline at observation time.                 The store records both axes correctly; Engine::about loses one."]
     fn a_job_change_mentioned_late_is_true_from_when_it_happened() {
         const JANUARY: Timestamp = 100;
         const JULY: Timestamp = 700;
