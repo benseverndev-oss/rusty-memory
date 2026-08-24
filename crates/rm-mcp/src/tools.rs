@@ -153,6 +153,23 @@ pub fn definitions() -> Vec<Value> {
             "inputSchema": {"type": "object", "additionalProperties": false}
         }),
         json!({
+            "name": "decision",
+            "title": "One decision, and what replaced it",
+            "description": "Read one decision in full by its exact title: what was chosen, why, what it replaced, and — when it has been superseded — the chain forward to the decision that stands now. Use this when `decisions` or `recall` surfaces a decision you are about to rely on, because a decision marked replaced tells you the answer is out of date and this is what tells you the current one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "The decision's exact title, as `decisions` lists it. Titles are matched exactly, not approximately.",
+                        "minLength": 1
+                    }
+                },
+                "required": ["title"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "resolve_review",
             "title": "Answer an open question",
             "description": "Answer one open question. same=true merges the pair; same=false records that they are different and stops the pair being asked about again.",
@@ -210,6 +227,10 @@ pub enum Call {
         session: String,
     },
     Decisions,
+    /// Read one decision in full, by exact title.
+    Decision {
+        title: String,
+    },
 }
 
 /// Why a call could not be read.
@@ -273,6 +294,9 @@ impl Call {
             }),
             "reviews" => Ok(Call::Reviews),
             "decisions" => Ok(Call::Decisions),
+            "decision" => Ok(Call::Decision {
+                title: string(arguments, "title")?,
+            }),
             "decide" => Ok(Call::Decide {
                 title: string(arguments, "title")?,
                 choice: string(arguments, "choice")?,
@@ -300,7 +324,11 @@ impl Call {
     pub fn mutates(&self) -> bool {
         match self {
             Call::Remember { .. } | Call::ResolveReview { .. } | Call::Decide { .. } => true,
-            Call::Recall { .. } | Call::About { .. } | Call::Reviews | Call::Decisions => false,
+            Call::Recall { .. }
+            | Call::About { .. }
+            | Call::Reviews
+            | Call::Decisions
+            | Call::Decision { .. } => false,
         }
     }
 }
@@ -395,6 +423,7 @@ mod tests {
                 json!({"title": "Use one file", "choice": "One snapshot per store"}),
             ),
             ("decisions", json!({})),
+            ("decision", json!({"title": "Use one file"})),
             ("resolve_review", json!({"id": 0, "same": true})),
         ];
 
@@ -627,13 +656,16 @@ mod tests {
             .mutates());
         assert!(!read("reviews", json!({})).unwrap().mutates());
         assert!(!read("decisions", json!({})).unwrap().mutates());
+        assert!(!read("decision", json!({"title": "Use one file"}))
+            .unwrap()
+            .mutates());
         assert!(read("decide", json!({"title": "t", "choice": "c"}))
             .unwrap()
             .mutates());
     }
 
     #[test]
-    fn the_table_is_seven_tools_in_a_fixed_order_with_legal_names() {
+    fn the_table_is_eight_tools_in_a_fixed_order_with_legal_names() {
         // Deterministic ordering is what lets a client cache the list and
         // keeps the tool block stable in a model's prompt. The name rules are
         // the specification's: letters, digits, underscore, hyphen and dot.
@@ -650,6 +682,7 @@ mod tests {
                 "reviews",
                 "decide",
                 "decisions",
+                "decision",
                 "resolve_review"
             ]
         );

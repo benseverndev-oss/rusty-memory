@@ -242,6 +242,7 @@ pub fn run(
                 }
                 (Command::ReviewList, _) => command::review_list(engine),
                 (Command::Decisions, _) => command::decisions(engine),
+                (Command::Decision { title }, _) => command::decision(engine, &title),
                 (Command::Init { .. }, _) => unreachable!("handled above"),
                 (other, _) => unreachable!("{other:?} writes, or was not planned"),
             }

@@ -46,6 +46,7 @@ rmem — a memory that resolves contradictions deterministically
                                      [--supersedes \"<title>\"]
                                      record a decision under a stable, findable title
     rmem decisions                   every decision, and whether it still stands
+    rmem decision \"<title>\"          one decision in full, and the chain it sits in
 
 Entity ids come from `remember` and `recall`. Review ids come from `review`.
 A decision is found again by its title, so write one you would search for.
@@ -83,6 +84,10 @@ pub enum Command {
         supersedes: Option<String>,
     },
     Decisions,
+    /// Read one decision by its exact title.
+    Decision {
+        title: String,
+    },
 }
 
 /// The value after a named flag, if the flag is there.
@@ -251,6 +256,21 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
         }
 
         "decisions" => Ok(Command::Decisions),
+
+        // Singular, and a different command: `decisions` is the index and this
+        // is the entry. The two names differ by one character on purpose --
+        // they are the same noun -- so the usage error below quotes what was
+        // typed rather than guessing which was meant.
+        "decision" => {
+            let Some(title) = args.get(1) else {
+                return Err(CliError::Usage(format!(
+                    "decision needs the title to read, exactly as it was recorded -- `rmem decisions` lists them\n\n{USAGE}"
+                )));
+            };
+            Ok(Command::Decision {
+                title: title.clone(),
+            })
+        }
 
         other => Err(CliError::Usage(format!(
             "{other:?} is not an rmem command\n\n{USAGE}"

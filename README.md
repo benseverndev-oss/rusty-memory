@@ -71,20 +71,43 @@ cargo install --path crates/rm-mcp
 rmem-mcp                        # reads ./rmem.toml, serves stdin
 ```
 
-Seven tools — `remember`, `recall`, `about`, `reviews`, `resolve_review`,
-`decide`, `decisions` — which are `rmem`'s own commands over shared code rather
-than a second implementation of them. `about` is the one that differs: it takes
+Eight tools — `remember`, `recall`, `about`, `reviews`, `resolve_review`,
+`decide`, `decisions`, `decision` — which are `rmem`'s own commands over shared
+code rather than a second implementation of them. `about` is the one that differs: it takes
 both time axes, so an agent can ask what was true in May and, separately, what
 was known last Tuesday.
 
-`decide` and `decisions` are the ADR pair. A decision is an entity with four
-attributes — `status`, `choice`, `because`, `context` — written under a title
-you would search for, and re-deciding under the same title supersedes the old
-one rather than sitting beside it, so `decisions` can say which still stand.
-Unlike `remember`, `decide` never reaches a completion model: the shape is
-known, so the fields go in directly under names that stay findable. That
-matters because extraction invents a fresh attribute name most of the time, and
-a record nobody can name twice is not a record.
+`decide`, `decisions` and `decision` are the decision log. A decision is an
+entity with four attributes — `status`, `choice`, `because`, `context` — written
+under a title you would search for. Unlike `remember`, `decide` never reaches a
+completion model: the shape is known, so the fields go in directly under names
+that stay findable, and the title is matched exactly rather than resolved.
+That matters because extraction invents a fresh attribute name most of the
+time, and a record nobody can name twice is not a record.
+
+Superseding writes an edge, not a flag. `decide X --supersedes Y` draws
+`X -supersedes-> Y`, so the link is a fact about the pair and both ends can read
+it: `decisions` names the successor beside every retired decision, and
+`decision "<title>"` walks the chain to whatever stands now.
+
+That walk is the point of the whole thing. An agent that searches its memory
+lands on whatever matches the words, and a superseded decision matches just as
+well as the one that replaced it — the `choice` line of a retired decision looks
+exactly as authoritative as a live one. So the answer to "what did we decide
+about X" has to carry its own correction:
+
+```
+Store snapshots as one JSON file [superseded]
+  write the whole store on every change
+  because simplest thing that survives a restart
+
+DO NOT ACT ON THE CHOICE ABOVE -- IT WAS REPLACED.
+What stands now is entity 1, "Store snapshots in SQLite". Read that one.
+```
+
+Re-deciding under the same title is the other way a decision changes, and it is
+a different thing: the title keeps its entity, the new choice is what stands,
+and `decision` shows every choice it has held with the date each was recorded.
 
 The answer keeps its three states across the wire. `{"believed": "absent"}` is
 "someone said there is none" and `{"believed": "unknown"}` is "it has never come
