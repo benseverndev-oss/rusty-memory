@@ -95,6 +95,12 @@ where
     /// subsequent `tools/call`, whether the client on the other end can read
     /// `structuredContent`.
     negotiated: Option<String>,
+    /// What the client called itself in the handshake.
+    ///
+    /// Recorded against every write it makes. A store one agent uses does not
+    /// need this; a store several share does, and asking each to remember a
+    /// `session` argument is asking for the writes where it was forgotten.
+    client: Option<String>,
 }
 
 impl<P, F> Server<P, F>
@@ -127,6 +133,7 @@ where
             config,
             provider,
             negotiated: None,
+            client: None,
         })
     }
 
@@ -215,6 +222,20 @@ where
             .and_then(Value::as_str);
         let agreed = version::negotiate(requested);
         self.negotiated = Some(agreed.clone());
+        // Taken once, here, because this is the only message that carries it.
+        // The version too, since two builds of one agent are two writers and a
+        // log that cannot tell them apart cannot answer why they disagreed.
+        self.client = request
+            .params
+            .get("clientInfo")
+            .and_then(|c| {
+                let name = c.get("name")?.as_str()?;
+                Some(match c.get("version").and_then(Value::as_str) {
+                    Some(v) => format!("{name} {v}"),
+                    None => name.to_string(),
+                })
+            })
+            .filter(|c| !c.trim().is_empty());
         json!({
             "protocolVersion": agreed,
             // No `listChanged`: this table is a constant, so promising
@@ -263,7 +284,7 @@ where
             .cloned()
             .unwrap_or_else(|| json!({}));
 
-        let call = match Call::read(name, &arguments, now) {
+        let call = match Call::read(name, &arguments, now, self.client.as_deref()) {
             Ok(call) => call,
             Err(why) => return Ok(refused(era, &why)),
         };

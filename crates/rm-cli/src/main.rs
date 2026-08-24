@@ -4,13 +4,27 @@
 //! where it is tested -- dispatch included, since which commands need a
 //! provider is a decision and it was wrong here once.
 
-use std::path::Path;
 use std::process::ExitCode;
 
 use rm_cli::format::render;
 use rm_cli::run::{exit_code, run};
 
 const CONFIG: &str = "rmem.toml";
+
+/// An environment variable naming the config to use instead of `./rmem.toml`.
+///
+/// Several agents sharing one store is the point, and each of them runs in its
+/// own directory. Without this every project would need its own `rmem.toml`
+/// pointing at the same store, and one of them would eventually point somewhere
+/// else -- a divergence nothing reports, because two stores are not an error.
+const CONFIG_ENV: &str = "RMEM_CONFIG";
+
+/// The config this process should read.
+fn config_path() -> std::path::PathBuf {
+    std::env::var_os(CONFIG_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(CONFIG))
+}
 
 fn main() -> ExitCode {
     // A wall clock reading, used for both time axes. Nothing below reads a
@@ -20,7 +34,7 @@ fn main() -> ExitCode {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
 
-    let result = run(std::env::args().skip(1), Path::new(CONFIG), now);
+    let result = run(std::env::args().skip(1), config_path().as_path(), now);
     match &result {
         Ok(outcome) => println!("{}", render(outcome)),
         // The library's own words. Every refusal in this workspace names

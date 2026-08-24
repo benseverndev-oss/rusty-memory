@@ -264,6 +264,47 @@ the expensive half, encoding and parsing two million JSON floats, is gone. Row
 writes in place need the engine to track which rows changed, and that is a
 separate piece of work.
 
+## Giving it to the agents you already have
+
+On one machine, several sessions share a store with nothing running between
+them. Each spawns its own `rmem-mcp`, and they take turns on the advisory lock
+beside the store -- measured here at eight concurrent writers from eight
+separate processes, all eight landing.
+
+```json
+"rmem": {
+  "command": "rmem-mcp",
+  "env": {
+    "RMEM_CONFIG": "D:/memory/rmem.toml",
+    "RMEM_TOOLS": "decide,decisions,decision"
+  }
+}
+```
+
+`RMEM_CONFIG` is what makes it one store rather than one per project: without
+it each session reads `./rmem.toml` from its own directory, and eventually one
+of them points somewhere else -- a divergence nothing reports, because two
+stores are not an error.
+
+`RMEM_TOOLS` is what it costs. The tool table is sent on every turn of every
+session that has this configured, used or not:
+
+| exposed | tools | tokens per turn |
+|---|---|---|
+| everything | 8 | ~1,700 |
+| `decide,decisions,decision,recall` | 4 | ~1,060 |
+| `decide,decisions,decision` | 3 | ~810 |
+| `decisions,decision` | 2 | ~360 |
+
+For comparison, a thirty-decision log is about 1,850 tokens to read in full. A
+project that only ever consults decisions should not pay most of that again,
+every turn, to advertise five tools it will never call.
+
+Writes are attributed to whoever made them. A client names itself in the MCP
+handshake and that goes on everything it writes, so a shared log says which
+agent decided what without any of them having to remember to say. A `session`
+argument, when given, is appended rather than replacing it.
+
 ## Many agents, one store
 
 ```sh

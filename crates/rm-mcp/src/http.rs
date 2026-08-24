@@ -24,6 +24,18 @@
 //!
 //! # What it does not do
 //!
+//! **Writes over this transport are not attributed.** A client names itself in
+//! `initialize`, and [`crate::Server`] records that against everything it
+//! writes -- but each request here arrives on its own connection with its own
+//! server, so the handshake and the tool call never meet and every write is
+//! recorded as `mcp`. Over stdio, where the connection lives for the session,
+//! attribution works.
+//!
+//! The fix is the transport's own: `Mcp-Session-Id`, minted at `initialize`,
+//! echoed by the client, and looked up here. It is not implemented, and this
+//! says so rather than leaving somebody to find a shared log in which every
+//! entry has the same author.
+//!
 //! No TLS and no OAuth. The specification's authorization chapter describes an
 //! OAuth 2.1 resource server, which is a great deal more than a bearer token,
 //! and pretending otherwise in a doc comment would be worse than saying so.
