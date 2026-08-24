@@ -126,6 +126,27 @@ rmem decision "Pin the compiler"   # its history reads 2026-02-28, not today
 rmem decisions --status rejected   # what was tried and turned down
 ```
 
+### The embedder is a choice you can now change your mind about
+
+The store keeps a value, an interval and a provenance. The text that was
+*embedded* is not among them — it goes to the embedder and is dropped — so the
+vectors are the only surviving representation of it. That made choosing an
+embedding model a **one-way door**: a different model, or the same model at a
+different dimension, strands every vector already written, and there is no way
+back short of re-ingesting from source.
+
+`rmem reindex` is the way back, where the text can be worked out again. A
+decision's is `"decision {title}: {attribute} is {value}"`, and title, attribute
+and value are all in the store, so a decision log can be re-embedded by anything
+at any time — a different provider, a local model, a different dimension.
+
+It refuses on a store holding anything else. A fact that came from a
+conversation was embedded on a sentence the extractor wrote, and that sentence
+is not kept; re-embedding around it would leave two models' output in one index,
+where the distances between them are not wrong but meaningless. That is the
+failure this project refuses everywhere else it appears, so it is refused here
+too, naming what it found.
+
 Reading *back* along the valid axis — "what did this hold in March" — is an
 `about` with both timestamps, which the MCP server takes and the `rmem` binary
 does not yet expose. The store records it either way; only one of the two front

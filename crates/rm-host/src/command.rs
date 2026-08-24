@@ -115,6 +115,11 @@ pub enum Outcome {
         supersedes_unknown: Option<String>,
     },
     Decisions(Vec<DecisionLine>),
+    /// The index was rebuilt: how many assertions, and under what shape.
+    Reindexed {
+        assertions: usize,
+        dimension: usize,
+    },
     /// One decision read in full. `None` when no decision has that title --
     /// reported rather than empty, because "no such decision" and "a decision
     /// with nothing in it" are different answers.
@@ -844,6 +849,114 @@ pub fn decisions(engine: &Engine, only: Option<&str>) -> Result<Outcome, HostErr
     }
     out.sort_by_key(|d| std::cmp::Reverse(d.entity));
     Ok(Outcome::Decisions(out))
+}
+
+/// Everything the index needs rebuilding with, embedded before the lock.
+pub struct ReindexPlan {
+    vectors: Vec<(rm_engine::AssertionId, Vec<f32>)>,
+    dimension: usize,
+    metric: Metric,
+}
+
+/// Re-embed every assertion in the store under the current provider.
+///
+/// # What this is for
+///
+/// The store keeps a value, an interval and a provenance. The text that was
+/// *embedded* is not among them -- it goes to the embedder and is dropped -- so
+/// the vectors are the only surviving representation of it, and changing
+/// embedding model strands every one of them. That makes choosing an embedder
+/// a one-way door, which is a poor position from which to try a different one.
+///
+/// This is the way back, where the text can be worked out again. A decision's
+/// is `"decision {title}: {attribute} is {value}"`, and title, attribute and
+/// value are all in the store, so a decision log can be re-embedded by anything
+/// at any time.
+///
+/// # Why it refuses on a mixed store
+///
+/// A fact that came from a conversation was embedded on a sentence the
+/// extractor wrote, and that sentence is gone. Re-embedding around it would
+/// leave two models' output in one index, where the distances between them are
+/// not wrong but meaningless -- the failure this workspace refuses everywhere
+/// else it appears. So a store holding anything but decisions is refused, and
+/// says what it found.
+pub fn reindex_texts(engine: &Engine) -> Result<Vec<(rm_engine::AssertionId, String)>, HostError> {
+    let mut texts = Vec::new();
+    let mut unreachable: Vec<String> = Vec::new();
+    for (id, entity, attribute) in engine.assertion_ids() {
+        let is_decision = engine
+            .identity_of(entity)
+            .is_some_and(|r| r.get("kind") == Some("decision"));
+        if !is_decision || !DECISION_FIELDS.contains(&attribute.as_str()) {
+            if unreachable.len() < 3 {
+                unreachable.push(format!("entity {entity}'s {attribute}"));
+            }
+            continue;
+        }
+        // Rebuilt exactly as `embed_field` composes it. The two have to agree
+        // or a rebuilt vector lands somewhere its original never was; the test
+        // `a_rebuilt_decision_vector_matches_the_one_decide_wrote` is what
+        // holds them together.
+        let title = title_of(engine, entity);
+        let value = engine
+            .store_history(entity, &attribute)
+            .last()
+            .and_then(|v| v.value.clone())
+            .unwrap_or_default();
+        texts.push((id, format!("decision {title}: {attribute} is {value}")));
+    }
+
+    if !unreachable.is_empty() {
+        return Err(HostError::Refused(format!(
+            "this store holds assertions that cannot be re-embedded, so rebuilding the index would leave two models' output in it and every distance between them meaningless. Only decisions carry text that can be worked out again -- a fact from a conversation was embedded on a sentence the extractor wrote, and that sentence is not kept. Found, for example: {}.",
+            unreachable.join(", ")
+        )));
+    }
+
+    Ok(texts)
+}
+
+/// Embed what [`reindex_texts`] worked out. No store, no lock.
+///
+/// Separate so the read that enumerates the store and the network calls that
+/// re-embed it do not happen under one lock -- the same split `remember` and
+/// `decide` already make, for the same reason.
+///
+/// Between the read and the commit another writer may add an assertion. Nothing
+/// here notices, and nothing needs to: the commit covers N of N+1 and
+/// [`Engine::rebuild_index`] refuses it by count, so the failure is a message
+/// and a re-run rather than an index missing a vector.
+pub fn plan_reindex(
+    texts: Vec<(rm_engine::AssertionId, String)>,
+    embedder: &impl Embedder,
+    dimension: usize,
+    metric: Metric,
+) -> Result<ReindexPlan, HostError> {
+    let mut vectors = Vec::with_capacity(texts.len());
+    for (id, text) in texts {
+        let v = embedder
+            .embed(&text)
+            .map_err(|e| HostError::Refused(e.to_string()))?;
+        vectors.push((id, v));
+    }
+    Ok(ReindexPlan {
+        vectors,
+        dimension,
+        metric,
+    })
+}
+
+/// Swap in the index [`plan_reindex`] built. Touches no network.
+pub fn commit_reindex(engine: &mut Engine, plan: ReindexPlan) -> Result<Outcome, HostError> {
+    let assertions = plan.vectors.len();
+    engine
+        .rebuild_index(plan.dimension, plan.metric, plan.vectors)
+        .map_err(|e| HostError::Refused(e.to_string()))?;
+    Ok(Outcome::Reindexed {
+        assertions,
+        dimension: plan.dimension,
+    })
 }
 
 /// One decision in full, found by exact title.
@@ -1641,6 +1754,136 @@ pub(crate) mod tests {
         assert_eq!(
             queue[0].revisions, 2,
             "and the store still knows there was an earlier choice"
+        );
+    }
+
+    /// A rebuilt vector is the one `decide` wrote.
+    ///
+    /// Two places compose the text a decision is embedded from -- `embed_field`
+    /// on the way in, `reindex_texts` on the way back -- and nothing but this
+    /// keeps them saying the same thing. If they drift, a rebuilt store still
+    /// works, still returns hits, and quietly ranks everything a little wrong:
+    /// the failure this project keeps finding and keeps refusing to ship.
+    #[test]
+    fn a_rebuilt_decision_vector_matches_the_one_decide_wrote() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "rust-toolchain.toml names the version",
+            None,
+            Some("CI took whatever stable had become"),
+            None,
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        // What the store now holds, keyed by assertion.
+        let before: Vec<(rm_engine::AssertionId, Vec<f32>)> = reindex_texts(&e)
+            .unwrap()
+            .into_iter()
+            .map(|(id, text)| (id, stub.embed(&text).unwrap()))
+            .collect();
+        assert!(
+            !before.is_empty(),
+            "the probe must actually cover something"
+        );
+
+        // Every recalled hit is reachable at the same score after a rebuild,
+        // which is only true if the text was composed identically.
+        let query = stub
+            .embed("decision Pin the compiler: choice is rust-toolchain.toml names the version")
+            .unwrap();
+        let Outcome::Recalled { hits: was, .. } = commit_recall(&e, query.clone(), 5, 0.0).unwrap()
+        else {
+            panic!()
+        };
+
+        let plan = plan_reindex(reindex_texts(&e).unwrap(), &stub, 3, Metric::Cosine).unwrap();
+        commit_reindex(&mut e, plan).unwrap();
+
+        let Outcome::Recalled { hits: now, .. } = commit_recall(&e, query, 5, 0.0).unwrap() else {
+            panic!()
+        };
+        assert_eq!(was.len(), now.len());
+        for (a, b) in was.iter().zip(&now) {
+            assert_eq!(a.assertion, b.assertion, "the order must not move");
+            assert_eq!(
+                a.score, b.score,
+                "a rebuilt vector that scores differently is a different vector"
+            );
+        }
+    }
+
+    /// A store holding anything but decisions is refused.
+    ///
+    /// A conversational fact was embedded on a sentence the extractor wrote,
+    /// and that sentence is not kept. Re-embedding around it would leave two
+    /// models' output in one index, where the distances between them are not
+    /// wrong but meaningless.
+    #[test]
+    fn reindexing_a_store_it_cannot_fully_cover_is_refused() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        // A decision, which is reachable...
+        decide(
+            &mut e, "Kept", "a choice", None, None, None, None, None, 100, "t", &stub,
+        )
+        .unwrap();
+        // ...and something that is not, written the way `ingest` writes.
+        e.remember(Observation {
+            kind: "person".into(),
+            mention: Record::new().with("name", "Ben").with("kind", "person"),
+            attribute: "employer".into(),
+            value: Some("Globex".into()),
+            valid: Interval::since(100),
+            provenance: Provenance::new(Source::ToolOutput, 100, "t"),
+            supersession: Supersession::Unstated,
+            embedding: stub.embed("Ben works at Globex").unwrap(),
+        })
+        .unwrap();
+
+        let Err(HostError::Refused(why)) = reindex_texts(&e) else {
+            panic!("a store it cannot fully cover must be refused")
+        };
+        assert!(
+            why.contains("employer"),
+            "it should say what it found: {why}"
+        );
+        assert!(why.contains("meaningless"), "and why it matters: {why}");
+    }
+
+    /// A rebuild that does not cover everything is refused by the engine too,
+    /// not only by the host that usually catches it first.
+    #[test]
+    fn a_partial_rebuild_leaves_the_index_alone() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e, "One", "a", None, None, None, None, None, 100, "t", &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e, "Two", "b", None, None, None, None, None, 100, "t", &stub,
+        )
+        .unwrap();
+        let before = e.index_len();
+
+        let mut half = plan_reindex(reindex_texts(&e).unwrap(), &stub, 3, Metric::Cosine).unwrap();
+        half.vectors.truncate(1);
+        let Err(HostError::Refused(why)) = commit_reindex(&mut e, half) else {
+            panic!("a partial rebuild must be refused")
+        };
+        assert!(why.contains("could never be recalled"), "{why}");
+        assert_eq!(
+            e.index_len(),
+            before,
+            "and the index it came in with must survive"
         );
     }
 

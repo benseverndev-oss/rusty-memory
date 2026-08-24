@@ -859,6 +859,78 @@ impl Engine {
         self.assertions.get(&id)
     }
 
+    /// Every assertion in the store, with the entity and attribute it belongs
+    /// to, in id order.
+    ///
+    /// For a caller that needs to reconstruct what each one was embedded from.
+    /// The engine cannot do that itself: it never sees the text, only the
+    /// vector the host handed it.
+    pub fn assertion_ids(&self) -> Vec<(AssertionId, StableId, String)> {
+        self.assertions
+            .iter()
+            .map(|(id, e)| (*id, e.entity, e.attribute.clone()))
+            .collect()
+    }
+
+    /// Replace the index with one built from vectors the caller supplies.
+    ///
+    /// # Why the store cannot do this on its own
+    ///
+    /// A `Version` keeps its value, its interval and its provenance. The text
+    /// that was *embedded* -- a sentence the extractor wrote, or a line the
+    /// host composed -- is handed to the embedder and dropped. So the vectors
+    /// are the only surviving representation of it, and changing embedder is a
+    /// one-way door: a different model, or the same model at a different
+    /// dimension, strands every vector already written.
+    ///
+    /// This is the way back through, for callers that *can* reconstruct the
+    /// text. It is not a general repair: whoever calls it has to know what each
+    /// assertion was embedded from, and only some do.
+    ///
+    /// # It is all or nothing
+    ///
+    /// `Engine::open` refuses a snapshot in which any assertion lacks a vector,
+    /// because such an assertion could never be recalled and nothing would say
+    /// so. A partial rebuild would either break that or -- worse -- leave two
+    /// embedding models' output in one index, where every distance between
+    /// them is silently meaningless rather than merely wrong. So a vector for
+    /// every assertion, or the index is left exactly as it was.
+    pub fn rebuild_index(
+        &mut self,
+        dimension: usize,
+        metric: Metric,
+        vectors: Vec<(AssertionId, Vec<f32>)>,
+    ) -> Result<(), EngineError> {
+        let mut fresh = VectorIndex::new(dimension, metric);
+        // Built to one side and swapped at the end, so a vector the new index
+        // refuses -- wrong length, non-finite, zero under cosine -- leaves the
+        // engine with the index it came in with rather than half of one.
+        for (id, v) in &vectors {
+            if !self.assertions.contains_key(id) {
+                return Err(EngineError::CorruptSnapshot(format!(
+                    "a vector was supplied for assertion {id}, which this store does not have"
+                )));
+            }
+            fresh.insert(*id, v)?;
+        }
+        if fresh.len() != self.assertions.len() {
+            let missing: Vec<AssertionId> = self
+                .assertions
+                .keys()
+                .filter(|id| !vectors.iter().any(|(v, _)| v == *id))
+                .take(3)
+                .copied()
+                .collect();
+            return Err(EngineError::CorruptSnapshot(format!(
+                "the rebuild covers {} of {} assertions, and one without a vector could never be recalled. Missing, for example: {missing:?}",
+                fresh.len(),
+                self.assertions.len()
+            )));
+        }
+        self.index = fresh;
+        Ok(())
+    }
+
     /// How many vectors are searchable.
     pub fn index_len(&self) -> usize {
         self.index.len()

@@ -49,6 +49,7 @@ rmem — a memory that resolves contradictions deterministically
                                      [--supersedes \"<title>\"] [--at YYYY-MM-DD]
                                      record a decision under a stable, findable title
     rmem decisions [--status <s>]    every decision, and whether it still stands
+    rmem reindex                     re-embed every assertion under the current provider
     rmem decision \"<title>\"          one decision in full, and the chain it sits in
 
 Entity ids come from `remember` and `recall`. Review ids come from `review`.
@@ -98,6 +99,8 @@ pub enum Command {
         /// Show only decisions with this status. `None` shows every one.
         status: Option<String>,
     },
+    /// Rebuild every vector in the store under the current provider.
+    Reindex,
     /// Read one decision by its exact title.
     Decision {
         title: String,
@@ -272,6 +275,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                 supersedes: flag(&args, "--supersedes")?,
             })
         }
+
+        "reindex" => Ok(Command::Reindex),
 
         "decisions" => Ok(Command::Decisions {
             status: flag(&args, "--status")?,

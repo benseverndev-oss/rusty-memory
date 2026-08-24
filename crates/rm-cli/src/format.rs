@@ -253,6 +253,15 @@ pub fn render(outcome: &Outcome) -> String {
             out
         }
 
+        Outcome::Reindexed {
+            assertions,
+            dimension,
+        } => format!(
+            "re-embedded {} under the current provider, at {dimension} dimensions.
+Every vector in this store now comes from one model.",
+            plural(*assertions, "assertion")
+        ),
+
         Outcome::About(Believed::Value(v)) => v.clone(),
         Outcome::About(Believed::Absent) => "no value — asserted to have none".to_string(),
         Outcome::About(Believed::Unknown) => "nothing known — this was never discussed".to_string(),

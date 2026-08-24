@@ -136,9 +136,50 @@ pub fn run(
             | Command::ReviewConfirm(_)
             | Command::ReviewReject(_)
             | Command::Decide { .. }
+            | Command::Reindex
     );
 
+    /// Stands in where there is nothing to embed.
+    ///
+    /// Never called: `plan_reindex` embeds once per text and there are none.
+    /// It exists so the empty case does not have to build a provider, which
+    /// would demand a credential to do no work.
+    struct NoEmbedder;
+    impl rm_engine::Embedder for NoEmbedder {
+        fn embed(&self, _: &str) -> Result<Vec<f32>, rm_engine::EmbedderError> {
+            Err(rm_engine::EmbedderError("nothing to embed".to_string()))
+        }
+    }
+
     let path = config.store.path.clone();
+
+    // Its own branch, because it is the one command that reads the store,
+    // calls the network, and then writes -- three phases where every other
+    // command has two. Folding it into the brackets below would mean either
+    // holding a lock across the embeddings or opening the store twice inside
+    // one, and both are the thing this file exists to avoid.
+    if matches!(command, Command::Reindex) {
+        let (r, p2) = (config.ruleset()?, config.policy_for_engine()?);
+        let texts = store::with_read(&path, r, p2, dimension, metric, |engine| {
+            command::reindex_texts(engine)
+        })?;
+        // No provider unless there is something to embed. `Config::provider`
+        // reads the API key out of the environment and refuses when it is
+        // unset, so building it unconditionally made `reindex` demand a
+        // credential to do nothing -- the same mistake the two brackets below
+        // already carry a comment about avoiding.
+        let plan = if texts.is_empty() {
+            command::plan_reindex(texts, &NoEmbedder, dimension, metric)?
+        } else {
+            let provider = config.provider()?;
+            command::plan_reindex(texts, &provider, dimension, metric)?
+        };
+        let (r, p2) = (config.ruleset()?, config.policy_for_engine()?);
+        return store::with_write(&path, r, p2, dimension, metric, |engine| {
+            command::commit_reindex(engine, plan)
+        })
+        .map_err(CliError::from);
+    }
 
     // # Every model call happens above the lock, not inside it
     //
