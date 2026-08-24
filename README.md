@@ -232,6 +232,39 @@ wired by default — it spends a completion per prompt, and that is not a choice
 to make on someone's behalf by their cloning a repo. See
 [`hooks/README.md`](hooks/README.md).
 
+## Many agents, one store
+
+```sh
+rmem-mcp                          # stdio: one client, one machine
+RMEM_TOKEN=... rmem-mcp --http 0.0.0.0:8899
+```
+
+stdio serves one client on one box. The store is a file and the lock is a
+`flock` on a sidecar beside it, so "many agents" has meant many processes on one
+filesystem. A memory several agents *share* — where one records a decision and
+another is corrected by it — needs a socket.
+
+`--http` is MCP's Streamable HTTP transport. There is no SSE: the stream exists
+for servers that send messages of their own, and this one never does, so every
+response is a single JSON object. Each connection gets its own server, because
+the protocol version is negotiated per client.
+
+It is safe by default and refuses rather than warns:
+
+- a request carrying `Origin` gets **403** — that is a browser, this server has
+  no browser clients, and the specification requires the check by name because a
+  page on any site can point at a loopback port
+- binding anything but loopback without `RMEM_TOKEN` **refuses to start**, since
+  a memory on an open port with no credential is not a deployment anyone chooses
+  on purpose
+- `GET` gets **405**: the stream it would open carries server-initiated
+  messages, and there are none
+
+**No TLS and no OAuth.** The specification's authorization chapter describes an
+OAuth 2.1 resource server, which a bearer token is not. Anything facing a
+hostile network wants a reverse proxy in front that terminates TLS and does the
+real thing.
+
 ## Vectors without a service
 
 `[provider] embedder = "local"` computes vectors here instead of asking a

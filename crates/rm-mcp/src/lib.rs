@@ -51,6 +51,7 @@
 //! lock within `rm_host::store`'s deadline comes back as a refusal saying so,
 //! rather than blocking a client forever behind a wedged peer.
 
+pub mod http;
 pub mod jsonrpc;
 pub mod render;
 pub mod serve;
