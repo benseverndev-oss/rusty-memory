@@ -1,0 +1,19 @@
+[package]
+name = "rm-conform"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+description = "Scores the store on contradiction, supersession and time against an independent reference model"
+
+[dependencies]
+rm-core.workspace = true
+rm-survivor.workspace = true
+rm-engine.workspace = true
+rm-host.workspace = true
+rm-index.workspace = true
+rm-resolve.workspace = true
+rm-embed.workspace = true
