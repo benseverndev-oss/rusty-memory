@@ -85,6 +85,18 @@ pub struct Query {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Recalled {
     pub entity: StableId,
+    /// What the entity this is about is called, when it has a name.
+    ///
+    /// Resolved here rather than left to the caller because every caller wants
+    /// it and the engine already holds it. A hit reading `entity 14  because =
+    /// the k-curve is still 0.926 at k=200` is the right answer with the
+    /// question missing: what the assertion says, with no way to tell what it
+    /// is about short of a second lookup per hit.
+    ///
+    /// `None` for an entity whose identity carries no `name`. Nothing requires
+    /// one -- an entity exists as soon as something is asserted about it, and
+    /// the mention that created it may have had only a kind.
+    pub name: Option<String>,
     pub assertion: AssertionId,
     pub attribute: String,
     /// `None` is a tombstone — this assertion claimed the attribute had no
@@ -343,6 +355,9 @@ impl Engine {
                     .get(entry.version)?;
                 Some(Recalled {
                     entity: entry.entity,
+                    name: self
+                        .identity_of(entry.entity)
+                        .and_then(|r| r.get("name").map(str::to_string)),
                     assertion: hit.id,
                     attribute: entry.attribute.clone(),
                     value: version.value.clone(),

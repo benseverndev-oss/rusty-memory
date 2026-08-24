@@ -140,9 +140,18 @@ pub fn render(outcome: &Outcome) -> Rendered {
                          whether it replaces this one -- both may be true]"
                     }
                 };
+                // The name first, because it is what the line is *about*.
+                // Without it a hit reads `entity 14  because = the k-curve is
+                // still 0.926 at k=200` -- the right answer with the question
+                // missing, and no way to tell which decision it belongs to
+                // short of another call per hit. The id stays: it is what
+                // `about` takes.
+                let who = match &h.name {
+                    Some(n) => format!("{n} (entity {})", h.entity),
+                    None => format!("entity {}", h.entity),
+                };
                 text.push_str(&format!(
-                    "  entity {}  {} = {value}  (score {:.3}, {}){stale}\n",
-                    h.entity,
+                    "  {who}  {} = {value}  (score {:.3}, {}){stale}\n",
                     h.attribute,
                     h.score,
                     source_name(&h.provenance.source),
@@ -412,6 +421,10 @@ fn hit(h: &Recalled) -> Value {
     } = &h.provenance;
     json!({
         "entity": h.entity,
+        // What the entity is called. Null when it has none -- an entity exists
+        // as soon as something is asserted about it, and nothing requires the
+        // mention that created it to have carried a name.
+        "name": h.name,
         "attribute": h.attribute,
         // Null here is unambiguous because it sits beside `asserted_absent`:
         // the pair says "this assertion claimed there is no value", which a
@@ -512,6 +525,52 @@ mod tests {
         assert!(absent.len() > 20 && unknown.len() > 20);
     }
 
+    /// A hit says what it is about, not only what it says.
+    ///
+    /// Found by seeding a real decision log and reading it: every hit came back
+    /// as `entity 14  because = the k-curve is still 0.926 at k=200` -- the
+    /// right answer with the question missing, and no way to tell which
+    /// decision it belonged to without another call per hit.
+    #[test]
+    fn a_recalled_hit_names_the_entity_it_is_about() {
+        let named = Recalled {
+            entity: 14,
+            name: Some("Rerank the recall results".into()),
+            assertion: 0,
+            attribute: "because".into(),
+            value: Some("the k-curve is still 0.926 at k=200".into()),
+            valid: Interval::since(100),
+            provenance: Provenance::new(Source::UserAssertion, 100, "s"),
+            score: 0.53,
+            standing: Standing::Latest,
+        };
+        let out = render(&Outcome::Recalled(vec![named.clone()]));
+        assert!(
+            out.text.contains("Rerank the recall results"),
+            "the name has to be in the text a model reads: {}",
+            out.text
+        );
+        assert!(
+            out.text.contains("entity 14"),
+            "and the id stays -- it is what `about` takes: {}",
+            out.text
+        );
+        assert_eq!(
+            out.structured["hits"][0]["name"],
+            json!("Rerank the recall results")
+        );
+
+        // An entity with no name still renders, and says null rather than
+        // inventing one. Nothing requires a mention to have carried a name.
+        let anonymous = Recalled {
+            name: None,
+            ..named
+        };
+        let out = render(&Outcome::Recalled(vec![anonymous]));
+        assert!(out.text.contains("entity 14"), "{}", out.text);
+        assert_eq!(out.structured["hits"][0]["name"], Value::Null);
+    }
+
     #[test]
     fn a_recalled_tombstone_is_not_a_blank() {
         // `Recalled::value` of `None` is a claim that the attribute had no
@@ -520,6 +579,7 @@ mod tests {
         // a value nobody filled in.
         let hit = Recalled {
             entity: 3,
+            name: Some("Ben".into()),
             assertion: 0,
             attribute: "employer".into(),
             value: None,
@@ -537,6 +597,7 @@ mod tests {
     fn stood(standing: Standing) -> Recalled {
         Recalled {
             entity: 1,
+            name: Some("Ben".into()),
             assertion: 0,
             attribute: "employer".into(),
             value: Some("Acme".into()),

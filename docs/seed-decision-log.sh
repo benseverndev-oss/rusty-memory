@@ -20,6 +20,9 @@
 # One thing it cannot do: record when each decision was actually made. `decide`
 # takes its timestamp from the clock, so every entry here is dated the day the
 # script ran. For a log seeded from history that is the wrong date on every row.
+#
+# Reading this log is what turned up the missing entity name in `recall`, which
+# is fixed: a hit now leads with what it is about rather than an id to chase.
 # The rusty-memory decision log, recorded from eleven merged pull requests.
 set -euo pipefail
 R="${RMEM_BIN:-rmem}"

@@ -109,9 +109,18 @@ pub fn render(outcome: &Outcome) -> String {
                         "  [a later assertion exists; neither said which replaces which]"
                     }
                 };
+                // The name leads, because it is what the line is about. An id
+                // alone made every hit a pointer to chase: `entity 14
+                // because = the k-curve is still 0.926 at k=200` is the answer
+                // with the question missing. The id stays beside it -- it is
+                // what `rmem about` takes.
+                let who = match &h.name {
+                    Some(n) => format!("{n} (entity {})", h.entity),
+                    None => format!("entity {}", h.entity),
+                };
                 out.push_str(&format!(
-                    "entity {}  {} = {value}  ({:.3}){stale}\n",
-                    h.entity, h.attribute, h.score
+                    "{who}  {} = {value}  ({:.3}){stale}\n",
+                    h.attribute, h.score
                 ));
             }
             out
