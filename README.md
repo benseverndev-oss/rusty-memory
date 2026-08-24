@@ -107,7 +107,50 @@ What stands now is entity 1, "Store snapshots in SQLite". Read that one.
 
 Re-deciding under the same title is the other way a decision changes, and it is
 a different thing: the title keeps its entity, the new choice is what stands,
-and `decision` shows every choice it has held with the date each was recorded.
+and `decision` shows every choice it has held with the day each was decided.
+
+`--at YYYY-MM-DD` records a decision that was made earlier — reconstructing a
+log from history, or writing up a choice made last week. It moves the **valid**
+time and leaves the transaction time alone, which is the difference the store's
+two axes exist for: the decision held from March, and the store learned it in
+August. Moving both would say it knew in March, and every answer it gave in
+between would become retroactively wrong — you could no longer tell a stale
+answer from a bug.
+
+```sh
+rmem decide "Pin the compiler" "rust-toolchain.toml names the version" \
+  --at 2026-02-28 \
+  --because "CI took whatever stable had become that week"
+
+rmem decision "Pin the compiler"   # its history reads 2026-02-28, not today
+rmem decisions --status rejected   # what was tried and turned down
+```
+
+### The embedder is a choice you can now change your mind about
+
+The store keeps a value, an interval and a provenance. The text that was
+*embedded* is not among them — it goes to the embedder and is dropped — so the
+vectors are the only surviving representation of it. That made choosing an
+embedding model a **one-way door**: a different model, or the same model at a
+different dimension, strands every vector already written, and there is no way
+back short of re-ingesting from source.
+
+`rmem reindex` is the way back, where the text can be worked out again. A
+decision's is `"decision {title}: {attribute} is {value}"`, and title, attribute
+and value are all in the store, so a decision log can be re-embedded by anything
+at any time — a different provider, a local model, a different dimension.
+
+It refuses on a store holding anything else. A fact that came from a
+conversation was embedded on a sentence the extractor wrote, and that sentence
+is not kept; re-embedding around it would leave two models' output in one index,
+where the distances between them are not wrong but meaningless. That is the
+failure this project refuses everywhere else it appears, so it is refused here
+too, naming what it found.
+
+Reading *back* along the valid axis — "what did this hold in March" — is an
+`about` with both timestamps, which the MCP server takes and the `rmem` binary
+does not yet expose. The store records it either way; only one of the two front
+doors can currently ask.
 
 A decision's `status` is one of `proposed`, `accepted`, `rejected` or
 `deprecated` — a closed vocabulary, because the point of a status is that a

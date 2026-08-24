@@ -115,6 +115,11 @@ pub enum Outcome {
         supersedes_unknown: Option<String>,
     },
     Decisions(Vec<DecisionLine>),
+    /// The index was rebuilt: how many assertions, and under what shape.
+    Reindexed {
+        assertions: usize,
+        dimension: usize,
+    },
     /// One decision read in full. `None` when no decision has that title --
     /// reported rather than empty, because "no such decision" and "a decision
     /// with nothing in it" are different answers.
@@ -170,9 +175,10 @@ pub struct DecisionDetail {
     /// What replaced this decision, and what replaced that, ending at whatever
     /// stands now. Empty when this is the one that stands.
     pub superseded_by: Vec<(StableId, String)>,
-    /// Every `choice` this title has held, oldest first, with when it was
-    /// recorded. One entry is a decision made once; more is a decision
-    /// re-decided under the same title.
+    /// Every `choice` this title has held, oldest first, with the day it was
+    /// decided -- valid time, so a backdated decision reads under the day it
+    /// was made rather than the day it was typed up. One entry is a decision
+    /// made once; more is a decision re-decided under the same title.
     pub history: Vec<(Timestamp, String)>,
 }
 
@@ -556,6 +562,7 @@ pub fn decide(
     because: Option<&str>,
     context: Option<&str>,
     supersedes: Option<&str>,
+    decided_at: Option<Timestamp>,
     observed_at: Timestamp,
     session: &str,
     embedder: &impl Embedder,
@@ -567,6 +574,7 @@ pub fn decide(
         because,
         context,
         supersedes,
+        decided_at,
         observed_at,
         session,
         embedder,
@@ -591,6 +599,9 @@ pub struct DecidePlan {
     /// The title of the decision being recorded. Its identity, not a hint --
     /// see [`commit_decide`].
     title: String,
+    /// When the decision was made: valid time.
+    decided_at: Timestamp,
+    /// When the store was told: transaction time.
     observed_at: Timestamp,
     session: String,
     /// The retirement of the decision this one replaces, embedded whether or
@@ -614,6 +625,12 @@ pub fn plan_decide(
     because: Option<&str>,
     context: Option<&str>,
     supersedes: Option<&str>,
+    // `decided_at` is valid time and only that. The transaction time stays at
+    // `observed_at`, because the store did not know this in March however true
+    // it was then, and moving both would make every answer it gave in between
+    // retroactively wrong -- you could no longer tell a stale answer from a
+    // bug, which is the whole reason `rm_store` carries two axes.
+    decided_at: Option<Timestamp>,
     observed_at: Timestamp,
     session: &str,
     embedder: &impl Embedder,
@@ -664,6 +681,7 @@ pub fn plan_decide(
 
     Ok(DecidePlan {
         title: title.to_string(),
+        decided_at: decided_at.unwrap_or(observed_at),
         observed_at,
         session: session.to_string(),
         retire,
@@ -692,6 +710,7 @@ pub fn plan_decide(
 pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, HostError> {
     let DecidePlan {
         title,
+        decided_at,
         observed_at,
         session,
         retire,
@@ -707,7 +726,9 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
         match find_decision(engine, &old_title) {
             None => supersedes_unknown = Some(old_title),
             Some(old) => {
-                write_field(engine, Some(old), &write, observed_at, &session)?;
+                // Retired as of the new decision's valid time: what replaced
+                // it is what says when it stopped standing.
+                write_field(engine, Some(old), &write, decided_at, observed_at, &session)?;
                 superseded = Some((old, old_title));
             }
         }
@@ -719,7 +740,7 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
     // one decision cannot scatter across two entities.
     let mut entity = find_decision(engine, &title);
     for write in &fields {
-        let landed = write_field(engine, entity, write, observed_at, &session)?;
+        let landed = write_field(engine, entity, write, decided_at, observed_at, &session)?;
         entity = Some(landed);
     }
 
@@ -742,7 +763,7 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
                     new,
                     SUPERSEDES,
                     *old,
-                    Interval::since(observed_at),
+                    Interval::since(decided_at),
                     Provenance::new(Source::UserAssertion, observed_at, &session),
                 )
                 .map_err(|e| HostError::Refused(e.to_string()))?;
@@ -764,7 +785,19 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
 }
 
 /// Every decision the store holds, most recently recorded first.
-pub fn decisions(engine: &Engine) -> Result<Outcome, HostError> {
+pub fn decisions(engine: &Engine, only: Option<&str>) -> Result<Outcome, HostError> {
+    // Checked before the scan rather than silently matching nothing. A status
+    // nobody uses and a status that does not exist both return an empty list,
+    // and the difference between "we have never rejected anything" and "you
+    // typed `declined`" is the whole answer.
+    if let Some(want) = only {
+        if want != SUPERSEDED && !DECISION_STATUSES.contains(&want) {
+            return Err(HostError::Refused(format!(
+                "{want:?} is not a decision status. It is one of: {}, {SUPERSEDED}",
+                DECISION_STATUSES.join(", ")
+            )));
+        }
+    }
     let mut out: Vec<DecisionLine> = Vec::new();
     for id in engine.entity_ids() {
         let Some(record) = engine.identity_of(id) else {
@@ -811,8 +844,119 @@ pub fn decisions(engine: &Engine) -> Result<Outcome, HostError> {
             because: latest("because"),
         });
     }
+    if let Some(want) = only {
+        out.retain(|d| d.status == want);
+    }
     out.sort_by_key(|d| std::cmp::Reverse(d.entity));
     Ok(Outcome::Decisions(out))
+}
+
+/// Everything the index needs rebuilding with, embedded before the lock.
+pub struct ReindexPlan {
+    vectors: Vec<(rm_engine::AssertionId, Vec<f32>)>,
+    dimension: usize,
+    metric: Metric,
+}
+
+/// Re-embed every assertion in the store under the current provider.
+///
+/// # What this is for
+///
+/// The store keeps a value, an interval and a provenance. The text that was
+/// *embedded* is not among them -- it goes to the embedder and is dropped -- so
+/// the vectors are the only surviving representation of it, and changing
+/// embedding model strands every one of them. That makes choosing an embedder
+/// a one-way door, which is a poor position from which to try a different one.
+///
+/// This is the way back, where the text can be worked out again. A decision's
+/// is `"decision {title}: {attribute} is {value}"`, and title, attribute and
+/// value are all in the store, so a decision log can be re-embedded by anything
+/// at any time.
+///
+/// # Why it refuses on a mixed store
+///
+/// A fact that came from a conversation was embedded on a sentence the
+/// extractor wrote, and that sentence is gone. Re-embedding around it would
+/// leave two models' output in one index, where the distances between them are
+/// not wrong but meaningless -- the failure this workspace refuses everywhere
+/// else it appears. So a store holding anything but decisions is refused, and
+/// says what it found.
+pub fn reindex_texts(engine: &Engine) -> Result<Vec<(rm_engine::AssertionId, String)>, HostError> {
+    let mut texts = Vec::new();
+    let mut unreachable: Vec<String> = Vec::new();
+    for (id, entity, attribute) in engine.assertion_ids() {
+        let is_decision = engine
+            .identity_of(entity)
+            .is_some_and(|r| r.get("kind") == Some("decision"));
+        if !is_decision || !DECISION_FIELDS.contains(&attribute.as_str()) {
+            if unreachable.len() < 3 {
+                unreachable.push(format!("entity {entity}'s {attribute}"));
+            }
+            continue;
+        }
+        // Rebuilt exactly as `embed_field` composes it. The two have to agree
+        // or a rebuilt vector lands somewhere its original never was; the test
+        // `a_rebuilt_decision_vector_matches_the_one_decide_wrote` is what
+        // holds them together.
+        let title = title_of(engine, entity);
+        let value = engine
+            .store_history(entity, &attribute)
+            .last()
+            .and_then(|v| v.value.clone())
+            .unwrap_or_default();
+        texts.push((id, format!("decision {title}: {attribute} is {value}")));
+    }
+
+    if !unreachable.is_empty() {
+        return Err(HostError::Refused(format!(
+            "this store holds assertions that cannot be re-embedded, so rebuilding the index would leave two models' output in it and every distance between them meaningless. Only decisions carry text that can be worked out again -- a fact from a conversation was embedded on a sentence the extractor wrote, and that sentence is not kept. Found, for example: {}.",
+            unreachable.join(", ")
+        )));
+    }
+
+    Ok(texts)
+}
+
+/// Embed what [`reindex_texts`] worked out. No store, no lock.
+///
+/// Separate so the read that enumerates the store and the network calls that
+/// re-embed it do not happen under one lock -- the same split `remember` and
+/// `decide` already make, for the same reason.
+///
+/// Between the read and the commit another writer may add an assertion. Nothing
+/// here notices, and nothing needs to: the commit covers N of N+1 and
+/// [`Engine::rebuild_index`] refuses it by count, so the failure is a message
+/// and a re-run rather than an index missing a vector.
+pub fn plan_reindex(
+    texts: Vec<(rm_engine::AssertionId, String)>,
+    embedder: &impl Embedder,
+    dimension: usize,
+    metric: Metric,
+) -> Result<ReindexPlan, HostError> {
+    let mut vectors = Vec::with_capacity(texts.len());
+    for (id, text) in texts {
+        let v = embedder
+            .embed(&text)
+            .map_err(|e| HostError::Refused(e.to_string()))?;
+        vectors.push((id, v));
+    }
+    Ok(ReindexPlan {
+        vectors,
+        dimension,
+        metric,
+    })
+}
+
+/// Swap in the index [`plan_reindex`] built. Touches no network.
+pub fn commit_reindex(engine: &mut Engine, plan: ReindexPlan) -> Result<Outcome, HostError> {
+    let assertions = plan.vectors.len();
+    engine
+        .rebuild_index(plan.dimension, plan.metric, plan.vectors)
+        .map_err(|e| HostError::Refused(e.to_string()))?;
+    Ok(Outcome::Reindexed {
+        assertions,
+        dimension: plan.dimension,
+    })
 }
 
 /// One decision in full, found by exact title.
@@ -834,7 +978,11 @@ pub fn decision(engine: &Engine, title: &str) -> Result<Outcome, HostError> {
     let history: Vec<(Timestamp, String)> = engine
         .store_history(id, "choice")
         .iter()
-        .filter_map(|v| Some((v.provenance.observed_at, v.value.clone()?)))
+        // The day it was decided, not the day the store was told. They are
+        // the same unless the decision was backdated, and when they differ the
+        // decided day is what a log is a log of -- "we chose this in March" is
+        // the entry, and "we typed it up in August" is not.
+        .filter_map(|v| Some((v.valid.from, v.value.clone()?)))
         .collect();
     let status = latest("status").unwrap_or_else(|| DEFAULT_STATUS.into());
     let superseded_by = chain(engine, id, Direction::Forward);
@@ -948,6 +1096,7 @@ fn write_field(
     engine: &mut Engine,
     entity: Option<StableId>,
     write: &FieldWrite,
+    decided_at: Timestamp,
     observed_at: Timestamp,
     session: &str,
 ) -> Result<StableId, HostError> {
@@ -965,7 +1114,11 @@ fn write_field(
                 mention: Record::new().with("name", title).with("kind", "decision"),
                 attribute: attribute.to_string(),
                 value: Some(value.to_string()),
-                valid: Interval::since(observed_at),
+                // Valid from when it was decided; observed when the store was
+                // told. The same for a decision recorded as it is made, and
+                // apart for one recorded later -- which is the case the two
+                // axes exist for.
+                valid: Interval::since(decided_at),
                 // `UserAssertion`, not `ToolOutput`: nobody inferred this from
                 // a sentence. Somebody decided it and said so.
                 provenance: Provenance::new(Source::UserAssertion, observed_at, session),
@@ -1263,6 +1416,7 @@ pub(crate) mod tests {
             Some("CI and a working copy were answering different questions"),
             None,
             None,
+            None,
             200,
             "test",
             &probe,
@@ -1301,7 +1455,7 @@ pub(crate) mod tests {
 
     /// Every decision in the store, as (title, entity, still standing).
     fn recorded(e: &mut Engine) -> Vec<(String, StableId, bool)> {
-        let Outcome::Decisions(ds) = decisions(e).unwrap() else {
+        let Outcome::Decisions(ds) = decisions(e, None).unwrap() else {
             panic!("decisions did not return decisions")
         };
         ds.iter()
@@ -1333,6 +1487,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "t",
             &stub,
@@ -1342,6 +1497,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite WAL",
             "also yes",
+            None,
             None,
             None,
             None,
@@ -1373,6 +1529,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "t",
             &stub,
@@ -1382,6 +1539,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "on reflection, no",
+            None,
             None,
             None,
             None,
@@ -1423,6 +1581,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "t",
             &stub,
@@ -1436,6 +1595,7 @@ pub(crate) mod tests {
             None,
             None,
             Some("Adopt SQLite"),
+            None,
             200,
             "t",
             &stub,
@@ -1480,6 +1640,7 @@ pub(crate) mod tests {
             Some("A single axis makes a stale answer indistinguishable from a bug"),
             Some("Choosing a storage model for the memory store"),
             None,
+            None,
             100,
             "cli",
             &stub,
@@ -1522,6 +1683,7 @@ pub(crate) mod tests {
             Some("we know it"),
             None,
             None,
+            None,
             100,
             "cli",
             &stub,
@@ -1552,6 +1714,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "cli",
             &stub,
@@ -1565,13 +1728,14 @@ pub(crate) mod tests {
             Some("simpler ops"),
             None,
             None,
+            None,
             200,
             "cli",
             &stub,
         )
         .unwrap();
 
-        let Outcome::Decisions(lines) = decisions(&e).unwrap() else {
+        let Outcome::Decisions(lines) = decisions(&e, None).unwrap() else {
             panic!()
         };
         let queue: Vec<_> = lines.iter().filter(|l| l.title == "Pick a queue").collect();
@@ -1593,6 +1757,270 @@ pub(crate) mod tests {
         );
     }
 
+    /// A rebuilt vector is the one `decide` wrote.
+    ///
+    /// Two places compose the text a decision is embedded from -- `embed_field`
+    /// on the way in, `reindex_texts` on the way back -- and nothing but this
+    /// keeps them saying the same thing. If they drift, a rebuilt store still
+    /// works, still returns hits, and quietly ranks everything a little wrong:
+    /// the failure this project keeps finding and keeps refusing to ship.
+    #[test]
+    fn a_rebuilt_decision_vector_matches_the_one_decide_wrote() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "rust-toolchain.toml names the version",
+            None,
+            Some("CI took whatever stable had become"),
+            None,
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        // What the store now holds, keyed by assertion.
+        let before: Vec<(rm_engine::AssertionId, Vec<f32>)> = reindex_texts(&e)
+            .unwrap()
+            .into_iter()
+            .map(|(id, text)| (id, stub.embed(&text).unwrap()))
+            .collect();
+        assert!(
+            !before.is_empty(),
+            "the probe must actually cover something"
+        );
+
+        // Every recalled hit is reachable at the same score after a rebuild,
+        // which is only true if the text was composed identically.
+        let query = stub
+            .embed("decision Pin the compiler: choice is rust-toolchain.toml names the version")
+            .unwrap();
+        let Outcome::Recalled { hits: was, .. } = commit_recall(&e, query.clone(), 5, 0.0).unwrap()
+        else {
+            panic!()
+        };
+
+        let plan = plan_reindex(reindex_texts(&e).unwrap(), &stub, 3, Metric::Cosine).unwrap();
+        commit_reindex(&mut e, plan).unwrap();
+
+        let Outcome::Recalled { hits: now, .. } = commit_recall(&e, query, 5, 0.0).unwrap() else {
+            panic!()
+        };
+        assert_eq!(was.len(), now.len());
+        for (a, b) in was.iter().zip(&now) {
+            assert_eq!(a.assertion, b.assertion, "the order must not move");
+            assert_eq!(
+                a.score, b.score,
+                "a rebuilt vector that scores differently is a different vector"
+            );
+        }
+    }
+
+    /// A store holding anything but decisions is refused.
+    ///
+    /// A conversational fact was embedded on a sentence the extractor wrote,
+    /// and that sentence is not kept. Re-embedding around it would leave two
+    /// models' output in one index, where the distances between them are not
+    /// wrong but meaningless.
+    #[test]
+    fn reindexing_a_store_it_cannot_fully_cover_is_refused() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        // A decision, which is reachable...
+        decide(
+            &mut e, "Kept", "a choice", None, None, None, None, None, 100, "t", &stub,
+        )
+        .unwrap();
+        // ...and something that is not, written the way `ingest` writes.
+        e.remember(Observation {
+            kind: "person".into(),
+            mention: Record::new().with("name", "Ben").with("kind", "person"),
+            attribute: "employer".into(),
+            value: Some("Globex".into()),
+            valid: Interval::since(100),
+            provenance: Provenance::new(Source::ToolOutput, 100, "t"),
+            supersession: Supersession::Unstated,
+            embedding: stub.embed("Ben works at Globex").unwrap(),
+        })
+        .unwrap();
+
+        let Err(HostError::Refused(why)) = reindex_texts(&e) else {
+            panic!("a store it cannot fully cover must be refused")
+        };
+        assert!(
+            why.contains("employer"),
+            "it should say what it found: {why}"
+        );
+        assert!(why.contains("meaningless"), "and why it matters: {why}");
+    }
+
+    /// A rebuild that does not cover everything is refused by the engine too,
+    /// not only by the host that usually catches it first.
+    #[test]
+    fn a_partial_rebuild_leaves_the_index_alone() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e, "One", "a", None, None, None, None, None, 100, "t", &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e, "Two", "b", None, None, None, None, None, 100, "t", &stub,
+        )
+        .unwrap();
+        let before = e.index_len();
+
+        let mut half = plan_reindex(reindex_texts(&e).unwrap(), &stub, 3, Metric::Cosine).unwrap();
+        half.vectors.truncate(1);
+        let Err(HostError::Refused(why)) = commit_reindex(&mut e, half) else {
+            panic!("a partial rebuild must be refused")
+        };
+        assert!(why.contains("could never be recalled"), "{why}");
+        assert_eq!(
+            e.index_len(),
+            before,
+            "and the index it came in with must survive"
+        );
+    }
+
+    /// A decision made in March, recorded in August, is valid from March and
+    /// known from August.
+    ///
+    /// The two axes, and the reason there are two. Moving the transaction time
+    /// back with the valid time would say the store knew this in March, which
+    /// would make every answer it gave between March and August retroactively
+    /// wrong -- you could no longer tell a stale answer from a bug, which is
+    /// what `rm_store`'s module docs give as the whole point of the second
+    /// axis. So `--at` moves one and leaves the other alone.
+    #[test]
+    fn a_backdated_decision_holds_from_then_and_is_known_from_now() {
+        const MARCH: Timestamp = 1_772_236_800_000; // 2026-02-28, well before
+        const AUGUST: Timestamp = 1_787_532_411_419; // 2026-08-24
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "rust-toolchain.toml names the version",
+            None,
+            None,
+            None,
+            None,
+            Some(MARCH),
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let Outcome::Decision(Some(d)) = decision(&e, "Pin the compiler").unwrap() else {
+            panic!()
+        };
+        // The history reads back the day it was decided, not the day it was
+        // typed. That is the whole user-visible point.
+        assert_eq!(
+            crate::time::format_day(d.history[0].0),
+            "2026-02-28",
+            "the log should show when it was decided"
+        );
+
+        // Valid time: it held in March.
+        assert_eq!(
+            about(&e, d.entity, "choice", MARCH, AUGUST).unwrap(),
+            Outcome::About(Believed::Value(
+                "rust-toolchain.toml names the version".into()
+            ))
+        );
+        // Transaction time: the store did not know it in March. Asking what it
+        // believed then gives the answer it would have given then, which is
+        // nothing.
+        assert_eq!(
+            about(&e, d.entity, "choice", MARCH, MARCH).unwrap(),
+            Outcome::About(Believed::Unknown),
+            "backdating must not rewrite what the store knew when"
+        );
+    }
+
+    /// Without `--at` the two axes coincide, so nothing changes for a decision
+    /// recorded as it is made.
+    #[test]
+    fn a_decision_recorded_now_is_valid_now_and_known_now() {
+        const NOW: Timestamp = 1_787_532_411_419;
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e, "Plain", "a choice", None, None, None, None, None, NOW, "t", &stub,
+        )
+        .unwrap();
+        let Outcome::Decision(Some(d)) = decision(&e, "Plain").unwrap() else {
+            panic!()
+        };
+        assert_eq!(d.history[0].0, NOW);
+        assert_eq!(
+            about(&e, d.entity, "choice", NOW, NOW).unwrap(),
+            Outcome::About(Believed::Value("a choice".into()))
+        );
+    }
+
+    /// The log can be read one status at a time.
+    #[test]
+    fn decisions_can_be_filtered_to_one_status() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        for (title, status) in [
+            ("Kept", None),
+            ("Turned down", Some("rejected")),
+            ("Still weighing", Some("proposed")),
+            ("Also turned down", Some("rejected")),
+        ] {
+            decide(
+                &mut e, title, "a choice", status, None, None, None, None, 100, "t", &stub,
+            )
+            .unwrap();
+        }
+
+        let titles = |only: Option<&str>| {
+            let Outcome::Decisions(l) = decisions(&e, only).unwrap() else {
+                panic!()
+            };
+            let mut t: Vec<String> = l.iter().map(|d| d.title.clone()).collect();
+            t.sort();
+            t
+        };
+        assert_eq!(titles(None).len(), 4);
+        assert_eq!(
+            titles(Some("rejected")),
+            ["Also turned down", "Turned down"]
+        );
+        assert_eq!(titles(Some("proposed")), ["Still weighing"]);
+        assert_eq!(titles(Some("accepted")), ["Kept"]);
+        assert!(titles(Some("deprecated")).is_empty());
+    }
+
+    /// A status the vocabulary does not have is refused rather than matching
+    /// nothing.
+    ///
+    /// "we have never rejected anything" and "you typed `declined`" both
+    /// produce an empty list, and telling them apart is the entire answer.
+    #[test]
+    fn filtering_by_a_status_that_does_not_exist_is_refused() {
+        let e = engine();
+        let Err(HostError::Refused(why)) = decisions(&e, Some("declined")) else {
+            panic!("a bad status should be refused")
+        };
+        assert!(
+            why.contains("proposed") && why.contains("superseded"),
+            "{why}"
+        );
+        // `superseded` is not settable by `decide`, but it is a real status a
+        // decision can hold, so filtering by it has to work.
+        assert!(decisions(&e, Some("superseded")).is_ok());
+    }
+
     /// An option considered and turned down is recordable as one.
     ///
     /// The entry a decision log is most useful for, and `decide` could not
@@ -1610,6 +2038,7 @@ pub(crate) mod tests {
             "a cross-encoder over the top 200",
             Some("rejected"),
             Some("the k-curve is still 0.926 at k=200, so there is nothing to rerank into"),
+            None,
             None,
             None,
             100,
@@ -1648,6 +2077,7 @@ pub(crate) mod tests {
                 None,
                 None,
                 None,
+                None,
                 100,
                 "t",
                 &stub,
@@ -1681,6 +2111,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "t",
             &stub,
@@ -1700,7 +2131,7 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "Plain", "a choice", None, None, None, None, 100, "t", &stub,
+            &mut e, "Plain", "a choice", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         let Outcome::Decision(Some(d)) = decision(&e, "Plain").unwrap() else {
@@ -1732,7 +2163,7 @@ pub(crate) mod tests {
             ("Store in Postgres", "a server", Some("Store in SQLite")),
         ] {
             decide(
-                &mut e, title, choice, None, None, None, replaces, 100, "t", &stub,
+                &mut e, title, choice, None, None, None, replaces, None, 100, "t", &stub,
             )
             .unwrap();
         }
@@ -1776,7 +2207,7 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "A", "first", None, None, None, None, 100, "t", &stub,
+            &mut e, "A", "first", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         decide(
@@ -1787,6 +2218,7 @@ pub(crate) mod tests {
             None,
             None,
             Some("A"),
+            None,
             200,
             "t",
             &stub,
@@ -1801,6 +2233,7 @@ pub(crate) mod tests {
             None,
             None,
             Some("B"),
+            None,
             300,
             "t",
             &stub,
@@ -1842,7 +2275,7 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "Only one", "first", None, None, None, None, 100, "t", &stub,
+            &mut e, "Only one", "first", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         decide(
@@ -1853,6 +2286,7 @@ pub(crate) mod tests {
             None,
             None,
             Some("Only one"),
+            None,
             200,
             "t",
             &stub,
@@ -1888,6 +2322,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "cli",
             &stub,
@@ -1901,6 +2336,7 @@ pub(crate) mod tests {
             Some("whole-file rewrites do not survive a real corpus"),
             None,
             Some("Store as JSON"),
+            None,
             200,
             "cli",
             &stub,
@@ -1940,6 +2376,7 @@ pub(crate) mod tests {
             None,
             None,
             Some("Teh Old Way"),
+            None,
             100,
             "cli",
             &stub,
@@ -1962,7 +2399,8 @@ pub(crate) mod tests {
         let stub = StubProvider::new(vec![]);
         for (title, choice) in [("", "something"), ("something", ""), ("  ", "x")] {
             assert!(
-                decide(&mut e, title, choice, None, None, None, None, 100, "cli", &stub).is_err(),
+                decide(&mut e, title, choice, None, None, None, None, None, 100, "cli", &stub)
+                    .is_err(),
                 "{title:?}/{choice:?}"
             );
         }
@@ -1983,13 +2421,14 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             200,
             "cli",
             &stub,
         )
         .unwrap();
 
-        let Outcome::Decisions(lines) = decisions(&e).unwrap() else {
+        let Outcome::Decisions(lines) = decisions(&e, None).unwrap() else {
             panic!()
         };
         assert_eq!(lines.len(), 1);

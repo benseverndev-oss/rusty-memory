@@ -17,12 +17,15 @@
 # Costs a few embeddings per decision and no completions at all -- `decide`
 # never reaches a completion model.
 #
-# One thing it cannot do: record when each decision was actually made. `decide`
-# takes its timestamp from the clock, so every entry here is dated the day the
-# script ran. For a log seeded from history that is the wrong date on every row.
+# Reading this log is what turned up two things since fixed: `recall` hits now
+# lead with what they are about rather than an id to chase, and `decide --at`
+# exists because every entry below used to be dated the day the script ran.
 #
-# Reading this log is what turned up the missing entity name in `recall`, which
-# is fixed: a hit now leads with what it is about rather than an id to chase.
+# The dates are still not set here. They could be -- each `d` call could carry
+# `--at` with the day its pull request merged -- and doing that is the obvious
+# next pass over this file. It is left undone deliberately rather than half
+# done: a wrong date is worse than an obviously absent one, and the merge dates
+# want reading off git rather than guessing.
 # The rusty-memory decision log, recorded from eleven merged pull requests.
 set -euo pipefail
 R="${RMEM_BIN:-rmem}"

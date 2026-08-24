@@ -145,6 +145,10 @@ pub fn definitions() -> Vec<Value> {
                     "supersedes": {
                         "type": "string",
                         "description": "The exact title of a decision this replaces. It is marked retired. A title that matches nothing is reported back rather than ignored."
+                    },
+                    "decided_at": {
+                        "type": "string",
+                        "description": "The day the decision was actually made, as YYYY-MM-DD, when that is not today. Use it when recording something settled earlier -- reconstructing a log from history, or writing up a choice made last week. This sets when the decision held from, not when the store learned it: the store still records that it heard this today, so asking what it believed last month gives the answer it would have given then."
                     }
                 },
                 "required": ["title", "choice"],
@@ -154,8 +158,18 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": "decisions",
             "title": "Decisions on record",
-            "description": "Every decision recorded, newest first, with whether it still stands. A decision that was re-decided under the same title, or superseded by a later one, is marked as replaced. Read this before proposing an approach that may already have been settled.",
-            "inputSchema": {"type": "object", "additionalProperties": false}
+            "description": "Every decision recorded, newest first, with whether it still stands. A decision that was re-decided under the same title, or superseded by a later one, is marked as replaced. Read this before proposing an approach that may already have been settled -- and pass status=rejected to see what was tried and turned down, which is what stops a settled question being reopened.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["proposed", "accepted", "rejected", "deprecated", "superseded"],
+                        "description": "Show only decisions with this status. Omit for all of them."
+                    }
+                },
+                "additionalProperties": false
+            }
         }),
         json!({
             "name": "decision",
@@ -227,12 +241,15 @@ pub enum Call {
         title: String,
         choice: String,
         status: Option<String>,
+        decided_at: Option<rm_engine::Timestamp>,
         because: Option<String>,
         context: Option<String>,
         supersedes: Option<String>,
         session: String,
     },
-    Decisions,
+    Decisions {
+        status: Option<String>,
+    },
     /// Read one decision in full, by exact title.
     Decision {
         title: String,
@@ -299,7 +316,9 @@ impl Call {
                 as_of: optional_integer(arguments, "as_of")?.unwrap_or(now),
             }),
             "reviews" => Ok(Call::Reviews),
-            "decisions" => Ok(Call::Decisions),
+            "decisions" => Ok(Call::Decisions {
+                status: optional_string(arguments, "status")?,
+            }),
             "decision" => Ok(Call::Decision {
                 title: string(arguments, "title")?,
             }),
@@ -307,6 +326,9 @@ impl Call {
                 title: string(arguments, "title")?,
                 choice: string(arguments, "choice")?,
                 status: optional_string(arguments, "status")?,
+                decided_at: optional_string(arguments, "decided_at")?
+                    .map(|d| rm_host::time::parse_day(&d))
+                    .transpose()?,
                 because: optional_string(arguments, "because")?,
                 context: optional_string(arguments, "context")?,
                 supersedes: optional_string(arguments, "supersedes")?,
@@ -334,7 +356,7 @@ impl Call {
             Call::Recall { .. }
             | Call::About { .. }
             | Call::Reviews
-            | Call::Decisions
+            | Call::Decisions { .. }
             | Call::Decision { .. } => false,
         }
     }

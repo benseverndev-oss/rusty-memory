@@ -294,6 +294,16 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }
         }
 
+        Outcome::Reindexed {
+            assertions,
+            dimension,
+        } => Rendered {
+            text: format!(
+                "Re-embedded {assertions} assertion(s) at {dimension} dimensions. Every vector in this store now comes from one model."
+            ),
+            structured: json!({"assertions": assertions, "dimension": dimension}),
+        },
+
         Outcome::Decisions(lines) if lines.is_empty() => Rendered {
             text: "No decisions have been recorded.".to_string(),
             structured: json!({"decisions": []}),
