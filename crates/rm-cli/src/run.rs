@@ -177,6 +177,7 @@ pub fn run(
             Command::Decide {
                 title,
                 choice,
+                status,
                 because,
                 context,
                 supersedes,
@@ -188,6 +189,7 @@ pub fn run(
                 Some(Planned::Decide(command::plan_decide(
                     title,
                     choice,
+                    status.as_deref(),
                     because.as_deref(),
                     context.as_deref(),
                     supersedes.as_deref(),

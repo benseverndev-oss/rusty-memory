@@ -206,6 +206,15 @@ pub fn render(outcome: &Outcome) -> Rendered {
             // uses any of it.
             if d.still_stands {
                 text.push_str("\nTHIS IS THE DECISION THAT STANDS.\n");
+            } else if d.status != "superseded" && d.superseded_by.is_empty() {
+                // Not replaced, but not in force either. The status is the
+                // whole reason, and a model that read only "does not stand"
+                // would have no idea whether this was never adopted or on its
+                // way out.
+                text.push_str(&format!(
+                    "\nDO NOT ACT ON THIS: its status is {:?}, not accepted.\n",
+                    d.status
+                ));
             } else if let Some((id, t)) = d.superseded_by.last() {
                 text.push_str(&format!(
                     "\nDO NOT ACT ON THE CHOICE ABOVE -- IT WAS REPLACED.\nWhat stands now is entity {id}, {t:?}. Read that one.\n"

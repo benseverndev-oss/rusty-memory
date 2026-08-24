@@ -43,6 +43,7 @@ rmem — a memory that resolves contradictions deterministically
     rmem review confirm <id>         answer one: the same thing
     rmem review reject <id>          answer one: different things
     rmem decide \"<title>\" \"<choice>\" [--because <why>] [--context <what prompted it>]
+                                     [--status proposed|accepted|rejected|deprecated]
                                      [--supersedes \"<title>\"]
                                      record a decision under a stable, findable title
     rmem decisions                   every decision, and whether it still stands
@@ -79,6 +80,8 @@ pub enum Command {
     Decide {
         title: String,
         choice: String,
+        /// One of `DECISION_STATUSES`. `None` means `accepted`.
+        status: Option<String>,
         because: Option<String>,
         context: Option<String>,
         supersedes: Option<String>,
@@ -249,6 +252,7 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
             Ok(Command::Decide {
                 title: title.clone(),
                 choice: choice.clone(),
+                status: flag(&args, "--status")?,
                 because: flag(&args, "--because")?,
                 context: flag(&args, "--context")?,
                 supersedes: flag(&args, "--supersedes")?,

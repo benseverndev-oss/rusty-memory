@@ -118,16 +118,18 @@ pub struct DecisionLine {
     pub status: String,
     pub choice: String,
     pub because: Option<String>,
-    /// Whether the `choice` shown beside this is the one that stands.
+    /// Whether this decision is in force — safe to act on as it reads.
+    ///
+    /// True only for an `accepted` decision that nothing has superseded. Every
+    /// other status is a reason not to act: `proposed` is not settled,
+    /// `rejected` records an option declined, `deprecated` is on its way out,
+    /// and `superseded` means another decision replaced this one.
     ///
     /// About the value being displayed, not about the title's whole past. A
     /// title re-decided under itself shows its *latest* choice, and that choice
-    /// stands -- marking it replaced said the opposite of what the line shows.
-    /// What makes it false is another decision superseding this one, which is
-    /// the case where the displayed value really is out of date.
-    ///
-    /// The count of earlier choices has not gone away; it is [`Self::revisions`],
-    /// which is a different question and now reads as one.
+    /// is in force -- marking it replaced said the opposite of what the line
+    /// shows. The count of earlier choices is [`Self::revisions`], a different
+    /// question that now reads as one.
     pub still_stands: bool,
     /// How many times this title has been decided. One unless it was
     /// re-decided under itself.
@@ -178,6 +180,30 @@ pub struct DecisionDetail {
 /// and that is precisely what `Standing::Corrected` should say about the old
 /// one.
 const DECISION_FIELDS: [&str; 4] = ["status", "choice", "because", "context"];
+
+/// What a decision's `status` may be, and the whole of it.
+///
+/// A closed vocabulary because the point of a status is that a reader can
+/// branch on it. An open one would let `rejected`, `Rejected` and `declined`
+/// mean the same thing to a person and three different things to a program,
+/// which is the same failure as the 81% singleton attribute names that made
+/// `decide` skip extraction in the first place.
+///
+/// `superseded` is deliberately not here. It says a *specific other decision*
+/// replaced this one, and writing it without naming that decision produces the
+/// state the supersession edge exists to prevent -- retired, with no way to
+/// reach what retired it. [`plan_decide`] refuses it and points at
+/// `--supersedes`, which writes both ends.
+pub const DECISION_STATUSES: [&str; 4] = ["proposed", "accepted", "rejected", "deprecated"];
+
+/// The status a decision takes when nobody says otherwise.
+pub const DEFAULT_STATUS: &str = "accepted";
+
+/// The status written on a decision that another one replaced.
+///
+/// Set by `--supersedes` and never by a caller directly; see
+/// [`DECISION_STATUSES`].
+pub const SUPERSEDED: &str = "superseded";
 
 /// The edge a decision draws to the one it replaced.
 ///
@@ -509,6 +535,7 @@ pub fn decide(
     engine: &mut Engine,
     title: &str,
     choice: &str,
+    status: Option<&str>,
     because: Option<&str>,
     context: Option<&str>,
     supersedes: Option<&str>,
@@ -519,6 +546,7 @@ pub fn decide(
     let plan = plan_decide(
         title,
         choice,
+        status,
         because,
         context,
         supersedes,
@@ -565,6 +593,7 @@ pub struct DecidePlan {
 pub fn plan_decide(
     title: &str,
     choice: &str,
+    status: Option<&str>,
     because: Option<&str>,
     context: Option<&str>,
     supersedes: Option<&str>,
@@ -578,17 +607,34 @@ pub fn plan_decide(
         ));
     }
 
+    let status = status.unwrap_or(DEFAULT_STATUS);
+    // Refused before the embedder is called, so a typo costs nothing. Named
+    // separately from an unknown status because the answer is different: this
+    // one is not a mistake about the vocabulary, it is a request for the one
+    // thing the vocabulary deliberately withholds.
+    if status == SUPERSEDED {
+        return Err(HostError::Refused(format!(
+            "a decision is not marked {SUPERSEDED:?} directly -- that says another decision replaced this one, and written on its own it leaves no way to reach the decision that did. Record the new decision with `--supersedes {title:?}`, which writes both ends."
+        )));
+    }
+    if !DECISION_STATUSES.contains(&status) {
+        return Err(HostError::Refused(format!(
+            "{status:?} is not a decision status. It is one of: {}",
+            DECISION_STATUSES.join(", ")
+        )));
+    }
+
     let retire = match supersedes {
         None => None,
         Some(old_title) => Some((
             old_title.to_string(),
-            embed_field(old_title, "status", "superseded", embedder)?,
+            embed_field(old_title, "status", SUPERSEDED, embedder)?,
         )),
     };
 
     let mut fields = Vec::with_capacity(DECISION_FIELDS.len());
     for (name, value) in [
-        ("status", Some("accepted")),
+        ("status", Some(status)),
         ("choice", Some(choice)),
         ("because", because),
         ("context", context),
@@ -720,7 +766,7 @@ pub fn decisions(engine: &Engine) -> Result<Outcome, HostError> {
         let Some(choice) = latest("choice") else {
             continue;
         };
-        let status = latest("status").unwrap_or_else(|| "accepted".into());
+        let status = latest("status").unwrap_or_else(|| DEFAULT_STATUS.into());
         // Read once: it decides the mark and it is shown on the line.
         let superseded_by = engine
             .edges_into(id, Timestamp::MAX, Timestamp::MAX)
@@ -740,7 +786,7 @@ pub fn decisions(engine: &Engine) -> Result<Outcome, HostError> {
             // Reading only the first made a decision retired by `--supersedes`
             // print as standing while printing `[superseded]` beside itself,
             // which is the one combination that cannot be true.
-            still_stands: superseded_by.is_none() && status != "superseded",
+            still_stands: superseded_by.is_none() && status == DEFAULT_STATUS,
             revisions: engine.store_history(id, "choice").len(),
             superseded_by,
             status,
@@ -773,7 +819,7 @@ pub fn decision(engine: &Engine, title: &str) -> Result<Outcome, HostError> {
         .iter()
         .filter_map(|v| Some((v.provenance.observed_at, v.value.clone()?)))
         .collect();
-    let status = latest("status").unwrap_or_else(|| "accepted".into());
+    let status = latest("status").unwrap_or_else(|| DEFAULT_STATUS.into());
     let superseded_by = chain(engine, id, Direction::Forward);
 
     Ok(Outcome::Decision(Some(Box::new(DecisionDetail {
@@ -782,7 +828,7 @@ pub fn decision(engine: &Engine, title: &str) -> Result<Outcome, HostError> {
         choice: latest("choice").unwrap_or_default(),
         because: latest("because"),
         context: latest("context"),
-        still_stands: superseded_by.is_empty() && status != "superseded",
+        still_stands: superseded_by.is_empty() && status == DEFAULT_STATUS,
         status,
         supersedes: chain(engine, id, Direction::Back),
         superseded_by,
@@ -1196,6 +1242,7 @@ pub(crate) mod tests {
         let plan = plan_decide(
             "Pin the toolchain",
             "rust-toolchain.toml names the version",
+            None,
             Some("CI and a working copy were answering different questions"),
             None,
             None,
@@ -1268,6 +1315,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "t",
             &stub,
@@ -1277,6 +1325,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite WAL",
             "also yes",
+            None,
             None,
             None,
             None,
@@ -1306,6 +1355,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "t",
             &stub,
@@ -1315,6 +1365,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "on reflection, no",
+            None,
             None,
             None,
             None,
@@ -1354,6 +1405,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "t",
             &stub,
@@ -1363,6 +1415,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite WAL",
             "also yes",
+            None,
             None,
             None,
             Some("Adopt SQLite"),
@@ -1406,6 +1459,7 @@ pub(crate) mod tests {
             &mut e,
             "Use bi-temporal storage",
             "Keep valid time and transaction time on every attribute value",
+            None,
             Some("A single axis makes a stale answer indistinguishable from a bug"),
             Some("Choosing a storage model for the memory store"),
             None,
@@ -1447,6 +1501,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "RabbitMQ",
+            None,
             Some("we know it"),
             None,
             None,
@@ -1479,6 +1534,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "cli",
             &stub,
@@ -1488,6 +1544,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "NATS",
+            None,
             Some("simpler ops"),
             None,
             None,
@@ -1519,6 +1576,123 @@ pub(crate) mod tests {
         );
     }
 
+    /// An option considered and turned down is recordable as one.
+    ///
+    /// The entry a decision log is most useful for, and `decide` could not
+    /// write it: every decision was `accepted`, so the only way to record a
+    /// rejection was to accept the word "no", which loses what was rejected
+    /// and why. The reason is the whole point -- it is what stops the same
+    /// question being reopened in six months.
+    #[test]
+    fn an_option_can_be_recorded_as_considered_and_rejected() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Rerank the recall results",
+            "a cross-encoder over the top 200",
+            Some("rejected"),
+            Some("the k-curve is still 0.926 at k=200, so there is nothing to rerank into"),
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let Outcome::Decision(Some(d)) = decision(&e, "Rerank the recall results").unwrap() else {
+            panic!()
+        };
+        assert_eq!(d.status, "rejected");
+        assert!(!d.still_stands, "a rejected option is not in force");
+        assert!(
+            d.superseded_by.is_empty(),
+            "and nothing replaced it -- it was never adopted"
+        );
+        assert!(d.because.is_some(), "the reason is the record");
+    }
+
+    /// Only the four statuses, and a typo is refused rather than stored.
+    ///
+    /// An open vocabulary would let `rejected`, `Rejected` and `declined` read
+    /// the same to a person and differently to a program, which is the failure
+    /// that made `decide` skip extraction in the first place.
+    #[test]
+    fn a_status_outside_the_vocabulary_is_refused() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        for status in ["declined", "Rejected", "wontfix", ""] {
+            let out = decide(
+                &mut e,
+                "Some title",
+                "some choice",
+                Some(status),
+                None,
+                None,
+                None,
+                100,
+                "t",
+                &stub,
+            );
+            let Err(HostError::Refused(why)) = out else {
+                panic!("{status:?} should have been refused, got {out:?}")
+            };
+            assert!(
+                why.contains("proposed") && why.contains("deprecated"),
+                "the refusal should list the vocabulary: {why}"
+            );
+        }
+        // And nothing was written on the way through.
+        assert_eq!(decision(&e, "Some title").unwrap(), Outcome::Decision(None));
+    }
+
+    /// `superseded` is not a status a caller sets.
+    ///
+    /// It claims a specific other decision replaced this one. Written on its
+    /// own it produces exactly the state the supersession edge exists to
+    /// prevent: retired, with no way to reach whatever retired it.
+    #[test]
+    fn superseded_is_refused_and_points_at_the_flag_that_does_it_properly() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        let out = decide(
+            &mut e,
+            "Store as one file",
+            "whole-file rewrite",
+            Some("superseded"),
+            None,
+            None,
+            None,
+            100,
+            "t",
+            &stub,
+        );
+        let Err(HostError::Refused(why)) = out else {
+            panic!("expected a refusal, got {out:?}")
+        };
+        assert!(
+            why.contains("--supersedes"),
+            "the refusal has to name the thing that does work: {why}"
+        );
+    }
+
+    /// The default is unchanged, so every existing caller means what it did.
+    #[test]
+    fn a_decision_with_no_status_is_accepted_and_in_force() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e, "Plain", "a choice", None, None, None, None, 100, "t", &stub,
+        )
+        .unwrap();
+        let Outcome::Decision(Some(d)) = decision(&e, "Plain").unwrap() else {
+            panic!()
+        };
+        assert_eq!(d.status, "accepted");
+        assert!(d.still_stands);
+    }
+
     /// A retired decision names what replaced it, and the chain leads to the
     /// one that stands.
     ///
@@ -1540,7 +1714,10 @@ pub(crate) mod tests {
             ),
             ("Store in Postgres", "a server", Some("Store in SQLite")),
         ] {
-            decide(&mut e, title, choice, None, None, replaces, 100, "t", &stub).unwrap();
+            decide(
+                &mut e, title, choice, None, None, None, replaces, 100, "t", &stub,
+            )
+            .unwrap();
         }
 
         let Outcome::Decision(Some(d)) = decision(&e, "Store as one JSON file").unwrap() else {
@@ -1581,11 +1758,15 @@ pub(crate) mod tests {
     fn a_supersession_cycle_terminates() {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
-        decide(&mut e, "A", "first", None, None, None, 100, "t", &stub).unwrap();
+        decide(
+            &mut e, "A", "first", None, None, None, None, 100, "t", &stub,
+        )
+        .unwrap();
         decide(
             &mut e,
             "B",
             "second",
+            None,
             None,
             None,
             Some("A"),
@@ -1595,7 +1776,19 @@ pub(crate) mod tests {
         )
         .unwrap();
         // Closes the loop: A now supersedes B, which already supersedes A.
-        decide(&mut e, "A", "third", None, None, Some("B"), 300, "t", &stub).unwrap();
+        decide(
+            &mut e,
+            "A",
+            "third",
+            None,
+            None,
+            None,
+            Some("B"),
+            300,
+            "t",
+            &stub,
+        )
+        .unwrap();
 
         let Outcome::Decision(Some(d)) = decision(&e, "A").unwrap() else {
             panic!()
@@ -1632,13 +1825,14 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "Only one", "first", None, None, None, 100, "t", &stub,
+            &mut e, "Only one", "first", None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         decide(
             &mut e,
             "Only one",
             "second",
+            None,
             None,
             None,
             Some("Only one"),
@@ -1676,6 +1870,7 @@ pub(crate) mod tests {
             None,
             None,
             None,
+            None,
             100,
             "cli",
             &stub,
@@ -1685,6 +1880,7 @@ pub(crate) mod tests {
             &mut e,
             "Store as SQLite",
             "One database per store",
+            None,
             Some("whole-file rewrites do not survive a real corpus"),
             None,
             Some("Store as JSON"),
@@ -1725,6 +1921,7 @@ pub(crate) mod tests {
             "Do it differently",
             None,
             None,
+            None,
             Some("Teh Old Way"),
             100,
             "cli",
@@ -1748,7 +1945,7 @@ pub(crate) mod tests {
         let stub = StubProvider::new(vec![]);
         for (title, choice) in [("", "something"), ("something", ""), ("  ", "x")] {
             assert!(
-                decide(&mut e, title, choice, None, None, None, 100, "cli", &stub).is_err(),
+                decide(&mut e, title, choice, None, None, None, None, 100, "cli", &stub).is_err(),
                 "{title:?}/{choice:?}"
             );
         }
@@ -1765,6 +1962,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "NATS",
+            None,
             None,
             None,
             None,
