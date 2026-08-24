@@ -20,5 +20,6 @@ pub mod differential;
 pub mod engine_harness;
 pub mod generate;
 pub mod history;
+pub mod invariants;
 pub mod reference;
 pub mod rng;
