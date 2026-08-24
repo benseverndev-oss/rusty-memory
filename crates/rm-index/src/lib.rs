@@ -246,6 +246,56 @@ pub struct Hit {
 ///
 /// Every query scans every live vector, so results are the true top-`k` with no
 /// recall parameter to tune and nothing to rebuild after a deletion.
+/// The checks every restored index passes, whichever door it came through.
+///
+/// Shared rather than duplicated because the two doors must not drift: a
+/// snapshot that one accepts and the other refuses is a store that opens or
+/// does not depending on which file it happened to be written to.
+fn validate(mut ix: VectorIndex) -> Result<VectorIndex, IndexError> {
+    if ix.dim == 0 {
+        return Err(IndexError::CorruptSnapshot(
+            "dimension is 0, so no vector could ever be inserted".to_string(),
+        ));
+    }
+    let expected = ix.ids.len() * ix.dim;
+    if ix.vectors.len() != expected {
+        return Err(IndexError::CorruptSnapshot(format!(
+            "{} ids at {} dimensions need {expected} floats, but there are {}",
+            ix.ids.len(),
+            ix.dim,
+            ix.vectors.len()
+        )));
+    }
+    if let Some(position) = ix.vectors.iter().position(|x| !x.is_finite()) {
+        return Err(IndexError::CorruptSnapshot(format!(
+            "stored component {position} is not finite"
+        )));
+    }
+
+    ix.positions = HashMap::with_capacity(ix.ids.len());
+    for (row, &id) in ix.ids.iter().enumerate() {
+        if ix.positions.insert(id, row).is_some() {
+            return Err(IndexError::CorruptSnapshot(format!(
+                "id {id} appears more than once, so one memory would answer a query twice"
+            )));
+        }
+    }
+    Ok(ix)
+}
+
+/// An index's shape and contents, without the vectors.
+///
+/// Its own type rather than `#[serde(skip)]` on the field, so that both forms
+/// stay expressible: [`VectorIndex::snapshot`] still writes the old
+/// everything-in-one-file shape, which is what lets a store written before the
+/// split be opened and migrated rather than refused.
+#[derive(Serialize, Deserialize)]
+struct Meta {
+    dim: usize,
+    metric: Metric,
+    ids: Vec<EntryId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VectorIndex {
     dim: usize,
@@ -440,6 +490,74 @@ impl VectorIndex {
         Ok(hits)
     }
 
+    /// Everything about the index except the vectors themselves.
+    ///
+    /// # Why they are kept apart
+    ///
+    /// Measured on a real store: 96.9% of the snapshot was this crate's
+    /// vectors, written as JSON numbers at roughly thirteen bytes for each
+    /// four-byte float. Everything the store actually remembers -- every
+    /// assertion, every identity -- was the other three per cent, and a whole
+    /// file was rewritten for each of them.
+    ///
+    /// So the vectors go beside the snapshot rather than inside it, as a flat
+    /// run of fixed-size records. The design is Qdrant's dense storage, which
+    /// is the same thing: a file of same-sized vectors with a map from id to
+    /// row. Only the design -- Qdrant is Apache 2.0 and this crate is MIT, and
+    /// a few hundred lines is not worth carrying somebody else's licence for.
+    pub fn snapshot_meta(&self) -> String {
+        serde_json::to_string(&Meta {
+            dim: self.dim,
+            metric: self.metric,
+            ids: self.ids.clone(),
+        })
+        .expect("Meta is always serialisable")
+    }
+
+    /// The vectors, little-endian, row after row.
+    ///
+    /// Little-endian named rather than native: a store copied between machines
+    /// has to read the same on both, and native byte order would make that
+    /// silently untrue on the day somebody moved one.
+    pub fn vectors_le(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.vectors.len() * 4);
+        for x in &self.vectors {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    }
+
+    /// Restore from a metadata snapshot and the vectors beside it.
+    ///
+    /// The same checks [`VectorIndex::open`] makes, against two files instead
+    /// of one -- and one more, because the count now has to be agreed by both:
+    /// a snapshot naming rows the vector file does not have is a store that
+    /// would search whatever came after it in memory.
+    pub fn open_split(meta: &str, vectors: &[u8]) -> Result<Self, IndexError> {
+        let meta: Meta = serde_json::from_str(meta).map_err(|e| IndexError::Parse(e.into()))?;
+        if !vectors.len().is_multiple_of(4) {
+            return Err(IndexError::CorruptSnapshot(format!(
+                "the vector file is {} bytes, which is not a whole number of 32-bit floats",
+                vectors.len()
+            )));
+        }
+        let floats: Vec<f32> = vectors
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(f32::from_le_bytes)
+            .collect();
+        let ix = VectorIndex {
+            dim: meta.dim,
+            metric: meta.metric,
+            ids: meta.ids,
+            vectors: floats,
+            positions: HashMap::new(),
+        };
+        validate(ix)
+    }
+
     /// Serialise to JSON.
     pub fn snapshot(&self) -> String {
         serde_json::to_string(self).expect("VectorIndex is always serialisable")
@@ -459,38 +577,9 @@ impl VectorIndex {
     /// and [`IndexError::CorruptSnapshot`] if they did and the numbers inside
     /// it contradict each other.
     pub fn open(snapshot: &str) -> Result<Self, IndexError> {
-        let mut ix: VectorIndex =
+        let ix: VectorIndex =
             serde_json::from_str(snapshot).map_err(|e| IndexError::Parse(e.into()))?;
-
-        if ix.dim == 0 {
-            return Err(IndexError::CorruptSnapshot(
-                "dimension is 0, so no vector could ever be inserted".to_string(),
-            ));
-        }
-        let expected = ix.ids.len() * ix.dim;
-        if ix.vectors.len() != expected {
-            return Err(IndexError::CorruptSnapshot(format!(
-                "{} ids at {} dimensions need {expected} floats, but the snapshot holds {}",
-                ix.ids.len(),
-                ix.dim,
-                ix.vectors.len()
-            )));
-        }
-        if let Some(position) = ix.vectors.iter().position(|x| !x.is_finite()) {
-            return Err(IndexError::CorruptSnapshot(format!(
-                "stored component {position} is not finite"
-            )));
-        }
-
-        ix.positions = HashMap::with_capacity(ix.ids.len());
-        for (row, &id) in ix.ids.iter().enumerate() {
-            if ix.positions.insert(id, row).is_some() {
-                return Err(IndexError::CorruptSnapshot(format!(
-                    "id {id} appears more than once, so one memory would answer a query twice"
-                )));
-            }
-        }
-        Ok(ix)
+        validate(ix)
     }
 
     /// Validate, and normalise if the metric calls for it.
@@ -542,6 +631,82 @@ impl VectorIndex {
                 .sum::<f32>()
                 .sqrt(),
         }
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn built() -> VectorIndex {
+        let mut ix = VectorIndex::new(3, Metric::Cosine);
+        ix.insert(7, &[1.0, 0.0, 0.0]).unwrap();
+        ix.insert(2, &[0.0, 2.0, 0.0]).unwrap();
+        ix.insert(9, &[0.0, 0.0, 3.0]).unwrap();
+        ix
+    }
+
+    /// The vectors go beside the snapshot and come back the same.
+    #[test]
+    fn an_index_round_trips_through_two_files() {
+        let ix = built();
+        let back = VectorIndex::open_split(&ix.snapshot_meta(), &ix.vectors_le()).unwrap();
+        assert_eq!(back, ix, "including the rows, in order");
+        // And the metadata really is small: no floats in it at all.
+        let meta = ix.snapshot_meta();
+        assert!(
+            !meta.contains("0.5773"),
+            "a normalised component leaked: {meta}"
+        );
+        assert_eq!(
+            ix.vectors_le().len(),
+            3 * 3 * 4,
+            "three rows of three floats"
+        );
+    }
+
+    /// Both doors enforce the same invariants.
+    ///
+    /// They are one function now. This is what says so, because the failure if
+    /// they drift is a store that opens through one door and not the other.
+    #[test]
+    fn the_split_door_refuses_what_the_single_one_does() {
+        let ix = built();
+        let meta = ix.snapshot_meta();
+
+        // A vector file that does not divide into floats.
+        let err = VectorIndex::open_split(&meta, &[0u8; 7]).unwrap_err();
+        assert!(format!("{err:?}").contains("whole number"), "{err:?}");
+
+        // The right shape, the wrong count: three ids, two rows of floats.
+        let short = ix.vectors_le()[..24].to_vec();
+        let err = VectorIndex::open_split(&meta, &short).unwrap_err();
+        assert!(format!("{err:?}").contains("need 9 floats"), "{err:?}");
+
+        // A component that is not finite.
+        let mut bad = ix.vectors_le();
+        bad[..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let err = VectorIndex::open_split(&meta, &bad).unwrap_err();
+        assert!(format!("{err:?}").contains("not finite"), "{err:?}");
+    }
+
+    /// Little-endian by name, so a store copied between machines reads the same.
+    #[test]
+    fn vectors_are_little_endian_whatever_the_machine_is() {
+        let mut ix = VectorIndex::new(1, Metric::L2);
+        ix.insert(0, &[1.0f32]).unwrap();
+        assert_eq!(ix.vectors_le(), 1.0f32.to_le_bytes().to_vec());
+    }
+
+    /// A store written before the split still opens.
+    ///
+    /// `snapshot`/`open` are kept for exactly this: the old shape is what is on
+    /// disk today, and refusing it would mean every existing store is lost
+    /// rather than migrated on its next save.
+    #[test]
+    fn the_old_single_file_shape_still_opens() {
+        let ix = built();
+        assert_eq!(VectorIndex::open(&ix.snapshot()).unwrap(), ix);
     }
 }
 

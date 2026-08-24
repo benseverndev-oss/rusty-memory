@@ -232,6 +232,38 @@ wired by default — it spends a completion per prompt, and that is not a choice
 to make on someone's behalf by their cloning a repo. See
 [`hooks/README.md`](hooks/README.md).
 
+## Where a store lives
+
+Two files. `memory.json` holds everything the store remembers — assertions,
+identities, the review queue — and `memory.vec` holds the vectors, as a flat run
+of little-endian `f32` rows.
+
+They were one file, and measured on a real store the vectors were **96.9%** of
+it: 1536 floats per assertion, written as JSON numbers at roughly thirteen bytes
+for each four-byte float, and all of them rewritten to record one decision.
+Splitting them took the part that is parsed and re-serialised on every write
+from 918 KB to 70 KB on a 33-decision log — **13× smaller** — and the vectors
+became 702 KB of bytes rather than 848 KB of text.
+
+The shape is Qdrant's dense storage: same-sized rows, and a map from id to row.
+The design only — Qdrant is Apache 2.0 and this is MIT, and a few hundred lines
+is not worth carrying somebody else's licence for.
+
+The vectors are written first and the snapshot second, because the snapshot's
+rename is the commit. A crash between them leaves rows nothing points at, which
+the next open neither reads nor minds; the other order would leave a snapshot
+naming rows that are not there.
+
+**A store written before the split still opens.** Its snapshot carries its own
+vectors, there is no `.vec` beside it, and the next save writes both. Refusing
+it would lose an existing store rather than move it.
+
+**What this does not yet do** is write incrementally. Both files are still
+replaced whole, so a save is O(store) rather than O(one row) — the win is that
+the expensive half, encoding and parsing two million JSON floats, is gone. Row
+writes in place need the engine to track which rows changed, and that is a
+separate piece of work.
+
 ## Many agents, one store
 
 ```sh

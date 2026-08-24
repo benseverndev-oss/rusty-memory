@@ -74,9 +74,15 @@ pub fn load(
         )),
         Err(e) => Err(HostError::Store(format!("could not read {WHERE}: {e}"))),
         Ok(text) => {
-            let engine = Engine::open(&text, ruleset, policy).map_err(|e| {
-                HostError::Store(format!("{WHERE} is not a store this build can open: {e}"))
-            })?;
+            // `None` when there is no vector file, which is a store written
+            // before the two were split. Its snapshot still carries its own
+            // vectors, so it opens and is migrated by its next save rather than
+            // refused.
+            let vectors = std::fs::read(vectors_path(path)).ok();
+            let engine =
+                Engine::open_split(&text, vectors.as_deref(), ruleset, policy).map_err(|e| {
+                    HostError::Store(format!("{WHERE} is not a store this build can open: {e}"))
+                })?;
             let (stored_dimension, stored_metric) = engine.index_shape();
             if stored_dimension != dimension {
                 return Err(HostError::Store(format!(
@@ -289,14 +295,37 @@ pub fn with_read<T>(
 /// should fsync the temporary file before the rename and the directory
 /// after.
 pub fn save(path: &Path, engine: &Engine) -> Result<(), HostError> {
+    // The vectors first, and the snapshot second, because the rename of the
+    // snapshot is the commit. A crash between them leaves a vector file with
+    // rows nothing points at, which the next open neither reads nor minds; the
+    // reverse order would leave a snapshot naming rows that are not there.
+    let vectors = vectors_path(path);
+    let vtmp = vectors.with_extension("vec.tmp");
+    std::fs::write(&vtmp, engine.vectors_le()).map_err(|e| {
+        HostError::Store(format!("could not write the vectors beside {WHERE}: {e}"))
+    })?;
+    std::fs::rename(&vtmp, &vectors).map_err(|e| {
+        let _ = std::fs::remove_file(&vtmp);
+        HostError::Store(format!("could not replace the vectors beside {WHERE}: {e}"))
+    })?;
+
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, engine.snapshot())
+    std::fs::write(&tmp, engine.snapshot_meta())
         .map_err(|e| HostError::Store(format!("could not write beside {WHERE}: {e}")))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         // Leave nothing behind on the failing path either.
         let _ = std::fs::remove_file(&tmp);
         HostError::Store(format!("could not replace {WHERE}: {e}"))
     })
+}
+
+/// The vectors' file, beside the store.
+///
+/// Named from the store rather than configured separately: two paths that can
+/// disagree are two paths that eventually do, and a snapshot pointing at
+/// somebody else's vectors is not a failure anything would report.
+pub fn vectors_path(store: &Path) -> PathBuf {
+    store.with_extension("vec")
 }
 
 #[cfg(test)]
@@ -540,9 +569,17 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != "memory.json")
+            // The two the store is made of. Anything else is litter, and a
+            // half-written one is a store a later reader could mistake for the
+            // real thing -- which is what this is here to catch, not the fact
+            // that there are now two files rather than one.
+            .filter(|n| n != "memory.json" && n != "memory.vec")
             .collect();
         assert!(left.is_empty(), "left behind: {left:?}");
+        assert!(
+            dir.path().join("memory.vec").exists(),
+            "the vectors are written beside the snapshot, not inside it"
+        );
     }
 
     #[test]
