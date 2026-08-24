@@ -16,5 +16,7 @@
 //! whole claim to be measuring anything: "known by construction" means nothing
 //! unless the expected answer is worked out without asking the code under test.
 
+pub mod generate;
 pub mod history;
 pub mod reference;
+pub mod rng;
