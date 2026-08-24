@@ -1303,3 +1303,87 @@ does not.
 This is the fourth thing measured here and left switched off, and the pattern
 across all four is the same: the signal was real, and too weak to act on
 without doing damage somewhere else.
+
+## Owning the embedder: built, measured, not enough
+
+Every vector in this workspace came from a remote service — a per-call cost, a
+network dependency, an API key, and for a memory store, every fact you record
+leaving the machine. `rm-embed` is the first implementation of the `Embedder`
+port that opens no socket: subword hashing, about a hundred lines of
+arithmetic, no model file at all.
+
+Built first because it is the cheapest thing that could work. A distilled
+static table — real vectors from a real model, looked up and averaged — has
+semantics and costs tens of megabytes of weights in the repository, and there
+is no point paying that until the free thing has been shown not to be enough.
+
+### It is not enough
+
+The decision log seeded by `docs/seed-decision-log.sh`, 31 decisions, indexed
+twice: once through `text-embedding-3-small`, once locally, using `rmem reindex`
+to swap without re-recording anything.
+
+**Asked for each decision by its own exact title**, both are perfect:
+
+| | rank-1 | in top 3 |
+|---|---|---|
+| local | 31/31 | 31/31 |
+| OpenAI | 31/31 | 31/31 |
+
+Which is the wrong test, and worth keeping only to say so: a query that reuses a
+title's words is the case subword hashing is *built* to win, and a test both
+methods ace measures nothing.
+
+**Asked in different words** — twelve paraphrases that deliberately avoid the
+title's vocabulary — they come apart:
+
+| | rank-1 | in top 3 |
+|---|---|---|
+| local | **6/12** | 8/12 |
+| OpenAI | **10/12** | 11/12 |
+
+Roughly half. And the failures are exactly the predicted shape:
+
+```
+"does the extractor know who is talking"     -> missed "Let a caller say who is speaking"
+"how do we know two names are the same"      -> missed "Resolve identity with Fellegi-Sunter"
+"should we score candidates a second time"   -> missed "Rerank the recall results"
+```
+
+Nothing lexical connects *talking* to *speaking*, or *the same person* to
+*Fellegi-Sunter*. The crate's own test says so in as many words — `car` and
+`automobile` are asserted to land orthogonal — and this is that assertion
+costing something real.
+
+One instructive near-miss: asked *"should we add a reranker to improve
+retrieval"*, local returns **Hybrid lexical retrieval**, because that title
+contains *retrieval* exactly while *reranker* only shares stem letters with
+*Rerank*. An exact word beats a near one, every time, which is the whole
+difference between matching and understanding.
+
+### What it is good for anyway
+
+It ships, defaulted off, for two reasons that are not recall quality.
+
+It makes the decision path **fully offline**: `decide`, `recall`, `reindex` and
+`decisions` need no credential and open no socket, because `decide` reaches no
+completion model either. 100 assertions were re-embedded in a shell with no
+`OPENAI_API_KEY` set, which is how that claim was checked.
+
+And it makes this measurement possible at all. Comparing two embedders on one
+corpus needs `rmem reindex`, and reindexing needs a second embedder to reindex
+*to*.
+
+### What it says about owning the embedder
+
+The question was whether the embedding could be owned rather than rented. The
+answer so far is **not this way**. Hashing is fully owned, dependency-free and
+deterministic, and it retrieves about half as well on the corpus most
+favourable to it — a decision log of titles chosen to be findable.
+
+What remains untested is the expensive option: a static table distilled from a
+real model, which has genuine semantics and costs a weights artifact. That is
+now a swap rather than a migration, since `reindex` exists and this crate has
+shown the seam works. Whether tens of megabytes in the repository is a better
+trade than an API key is a judgement, not a measurement — but it should be made
+knowing that the free version loses four of twelve.

@@ -12,5 +12,6 @@ authors.workspace = true
 rm-engine = { workspace = true }
 rm-extract = { workspace = true }
 rm-providers = { workspace = true }
+rm-embed = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }

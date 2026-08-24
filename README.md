@@ -232,6 +232,27 @@ wired by default — it spends a completion per prompt, and that is not a choice
 to make on someone's behalf by their cloning a repo. See
 [`hooks/README.md`](hooks/README.md).
 
+## Vectors without a service
+
+`[provider] embedder = "local"` computes vectors here instead of asking a
+remote model. `rm_embed` is subword hashing — about a hundred lines of
+arithmetic, no dependency, no model file, deterministic across machines and
+releases.
+
+With it, the whole decision path is offline: `decide` reaches no completion
+model by design, so `decide`, `recall`, `decisions` and `reindex` need no API
+key and open no socket.
+
+It costs recall, and the number is in `benches/locomo/README.md`. On this
+project's own decision log, asked in words other than the title's own, it
+places the right decision first **6 times in 12** where
+`text-embedding-3-small` manages **10**. It has morphology and no semantics:
+nothing lexical connects *talking* to *speaking*. Asked by exact title both are
+perfect, which is why that is the wrong test to judge it by.
+
+Switching is not free — vectors from the two are not comparable — but it is
+reversible: `rmem reindex` rebuilds the index under whichever is configured.
+
 ## Crates
 
 | Crate | Status | Role |

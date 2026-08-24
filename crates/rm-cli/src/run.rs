@@ -171,8 +171,8 @@ pub fn run(
         let plan = if texts.is_empty() {
             command::plan_reindex(texts, &NoEmbedder, dimension, metric)?
         } else {
-            let provider = config.provider()?;
-            command::plan_reindex(texts, &provider, dimension, metric)?
+            let embedder = config.embedder()?;
+            command::plan_reindex(texts, &embedder, dimension, metric)?
         };
         let (r, p2) = (config.ruleset()?, config.policy_for_engine()?);
         return store::with_write(&path, r, p2, dimension, metric, |engine| {
@@ -224,10 +224,10 @@ pub fn run(
                 context,
                 supersedes,
             } => {
-                // `config.provider()` builds a completer too, and nothing
-                // here will call it: a decision has a known shape, so it
-                // costs embeddings and no completion at all.
-                let provider = config.provider()?;
+                // An embedder, not a provider: a decision has a known shape,
+                // so it costs embeddings and no completion at all -- and where
+                // the embedder is local, no credential and no socket either.
+                let embedder = config.embedder()?;
                 Some(Planned::Decide(command::plan_decide(
                     title,
                     choice,
@@ -238,7 +238,7 @@ pub fn run(
                     *decided_at,
                     now,
                     "cli",
-                    &provider,
+                    &embedder,
                 )?))
             }
             // The review answers write, but they answer a question the
@@ -272,8 +272,8 @@ pub fn run(
         let weak_below = config.retrieval.weak_below;
         let query_vector = match &command {
             Command::Recall { query, .. } => {
-                let provider = config.provider()?;
-                Some(command::plan_recall(query, &provider)?)
+                let embedder = config.embedder()?;
+                Some(command::plan_recall(query, &embedder)?)
             }
             _ => None,
         };

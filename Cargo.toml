@@ -9,6 +9,7 @@ members = [
     "crates/rm-graph",
     "crates/rm-extract",
     "crates/rm-providers",
+    "crates/rm-embed",
     "crates/rm-host",
     "crates/rm-cli",
     "crates/rm-mcp",
@@ -35,6 +36,7 @@ rm-engine = { path = "crates/rm-engine" }
 rm-graph = { path = "crates/rm-graph" }
 rm-extract = { path = "crates/rm-extract" }
 rm-providers = { path = "crates/rm-providers" }
+rm-embed = { path = "crates/rm-embed" }
 rm-host = { path = "crates/rm-host" }
 rm-cli = { path = "crates/rm-cli" }
 rm-mcp = { path = "crates/rm-mcp" }

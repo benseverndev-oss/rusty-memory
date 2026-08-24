@@ -42,6 +42,19 @@ base_url = "https://api.openai.com/v1"
 api_key_env = "OPENAI_API_KEY"
 completion_model = "gpt-4o-mini"
 embedding_model = "text-embedding-3-small"
+# Where vectors come from: "http" asks the service above, "local" computes them
+# here with no socket and no model file.
+#
+# Local is subword hashing -- see `rm_embed`. It has no semantics: "car" and
+# "automobile" land orthogonal, where a real model puts them together. What it
+# has is morphology and overlap, which is a bet that your queries reuse the
+# words your records were written in. That is often true of a decision log whose
+# titles were chosen to be findable, and rarely true of conversation.
+#
+# Switching this is not free: vectors from the two are not comparable, so the
+# index has to be rebuilt. `rmem reindex` does that where the text can be worked
+# out again, and refuses where it cannot.
+embedder = "http"
 # Discovered by `rmem init` from the model itself. If you change the embedding
 # model, run `rmem init --force` again rather than editing this: a dimension
 # that disagrees with the model makes every distance meaningless and nothing
@@ -171,6 +184,31 @@ default = "most_recent"
 employer = "valid_interval"
 "#;
 
+/// Whichever embedder the config named.
+///
+/// An enum rather than a boxed trait object: there are two, both are known
+/// here, and the call sites want a concrete `impl Embedder` to hand to the
+/// plan functions.
+pub enum Embedding {
+    /// Vectors from the service in `[provider]`.
+    ///
+    /// Boxed: an `HttpProvider` carries an agent and its TLS config and is two
+    /// orders of magnitude larger than the local one, so an unboxed enum would
+    /// make every `Embedding` that size.
+    Http(Box<HttpProvider>),
+    /// Vectors computed here, with no socket and no model file.
+    Local(rm_embed::Hashed),
+}
+
+impl rm_engine::Embedder for Embedding {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, rm_engine::EmbedderError> {
+        match self {
+            Embedding::Http(p) => p.embed(text),
+            Embedding::Local(h) => h.embed(text),
+        }
+    }
+}
+
 /// Every config struct carries `deny_unknown_fields`.
 ///
 /// The invariant this crate is built around is that an API key never reaches
@@ -216,6 +254,10 @@ pub struct ProviderConfig {
     pub api_key_env: String,
     pub completion_model: String,
     pub embedding_model: String,
+    /// `"http"` or `"local"`. Defaulted, so a config written before this
+    /// existed keeps asking the service it was written for.
+    #[serde(default = "default_embedder")]
+    pub embedder: String,
     pub dimension: usize,
     pub metric: String,
 }
@@ -273,6 +315,10 @@ impl Default for RetrievalConfig {
 /// is worse than the silence it replaces. See `TEMPLATE` for the measurement
 /// and for why 0.62 -- the best figure from the LoCoMo sweep -- was withdrawn
 /// after it fired on a question this project can answer perfectly well.
+fn default_embedder() -> String {
+    "http".to_string()
+}
+
 fn default_weak_below() -> f32 {
     0.0
 }
@@ -518,6 +564,25 @@ impl Config {
     }
 
     /// A provider built from this file and the environment.
+    /// Where vectors come from, per `[provider] embedder`.
+    ///
+    /// Separate from [`Config::provider`] because the answer can be "here". A
+    /// local embedder needs no base URL and no API key, so a store configured
+    /// for one can record and read decisions with no credential in the
+    /// environment and no socket opened -- which is the whole point of having
+    /// the option.
+    pub fn embedder(&self) -> Result<Embedding, HostError> {
+        match self.provider.embedder.as_str() {
+            "local" => Ok(Embedding::Local(rm_embed::Hashed::new(
+                self.provider.dimension,
+            ))),
+            "http" => Ok(Embedding::Http(Box::new(self.provider()?))),
+            other => Err(HostError::Config(format!(
+                "rmem.toml's [provider] embedder is {other:?}, which this build does not know; use \"http\" to ask the service, or \"local\" to compute vectors here. It is not defaulted because the two are not comparable: a store built under one cannot be searched under the other without `rmem reindex`."
+            ))),
+        }
+    }
+
     pub fn provider(&self) -> Result<HttpProvider, HostError> {
         validate_base_url(&self.provider.base_url)?;
 
@@ -579,6 +644,7 @@ const SCHEMA: &[(&str, &[&str])] = &[
         "[provider]",
         &[
             "base_url",
+            "embedder",
             "api_key_env",
             "completion_model",
             "embedding_model",
