@@ -85,28 +85,47 @@ fn most_recent(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
 /// Ordered by when each value began to hold, ties broken by when it was heard.
 /// Sorting by `valid.from` rather than `observed_at` is the whole difference
 /// between a valid-time timeline and a transaction-time one wearing its name.
+///
+/// # The doc comment quoted above is stale, and the sweep found it
+///
+/// Taken literally, "share an observation timestamp" refuses two values heard
+/// in the same instant however their valid spans differ. `rm_survivor` does
+/// not do that: it refuses only when `valid.from` *and* `observed_at` *and* the
+/// values all collide.
+///
+/// The implementation is the correct one and the sentence is out of date. It
+/// was written when a `Candidate` carried no `valid` and the timeline was cut
+/// at `observed_at` -- at which point two values sharing an observation really
+/// did have no order between them. Adding valid time gave them one, and the
+/// rationale in that same sentence ("with no order between them") is now
+/// satisfied by the narrower condition. The prose did not follow the code.
+///
+/// This reference is written against the behaviour, with the divergence
+/// recorded here rather than quietly conformed to.
 fn valid_interval(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
     let claims = claims(candidates);
     if claims.is_empty() {
         return Ok(Outcome::Timeline(vec![]));
     }
 
-    // Refusal first: two different values heard at the same instant have no
-    // order between them, so no timeline can say which replaced which.
-    for a in &claims {
-        for b in &claims {
-            if a.provenance.observed_at == b.provenance.observed_at && held(a) != held(b) {
-                return Err(Refused(
-                    "two different values share an observation timestamp".to_string(),
-                ));
-            }
-        }
-    }
-
     let mut ordered: Vec<&&Candidate<'_>> = claims.iter().collect();
     ordered.sort_by(|a, b| {
         (a.valid.from, a.provenance.observed_at).cmp(&(b.valid.from, b.provenance.observed_at))
     });
+
+    // Refusal: only where nothing orders the two. Adjacent pairs suffice once
+    // sorted, because the colliding keys are equal and therefore neighbours.
+    for pair in ordered.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a.valid.from == b.valid.from
+            && a.provenance.observed_at == b.provenance.observed_at
+            && held(a) != held(b)
+        {
+            return Err(Refused(
+                "neither supersedes the other and no validity range can be assigned".to_string(),
+            ));
+        }
+    }
 
     let mut facts: Vec<Fact> = Vec::new();
     for c in ordered {
@@ -172,23 +191,27 @@ fn majority(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
 
 /// The first non-null assertion in input order.
 ///
-/// A tombstone is a claim but it is not a *value*, so it does not satisfy
-/// "non-null" and is skipped here.
+/// "Null" here means [`Asserted::Silent`] -- a gap in what was heard -- not
+/// [`Asserted::Absent`]. A tombstone is a positive claim that the field is
+/// empty and it competes like any other: `rm_survivor`'s own test says so in
+/// as many words, in `an_absence_competes_rather_than_being_treated_as_silence`
+/// ("they left Acme and are between jobs" is an assertion, not a gap).
+///
+/// This reference read it the other way round at first and the differential
+/// sweep caught it on a one-assertion history. Recorded because the classical
+/// data-quality meaning of "non-null" is the other one, so the mistake is an
+/// easy one to make twice.
 fn first_non_null(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
-    let first = claims(candidates)
-        .into_iter()
-        .find(|c| matches!(c.value, Asserted::Value(_)))
-        .map(held);
+    let first = claims(candidates).into_iter().next().map(held);
     Ok(Outcome::Survivor(first))
 }
 
 /// The value if every non-null assertion agrees, otherwise nothing.
+///
+/// Same reading of "non-null" as [`first_non_null`]: a tombstone participates,
+/// so a tombstone disagreeing with a value is not unanimous.
 fn unanimous(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
-    let values: Vec<Held> = claims(candidates)
-        .into_iter()
-        .filter(|c| matches!(c.value, Asserted::Value(_)))
-        .map(held)
-        .collect();
+    let values: Vec<Held> = claims(candidates).into_iter().map(held).collect();
     match values.first() {
         None => Ok(Outcome::Survivor(None)),
         Some(first) if values.iter().all(|v| v == first) => {
@@ -345,13 +368,44 @@ mod tests {
     }
 
     #[test]
-    fn two_different_values_sharing_an_observation_instant_refuse() {
+    fn two_values_with_nothing_at_all_to_order_them_refuse() {
+        // Same instant heard, same instant held: nothing orders these two, so
+        // no validity range can be assigned to either.
+        let (p1, p2) = (prov(500), prov(500));
+        let cs = [
+            Candidate::new(Some("fly.io"), &p1).over(Interval::since(100)),
+            Candidate::new(Some("render"), &p2).over(Interval::since(100)),
+        ];
+        assert!(merge(&cs, &Strategy::ValidInterval).is_err());
+    }
+
+    #[test]
+    fn sharing_an_observation_instant_is_not_enough_to_refuse() {
+        // This pins the divergence the sweep found. `Strategy::ValidInterval`'s
+        // doc comment says it "refuses when two different values share an
+        // observation timestamp", which taken literally would refuse here.
+        // It does not, and should not: the two were heard together but held
+        // from different moments, and valid time orders them perfectly well.
+        //
+        // The prose predates `Candidate::valid` and did not follow the code.
         let (p1, p2) = (prov(500), prov(500));
         let cs = [
             Candidate::new(Some("fly.io"), &p1).over(Interval::since(100)),
             Candidate::new(Some("render"), &p2).over(Interval::since(300)),
         ];
-        assert!(merge(&cs, &Strategy::ValidInterval).is_err());
+        assert_eq!(
+            merge(&cs, &Strategy::ValidInterval).unwrap(),
+            Outcome::Timeline(vec![
+                Fact {
+                    value: Held::Value("fly.io".into()),
+                    valid: Interval::between(100, 300)
+                },
+                Fact {
+                    value: Held::Value("render".into()),
+                    valid: Interval::since(300)
+                },
+            ])
+        );
     }
 
     #[test]
