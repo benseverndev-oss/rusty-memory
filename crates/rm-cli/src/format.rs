@@ -90,11 +90,22 @@ pub fn render(outcome: &Outcome) -> String {
             out
         }
 
-        Outcome::Recalled(hits) if hits.is_empty() => {
+        Outcome::Recalled { hits, .. } if hits.is_empty() => {
             "nothing recalled — the store has nothing near that yet".to_string()
         }
-        Outcome::Recalled(hits) => {
+        Outcome::Recalled { hits, weak_below } => {
             let mut out = String::new();
+            // Said once, at the top, before any of it is read. Not per hit and
+            // not a filter: measured against LoCoMo's adversarial questions,
+            // dropping enough of them to matter costs between a tenth and a
+            // third of real answers, so everything is returned and the caller
+            // is told how near the nearest thing actually was.
+            if *weak_below > 0.0 && hits.first().is_some_and(|h| h.score < *weak_below) {
+                out.push_str(&format!(
+                    "nothing here is a close match -- the nearest is {:.3}, under the {weak_below:.2} bar.\nWhat follows may be about something else.\n\n",
+                    hits[0].score
+                ));
+            }
             for h in hits {
                 let value = h.value.as_deref().unwrap_or("(no value)");
                 // Four states, not two, because "something later exists" and
@@ -626,7 +637,10 @@ mod tests {
 
     #[test]
     fn an_empty_recall_says_so_rather_than_printing_nothing() {
-        let text = render(&Outcome::Recalled(vec![]));
+        let text = render(&Outcome::Recalled {
+            hits: vec![],
+            weak_below: 0.62,
+        });
         assert!(!text.trim().is_empty(), "silence is not an answer");
     }
 

@@ -226,6 +226,7 @@ pub fn run(
         // together, but it still holds a writer off, so a `recall` that
         // embedded its query under the lock made every reader a brake on
         // every writer.
+        let weak_below = config.retrieval.weak_below;
         let query_vector = match &command {
             Command::Recall { query, .. } => {
                 let provider = config.provider()?;
@@ -237,7 +238,7 @@ pub fn run(
         store::with_read(&path, ruleset, policy, dimension, metric, |engine| {
             match (command, query_vector) {
                 (Command::Recall { k, .. }, Some(vector)) => {
-                    command::commit_recall(engine, vector, k)
+                    command::commit_recall(engine, vector, k, weak_below)
                 }
                 (Command::About { entity, attribute }, _) => {
                     command::about(engine, entity, &attribute, now, now)

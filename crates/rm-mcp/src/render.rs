@@ -110,12 +110,26 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }
         }
 
-        Outcome::Recalled(hits) if hits.is_empty() => Rendered {
+        Outcome::Recalled { hits, .. } if hits.is_empty() => Rendered {
             text: "Nothing recalled: memory has nothing near that yet.".to_string(),
             structured: json!({"hits": []}),
         },
-        Outcome::Recalled(hits) => {
-            let mut text = format!("{} hit(s), nearest first:\n", hits.len());
+        Outcome::Recalled { hits, weak_below } => {
+            // Before the hits, because the model reads top to bottom and this
+            // changes what the rest of it means. Not a filter: measured against
+            // LoCoMo's adversarial questions, dropping enough of them to matter
+            // costs a tenth to a third of real answers, so everything is
+            // returned and the caller is told how near the nearest one was.
+            let weak = *weak_below > 0.0 && hits.first().is_some_and(|h| h.score < *weak_below);
+            let mut text = if weak {
+                format!(
+                    "NOTHING HERE IS A CLOSE MATCH. The nearest is {:.3}, under the {weak_below:.2} bar, so the store may hold nothing on this. Treat what follows as possibly about something else, and say so rather than answering from it.\n\n{} hit(s), nearest first:\n",
+                    hits[0].score,
+                    hits.len()
+                )
+            } else {
+                format!("{} hit(s), nearest first:\n", hits.len())
+            };
             for h in hits {
                 // `None` is a tombstone, not an absence of data: an assertion
                 // that says nothing is never stored, so this is a claim that
@@ -159,7 +173,13 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }
             Rendered {
                 text,
-                structured: json!({"hits": hits.iter().map(hit).collect::<Vec<_>>()}),
+                structured: json!({
+                    "hits": hits.iter().map(hit).collect::<Vec<_>>(),
+                    // The field to branch on. True means the nearest hit is
+                    // under the configured bar and the store may hold nothing
+                    // on the subject.
+                    "weak_match": weak,
+                }),
             }
         }
 
@@ -525,6 +545,72 @@ mod tests {
         assert!(absent.len() > 20 && unknown.len() > 20);
     }
 
+    /// A query the store has nothing near is said to be a weak match, and the
+    /// hits still come back.
+    ///
+    /// Found by seeding a real decision log: asking it about database
+    /// migrations, a subject the project has never discussed, returned three
+    /// unrelated decisions at 0.27-0.31 with nothing to say they were
+    /// unrelated. Naming the entities made that worse rather than better --
+    /// anonymous ids read like pointers, named decisions read like an answer.
+    ///
+    /// It labels rather than filters, and that is a measured choice. Against
+    /// LoCoMo's adversarial questions over 382 answerable and 112 unanswerable,
+    /// a cutoff that refuses a third of the unanswerable also throws away a
+    /// tenth of the real answers; refusing 87% costs 37% of them.
+    #[test]
+    fn a_query_with_nothing_near_it_is_marked_weak_and_still_answered() {
+        let far = Recalled {
+            entity: 0,
+            name: Some("Store bi-temporally".into()),
+            assertion: 0,
+            attribute: "context".into(),
+            value: Some("choosing the storage model".into()),
+            valid: Interval::since(100),
+            provenance: Provenance::new(Source::UserAssertion, 100, "s"),
+            score: 0.308,
+            standing: Standing::Latest,
+        };
+        let out = render(&Outcome::Recalled {
+            hits: vec![far.clone()],
+            weak_below: 0.62,
+        });
+        assert!(
+            out.text.contains("NOTHING HERE IS A CLOSE MATCH"),
+            "{}",
+            out.text
+        );
+        assert_eq!(out.structured["weak_match"], json!(true));
+        assert_eq!(
+            out.structured["hits"].as_array().map(Vec::len),
+            Some(1),
+            "the hit is still returned -- this labels, it does not filter"
+        );
+
+        // A near hit says nothing extra, and the same hit says nothing when the
+        // bar is off.
+        let near = Recalled {
+            score: 0.75,
+            ..far.clone()
+        };
+        let out = render(&Outcome::Recalled {
+            hits: vec![near],
+            weak_below: 0.62,
+        });
+        assert!(!out.text.contains("NOTHING HERE"), "{}", out.text);
+        assert_eq!(out.structured["weak_match"], json!(false));
+
+        let out = render(&Outcome::Recalled {
+            hits: vec![far],
+            weak_below: 0.0,
+        });
+        assert!(
+            !out.text.contains("NOTHING HERE"),
+            "zero turns the notice off: {}",
+            out.text
+        );
+    }
+
     /// A hit says what it is about, not only what it says.
     ///
     /// Found by seeding a real decision log and reading it: every hit came back
@@ -544,7 +630,7 @@ mod tests {
             score: 0.53,
             standing: Standing::Latest,
         };
-        let out = render(&Outcome::Recalled(vec![named.clone()]));
+        let out = render(&recalled(vec![named.clone()]));
         assert!(
             out.text.contains("Rerank the recall results"),
             "the name has to be in the text a model reads: {}",
@@ -566,7 +652,7 @@ mod tests {
             name: None,
             ..named
         };
-        let out = render(&Outcome::Recalled(vec![anonymous]));
+        let out = render(&recalled(vec![anonymous]));
         assert!(out.text.contains("entity 14"), "{}", out.text);
         assert_eq!(out.structured["hits"][0]["name"], Value::Null);
     }
@@ -588,10 +674,19 @@ mod tests {
             score: 0.5,
             standing: Standing::Latest,
         };
-        let out = render(&Outcome::Recalled(vec![hit]));
+        let out = render(&recalled(vec![hit]));
         assert!(out.text.contains("no value"), "{}", out.text);
         assert_eq!(out.structured["hits"][0]["value"], Value::Null);
         assert_eq!(out.structured["hits"][0]["asserted_absent"], json!(true));
+    }
+
+    /// Hits with the notice off, so a test about anything else is unaffected
+    /// by where the weak-match bar happens to sit.
+    fn recalled(hits: Vec<Recalled>) -> Outcome {
+        Outcome::Recalled {
+            hits,
+            weak_below: 0.0,
+        }
     }
 
     fn stood(standing: Standing) -> Recalled {
@@ -612,7 +707,7 @@ mod tests {
     fn a_corrected_hit_says_so_in_both_halves() {
         // It is returned rather than hidden -- what was believed is part of
         // the record -- which only works if the reader is told it is stale.
-        let out = render(&Outcome::Recalled(vec![stood(Standing::Corrected)]));
+        let out = render(&recalled(vec![stood(Standing::Corrected)]));
         assert!(out.text.contains("corrected"), "{}", out.text);
         assert_eq!(out.structured["hits"][0]["standing"], json!("corrected"));
         assert_eq!(out.structured["hits"][0]["still_stands"], json!(false));
@@ -629,7 +724,7 @@ mod tests {
         // later assertion under the same attribute; neither has been replaced,
         // and a model told otherwise drops a fact that is still true.
         for standing in [Standing::Joined, Standing::Unsettled] {
-            let out = render(&Outcome::Recalled(vec![stood(standing)]));
+            let out = render(&recalled(vec![stood(standing)]));
             assert!(
                 !out.text.contains("corrected"),
                 "{standing:?} must not read as a correction: {}",
@@ -642,20 +737,18 @@ mod tests {
             );
         }
         assert_eq!(
-            render(&Outcome::Recalled(vec![stood(Standing::Joined)])).structured["hits"][0]
-                ["standing"],
+            render(&recalled(vec![stood(Standing::Joined)])).structured["hits"][0]["standing"],
             json!("joined")
         );
         assert_eq!(
-            render(&Outcome::Recalled(vec![stood(Standing::Unsettled)])).structured["hits"][0]
-                ["standing"],
+            render(&recalled(vec![stood(Standing::Unsettled)])).structured["hits"][0]["standing"],
             json!("unsettled")
         );
     }
 
     #[test]
     fn an_empty_recall_is_an_answer_and_not_a_shrug() {
-        let out = render(&Outcome::Recalled(vec![]));
+        let out = render(&recalled(vec![]));
         assert_eq!(out.structured, json!({"hits": []}));
         assert!(!out.text.is_empty());
     }

@@ -295,7 +295,7 @@ where
             })
         } else {
             store::with_read(&path, ruleset, policy, dimension, metric, |engine| {
-                Self::read(engine, call, planned, now)
+                Self::read(engine, call, planned, now, self.config.retrieval.weak_below)
             })
         };
 
@@ -417,11 +417,12 @@ where
         call: Call,
         planned: Planned,
         now: Timestamp,
+        weak_below: f32,
     ) -> Result<Outcome, HostError> {
         let _ = now;
         match (call, planned) {
             (Call::Recall { k, .. }, Planned::Recall(vector)) => {
-                command::commit_recall(engine, vector, k)
+                command::commit_recall(engine, vector, k, weak_below)
             }
             (
                 Call::About {

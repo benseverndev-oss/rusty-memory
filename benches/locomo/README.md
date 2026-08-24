@@ -1249,3 +1249,57 @@ material to work with and uses it worse. Not how the pipeline runs, so not a
 result about shipped behaviour, but it invalidates any simulation that dumps
 deep and slices shallow. Sorting the dumped list back into pure similarity order
 reproduces 0.671 exactly, and that is the control every table above uses.
+
+## Can the store tell when it has no answer?
+
+LoCoMo's category 5 is adversarial: the premise is unsupported and the corpus
+cannot answer. That makes it a labelled set for a question the store has never
+been able to answer — **382 answerable against 112 unanswerable**, over three
+conversations, read off the same dumped top-200 lists as everything else here.
+
+Six candidate signals, scored by Youden's J against that label:
+
+| signal | best J | at cutoff | answerable kept | unanswerable refused |
+|---|---|---|---|---|
+| **top score** | **0.494** | 0.7058 | 62.8% | 86.6% |
+| mean of the top 5 | 0.473 | 0.6372 | 65.2% | 82.1% |
+| top − mean(all 200) | 0.378 | 0.1785 | 73.6% | 64.3% |
+| top − 10th | 0.246 | 0.1488 | 39.8% | 84.8% |
+| top − mean(2..10) | 0.217 | 0.1163 | 36.9% | 84.8% |
+| top ÷ mean(2..10) | 0.187 | 1.2124 | 33.0% | 85.7% |
+
+The raw score wins and every shape-based signal loses, which is the opposite of
+the obvious guess — that an answerable query has a *peak* and an unanswerable
+one is flat. It does not; it is simply lower everywhere.
+
+### J hides the trade, and the trade is bad
+
+| keep this much of answerable | refuses this much of unanswerable |
+|---|---|
+| 99% | 4.5% |
+| 95% | 14.3% |
+| 90% | 36.6% |
+| 62.8% (best J) | 86.6% |
+
+To drop enough unanswerable queries to matter you throw away between a tenth
+and a third of real answers. **So nothing is dropped.** `[retrieval] weak_below`
+labels the answer instead: every hit still comes back, with a line saying how
+near the nearest one actually was.
+
+### And the cutoff does not travel
+
+0.62 was taken off that table and tried on this project's own decision log,
+seeded by `docs/seed-decision-log.sh`. It marked *"should we add a reranker"* —
+a question with a perfect answer, the rejected reranking decision at 0.531 —
+as having nothing near it. Same embedding model, different corpus, and the
+scale moved out from under the number. On that log the equivalent bar is
+around 0.35.
+
+So the default is **0.0, off**. A cutoff that has not been measured against the
+corpus it will run on produces confident warnings on good answers, which is
+worse than the silence it was meant to fix. The mechanism ships; the number
+does not.
+
+This is the fourth thing measured here and left switched off, and the pattern
+across all four is the same: the signal was real, and too weak to act on
+without doing damage somewhere else.

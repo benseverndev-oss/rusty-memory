@@ -87,7 +87,18 @@ pub enum Outcome {
         /// person actually using this, whatever the type says.
         dropped: Vec<rm_extract::Dropped>,
     },
-    Recalled(Vec<Recalled>),
+    /// Hits, nearest first, with the bar below which the nearest one is worth
+    /// calling weak.
+    ///
+    /// The bar travels with the answer rather than being looked up by whoever
+    /// renders it: it comes from `rmem.toml`, and a renderer that had to read
+    /// config would need one threaded through every call for the sake of one
+    /// number.
+    Recalled {
+        hits: Vec<Recalled>,
+        /// From `[retrieval] weak_below`. Zero turns the notice off.
+        weak_below: f32,
+    },
     About(Believed),
     Reviews(Vec<ReviewLine>),
     Confirmed {
@@ -411,8 +422,9 @@ pub fn recall(
     query: &str,
     k: usize,
     embedder: &impl Embedder,
+    weak_below: f32,
 ) -> Result<Outcome, HostError> {
-    commit_recall(engine, plan_recall(query, embedder)?, k)
+    commit_recall(engine, plan_recall(query, embedder)?, k, weak_below)
 }
 
 /// Embed a query, touching no store.
@@ -427,11 +439,16 @@ pub fn plan_recall(query: &str, embedder: &impl Embedder) -> Result<Vec<f32>, Ho
 }
 
 /// Search with an embedding [`plan_recall`] already produced.
-pub fn commit_recall(engine: &Engine, embedding: Vec<f32>, k: usize) -> Result<Outcome, HostError> {
+pub fn commit_recall(
+    engine: &Engine,
+    embedding: Vec<f32>,
+    k: usize,
+    weak_below: f32,
+) -> Result<Outcome, HostError> {
     let hits = engine
         .recall(&Query::new(embedding, k))
         .map_err(|e| HostError::Refused(e.to_string()))?;
-    Ok(Outcome::Recalled(hits))
+    Ok(Outcome::Recalled { hits, weak_below })
 }
 
 /// What the store believes an attribute held.
@@ -2066,8 +2083,8 @@ pub(crate) mod tests {
         let stub = StubProvider::new(vec![EXTRACTION]);
         remember(&mut e, "I work at Globex", 100, "cli", None, &stub, &stub).unwrap();
 
-        let out = recall(&e, "Ben works at Globex", 5, &stub).unwrap();
-        let Outcome::Recalled(hits) = out else {
+        let out = recall(&e, "Ben works at Globex", 5, &stub, 0.0).unwrap();
+        let Outcome::Recalled { hits, .. } = out else {
             panic!("{out:?}")
         };
         assert!(!hits.is_empty());
@@ -2078,8 +2095,8 @@ pub(crate) mod tests {
     fn recalling_an_empty_store_is_an_empty_answer_not_a_failure() {
         let e = engine();
         let stub = StubProvider::new(vec![]);
-        let out = recall(&e, "anything", 5, &stub).unwrap();
-        let Outcome::Recalled(hits) = out else {
+        let out = recall(&e, "anything", 5, &stub, 0.0).unwrap();
+        let Outcome::Recalled { hits, .. } = out else {
             panic!("{out:?}")
         };
         assert!(hits.is_empty());
