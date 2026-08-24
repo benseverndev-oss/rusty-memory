@@ -178,6 +178,7 @@ pub fn run(
                 title,
                 choice,
                 status,
+                decided_at,
                 because,
                 context,
                 supersedes,
@@ -193,6 +194,7 @@ pub fn run(
                     because.as_deref(),
                     context.as_deref(),
                     supersedes.as_deref(),
+                    *decided_at,
                     now,
                     "cli",
                     &provider,
@@ -244,7 +246,7 @@ pub fn run(
                     command::about(engine, entity, &attribute, now, now)
                 }
                 (Command::ReviewList, _) => command::review_list(engine),
-                (Command::Decisions, _) => command::decisions(engine),
+                (Command::Decisions { status }, _) => command::decisions(engine, status.as_deref()),
                 (Command::Decision { title }, _) => command::decision(engine, &title),
                 (Command::Init { .. }, _) => unreachable!("handled above"),
                 (other, _) => unreachable!("{other:?} writes, or was not planned"),

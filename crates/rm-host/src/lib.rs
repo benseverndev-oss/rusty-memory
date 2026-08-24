@@ -23,6 +23,7 @@ pub mod command;
 pub mod config;
 pub mod store;
 pub mod testing;
+pub mod time;
 
 /// Something the user has to fix.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -29,6 +29,8 @@
 //! `args` iterator and none of them from any file. Anything that begins
 //! reading a file in here needs this paragraph revisited.
 
+use rm_engine::Timestamp;
+
 use crate::CliError;
 
 pub const USAGE: &str = "\
@@ -44,9 +46,9 @@ rmem — a memory that resolves contradictions deterministically
     rmem review reject <id>          answer one: different things
     rmem decide \"<title>\" \"<choice>\" [--because <why>] [--context <what prompted it>]
                                      [--status proposed|accepted|rejected|deprecated]
-                                     [--supersedes \"<title>\"]
+                                     [--supersedes \"<title>\"] [--at YYYY-MM-DD]
                                      record a decision under a stable, findable title
-    rmem decisions                   every decision, and whether it still stands
+    rmem decisions [--status <s>]    every decision, and whether it still stands
     rmem decision \"<title>\"          one decision in full, and the chain it sits in
 
 Entity ids come from `remember` and `recall`. Review ids come from `review`.
@@ -82,11 +84,20 @@ pub enum Command {
         choice: String,
         /// One of `DECISION_STATUSES`. `None` means `accepted`.
         status: Option<String>,
+        /// When the decision was made, as milliseconds. `None` means now.
+        ///
+        /// Parsed from `--at YYYY-MM-DD` here rather than carried as a string,
+        /// so a date nobody can read is refused while the user is still at the
+        /// prompt to fix it.
+        decided_at: Option<Timestamp>,
         because: Option<String>,
         context: Option<String>,
         supersedes: Option<String>,
     },
-    Decisions,
+    Decisions {
+        /// Show only decisions with this status. `None` shows every one.
+        status: Option<String>,
+    },
     /// Read one decision by its exact title.
     Decision {
         title: String,
@@ -253,13 +264,18 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                 title: title.clone(),
                 choice: choice.clone(),
                 status: flag(&args, "--status")?,
+                decided_at: flag(&args, "--at")?
+                    .map(|d| rm_host::time::parse_day(&d).map_err(CliError::Usage))
+                    .transpose()?,
                 because: flag(&args, "--because")?,
                 context: flag(&args, "--context")?,
                 supersedes: flag(&args, "--supersedes")?,
             })
         }
 
-        "decisions" => Ok(Command::Decisions),
+        "decisions" => Ok(Command::Decisions {
+            status: flag(&args, "--status")?,
+        }),
 
         // Singular, and a different command: `decisions` is the index and this
         // is the entry. The two names differ by one character on purpose --
@@ -288,6 +304,51 @@ mod tests {
 
     fn parse_args(args: &[&str]) -> Result<Command, CliError> {
         parse(args.iter().map(|s| s.to_string()))
+    }
+
+    /// `--at` is a day, and a day this cannot read is refused at the prompt.
+    ///
+    /// Parsed here rather than carried through as a string so the refusal
+    /// arrives while the user is still standing in front of it, before a
+    /// provider is built or a lock is taken. The alternative -- falling back to
+    /// the clock -- would file the decision under today, which is the one thing
+    /// passing a date was meant to avoid.
+    #[test]
+    fn a_decision_can_be_dated_and_a_bad_date_is_refused() {
+        let Ok(Command::Decide { decided_at, .. }) =
+            parse_args(&["decide", "T", "C", "--at", "2026-03-14"])
+        else {
+            panic!("a good date should parse")
+        };
+        // 2026-03-14T00:00:00Z
+        assert_eq!(decided_at, Some(1_773_446_400_000));
+
+        let Ok(Command::Decide { decided_at, .. }) = parse_args(&["decide", "T", "C"]) else {
+            panic!()
+        };
+        assert_eq!(decided_at, None, "no flag means now, decided downstream");
+
+        for bad in ["14/03/2026", "March", "2026-3-14", "2026-02-30"] {
+            let Err(CliError::Usage(why)) = parse_args(&["decide", "T", "C", "--at", bad]) else {
+                panic!("{bad:?} should be refused")
+            };
+            assert!(!why.is_empty(), "for {bad:?}");
+        }
+    }
+
+    /// `decisions` takes a status to filter by, and takes none to mean all.
+    #[test]
+    fn decisions_parses_its_filter() {
+        assert_eq!(
+            parse_args(&["decisions"]).unwrap(),
+            Command::Decisions { status: None }
+        );
+        assert_eq!(
+            parse_args(&["decisions", "--status", "rejected"]).unwrap(),
+            Command::Decisions {
+                status: Some("rejected".into())
+            }
+        );
     }
 
     #[test]

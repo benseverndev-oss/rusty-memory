@@ -247,7 +247,7 @@ pub fn render(outcome: &Outcome) -> String {
                     d.history.len()
                 ));
                 for (at, choice) in &d.history {
-                    out.push_str(&format!("    {}  {choice}\n", utc_day(*at)));
+                    out.push_str(&format!("    {}  {choice}\n", rm_host::time::format_day(*at)));
                 }
             }
             out
@@ -284,58 +284,6 @@ pub fn render(outcome: &Outcome) -> String {
         }
         Outcome::Rejected => "kept apart, and not asked again".to_string(),
     }
-}
-
-#[cfg(test)]
-mod date_tests {
-    use super::utc_day;
-
-    /// Known dates, including the ones the arithmetic gets wrong if it is
-    /// wrong: an epoch boundary, a leap day, a century that is not a leap year,
-    /// a century that is, and a date before the epoch.
-    #[test]
-    fn utc_day_converts_known_timestamps() {
-        for (ms, want) in [
-            (0i64, "1970-01-01"),
-            (86_399_999, "1970-01-01"),
-            (86_400_000, "1970-01-02"),
-            (951_782_400_000, "2000-02-29"), // leap day, 400-year rule
-            (4_107_542_400_000, "2100-03-01"), // the day after 2100-02-28: not a leap year
-            (1_787_532_411_419, "2026-08-24"),
-            (-1, "1969-12-31"), // floor division, not truncation
-            (-86_400_000, "1969-12-31"),
-        ] {
-            assert_eq!(utc_day(ms), want, "for {ms}");
-        }
-    }
-}
-
-/// A millisecond timestamp as `YYYY-MM-DD`, in UTC.
-///
-/// Written out rather than pulled in. This workspace has three times chosen the
-/// small thing over the dependency -- exact search over an approximate index,
-/// a hand-written parser over `syn`, ports over an HTTP client -- and a date
-/// library for one line of output is the same trade. The civil-from-days
-/// conversion below is Howard Hinnant's, which is exact for every day in the
-/// proleptic Gregorian calendar and is what the date libraries run anyway.
-///
-/// The day only. A decision log is read at the granularity of days, and a
-/// wall-clock time implies a precision that the recorded `observed_at` -- which
-/// a host may set to anything -- does not have.
-fn utc_day(ms: i64) -> String {
-    // Floor division, so a timestamp before the epoch lands on the day it
-    // belongs to rather than the one after.
-    let days = ms.div_euclid(86_400_000);
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    format!("{:04}-{:02}-{:02}", y + i64::from(m <= 2), m, d)
 }
 
 /// `1 fact`, `2 facts`. Every word this renders pluralises with a bare `s`.
