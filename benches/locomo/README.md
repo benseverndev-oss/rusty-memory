@@ -1387,3 +1387,44 @@ now a swap rather than a migration, since `reindex` exists and this crate has
 shown the seam works. Whether tens of megabytes in the repository is a better
 trade than an API key is a judgement, not a measurement — but it should be made
 knowing that the free version loses four of twelve.
+
+### The next step, tried and not taken
+
+The obvious improvement to hashing is a static table: real vectors from a real
+model, looked up per word and pooled. That is what model2vec does, and it was
+the plan — until it was measured.
+
+Same 31-decision log, same twelve paraphrased queries. Every distinct word (531
+of them) embedded through `text-embedding-3-small`, then pooled five ways:
+
+| | rank-1 |
+|---|---|
+| full text embedding | **10/12** |
+| plain mean of word vectors | 3/12 |
+| IDF weighted | 4/12 |
+| zipf, 1/√df | 2/12 |
+| stopwords dropped | 6/12 |
+| IDF + stopwords | 6/12 |
+| subword hashing, no weights at all | **6/12** |
+
+The best pooling reaches exactly where free hashing already is — for the price
+of a bootstrap pass over a vocabulary, a weights artifact in the repository, and
+a megabyte budget. Plain averaging is *worse than hashing*, and the zipf
+weighting that model2vec relies on is the worst of the lot.
+
+**Why it cannot work this way.** An OpenAI embedding of a single word is an
+embedding of a one-word *document*. The model's document geometry is not linear
+in its words, so averaging those vectors is not the model's own pooling and
+throws away most of what the model did. Model2vec is not doing this: it distils
+a transformer's *token embedding layer*, before attention, with PCA and zipf
+weighting on top. That layer is an internal object, and the OpenAI API does not
+expose it.
+
+So the structural finding, which is worth more than the number: **a static table
+cannot be distilled from an API-only model.** Owning semantics means owning a
+model — running an open one in-process (ONNX or candle, and a dependency tree
+this workspace has four times declined) or distilling its embedding layer
+offline with tooling that does not belong in this repository.
+
+Two rounds of the cheap thing have now been measured. Neither reached the
+service, and the second says the first was not the limiting factor.
