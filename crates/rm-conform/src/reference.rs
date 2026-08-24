@@ -19,7 +19,11 @@ pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcom
     match strategy {
         Strategy::MostRecent => most_recent(candidates),
         Strategy::ValidInterval => valid_interval(candidates),
-        _ => unimplemented!("later tasks"),
+        Strategy::MostComplete | Strategy::LongestValue => most_complete(candidates),
+        Strategy::MajorityVote | Strategy::ConfidenceMajority => majority(candidates),
+        Strategy::FirstNonNull => first_non_null(candidates),
+        Strategy::UnanimousOrNull => unanimous(candidates),
+        Strategy::SourcePriority(order) => source_priority(candidates, order),
     }
 }
 
@@ -122,6 +126,106 @@ fn valid_interval(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
         });
     }
     Ok(Outcome::Timeline(facts))
+}
+
+/// Longest value wins; ties go to the first seen.
+///
+/// The tie direction is why this is a loop rather than `max_by_key`, which
+/// returns the *last* maximum and would quietly invert the documented rule.
+fn most_complete(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
+    let mut best: Option<Held> = None;
+    for c in claims(candidates) {
+        let h = held(c);
+        let len = h.value().map(str::len).unwrap_or(0);
+        let better = match &best {
+            None => true,
+            Some(b) => len > b.value().map(str::len).unwrap_or(0),
+        };
+        if better {
+            best = Some(h);
+        }
+    }
+    Ok(Outcome::Survivor(best))
+}
+
+/// Most frequently asserted value wins; count ties go to the first seen.
+///
+/// `counts` keeps insertion order and the comparison is strict, so the first
+/// value to reach a given count keeps it.
+fn majority(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
+    let mut counts: Vec<(Held, usize)> = Vec::new();
+    for c in claims(candidates) {
+        let h = held(c);
+        match counts.iter_mut().find(|(k, _)| *k == h) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((h, 1)),
+        }
+    }
+    let mut best: Option<(Held, usize)> = None;
+    for (h, n) in counts {
+        if best.as_ref().is_none_or(|(_, bn)| n > *bn) {
+            best = Some((h, n));
+        }
+    }
+    Ok(Outcome::Survivor(best.map(|(h, _)| h)))
+}
+
+/// The first non-null assertion in input order.
+///
+/// A tombstone is a claim but it is not a *value*, so it does not satisfy
+/// "non-null" and is skipped here.
+fn first_non_null(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
+    let first = claims(candidates)
+        .into_iter()
+        .find(|c| matches!(c.value, Asserted::Value(_)))
+        .map(held);
+    Ok(Outcome::Survivor(first))
+}
+
+/// The value if every non-null assertion agrees, otherwise nothing.
+fn unanimous(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
+    let values: Vec<Held> = claims(candidates)
+        .into_iter()
+        .filter(|c| matches!(c.value, Asserted::Value(_)))
+        .map(held)
+        .collect();
+    match values.first() {
+        None => Ok(Outcome::Survivor(None)),
+        Some(first) if values.iter().all(|v| v == first) => {
+            Ok(Outcome::Survivor(Some(first.clone())))
+        }
+        _ => Ok(Outcome::Survivor(None)),
+    }
+}
+
+/// The value from the highest-priority source that asserted one.
+///
+/// Refuses when any asserting source is absent from the priority list: ranking
+/// an unlisted source would silently prefer the wrong system of record. Within
+/// the winning source, ties resolve by `MostRecent`.
+fn source_priority(
+    candidates: &[Candidate<'_>],
+    order: &[rm_core::Source],
+) -> Result<Outcome, Refused> {
+    let claims = claims(candidates);
+    for c in &claims {
+        if !order.contains(&c.provenance.source) {
+            return Err(Refused(
+                "an asserting source is absent from the priority list".to_string(),
+            ));
+        }
+    }
+    for source in order {
+        let at_source: Vec<Candidate<'_>> = claims
+            .iter()
+            .filter(|c| c.provenance.source == *source)
+            .map(|c| (*c).clone())
+            .collect();
+        if !at_source.is_empty() {
+            return most_recent(&at_source);
+        }
+    }
+    Ok(Outcome::Survivor(None))
 }
 
 #[cfg(test)]
@@ -254,5 +358,124 @@ mod tests {
     fn nothing_asserted_is_an_empty_timeline_not_a_refusal() {
         let out = merge(&[], &Strategy::ValidInterval).unwrap();
         assert_eq!(out, Outcome::Timeline(vec![]));
+    }
+
+    #[test]
+    fn most_complete_takes_the_longest_value() {
+        let (p1, p2, p3) = (prov(100), prov(200), prov(300));
+        let cs = [
+            Candidate::new(Some("aa"), &p1),
+            Candidate::new(Some("bbbb"), &p2),
+            Candidate::new(Some("ccc"), &p3),
+        ];
+        let out = merge(&cs, &Strategy::MostComplete).unwrap();
+        assert_eq!(out, Outcome::Survivor(Some(Held::Value("bbbb".into()))));
+    }
+
+    #[test]
+    fn most_complete_gives_a_length_tie_to_the_first_seen() {
+        let (p1, p2) = (prov(100), prov(200));
+        let cs = [
+            Candidate::new(Some("aaaa"), &p1),
+            Candidate::new(Some("bbbb"), &p2),
+        ];
+        let out = merge(&cs, &Strategy::MostComplete).unwrap();
+        assert_eq!(out, Outcome::Survivor(Some(Held::Value("aaaa".into()))));
+    }
+
+    #[test]
+    fn longest_value_is_the_same_rule_as_most_complete() {
+        let (p1, p2) = (prov(100), prov(200));
+        let cs = [
+            Candidate::new(Some("aa"), &p1),
+            Candidate::new(Some("bbb"), &p2),
+        ];
+        assert_eq!(
+            merge(&cs, &Strategy::LongestValue).unwrap(),
+            merge(&cs, &Strategy::MostComplete).unwrap()
+        );
+    }
+
+    #[test]
+    fn majority_vote_counts_assertions_not_recency() {
+        let (p1, p2, p3) = (prov(100), prov(200), prov(300));
+        let cs = [
+            Candidate::new(Some("fly.io"), &p1),
+            Candidate::new(Some("fly.io"), &p2),
+            Candidate::new(Some("render"), &p3),
+        ];
+        let out = merge(&cs, &Strategy::MajorityVote).unwrap();
+        assert_eq!(out, Outcome::Survivor(Some(Held::Value("fly.io".into()))));
+    }
+
+    #[test]
+    fn majority_vote_gives_a_count_tie_to_the_first_seen() {
+        let (p1, p2) = (prov(100), prov(200));
+        let cs = [
+            Candidate::new(Some("first"), &p1),
+            Candidate::new(Some("second"), &p2),
+        ];
+        let out = merge(&cs, &Strategy::MajorityVote).unwrap();
+        assert_eq!(out, Outcome::Survivor(Some(Held::Value("first".into()))));
+    }
+
+    #[test]
+    fn first_non_null_takes_input_order_not_time_order() {
+        let (p1, p2) = (prov(900), prov(100));
+        let cs = [
+            Candidate::new(Some("first"), &p1),
+            Candidate::new(Some("second"), &p2),
+        ];
+        let out = merge(&cs, &Strategy::FirstNonNull).unwrap();
+        assert_eq!(out, Outcome::Survivor(Some(Held::Value("first".into()))));
+    }
+
+    #[test]
+    fn unanimous_or_null_yields_nothing_when_sources_disagree() {
+        let (p1, p2) = (prov(100), prov(200));
+        let cs = [
+            Candidate::new(Some("fly.io"), &p1),
+            Candidate::new(Some("render"), &p2),
+        ];
+        assert_eq!(
+            merge(&cs, &Strategy::UnanimousOrNull).unwrap(),
+            Outcome::Survivor(None)
+        );
+    }
+
+    #[test]
+    fn unanimous_or_null_yields_the_value_when_they_agree() {
+        let (p1, p2) = (prov(100), prov(200));
+        let cs = [
+            Candidate::new(Some("render"), &p1),
+            Candidate::new(Some("render"), &p2),
+        ];
+        assert_eq!(
+            merge(&cs, &Strategy::UnanimousOrNull).unwrap(),
+            Outcome::Survivor(Some(Held::Value("render".into())))
+        );
+    }
+
+    #[test]
+    fn source_priority_refuses_an_asserting_source_it_was_not_told_how_to_rank() {
+        let p1 = Provenance::new(Source::AgentInference, 100, "t");
+        let cs = [Candidate::new(Some("guess"), &p1)];
+        let ranked = Strategy::SourcePriority(vec![Source::UserAssertion]);
+        assert!(merge(&cs, &ranked).is_err());
+    }
+
+    #[test]
+    fn source_priority_prefers_the_higher_ranked_source_however_old() {
+        let p1 = Provenance::new(Source::UserAssertion, 100, "t");
+        let p2 = Provenance::new(Source::ToolOutput, 900, "t");
+        let cs = [
+            Candidate::new(Some("stated"), &p1),
+            Candidate::new(Some("fetched"), &p2),
+        ];
+        let ranked = Strategy::SourcePriority(vec![Source::UserAssertion, Source::ToolOutput]);
+        assert_eq!(
+            merge(&cs, &ranked).unwrap(),
+            Outcome::Survivor(Some(Held::Value("stated".into())))
+        );
     }
 }
