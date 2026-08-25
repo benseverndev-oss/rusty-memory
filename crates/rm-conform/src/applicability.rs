@@ -15,6 +15,15 @@
 //! the code it judges is not an oracle. Scopes reach the store through
 //! `command::decide` and `command::plan_rescope` like any other caller, so the
 //! store is exercised normally; only the *expectation* is computed here.
+//!
+//! # The backfill case is not reachable here
+//!
+//! `decide` refuses without a scope, so every decision this module generates
+//! carries one and every rescope over it is a correction. A decision with no
+//! scope at all can only be a record written before scopes existed, and no
+//! public write path produces one any more. That case stays covered by
+//! `rm-host`'s own unit tests and by the live-store check in the scope PR --
+//! 219 records, all unscoped, all still visible -- not by this sweep.
 
 /// Whether a memory scoped `scope` reaches an asker standing at `position`.
 ///
@@ -273,6 +282,95 @@ pub fn depth_monotonic(seeds: std::ops::Range<u64>, params: &Params) -> bool {
     })
 }
 
+use rm_core::Timestamp;
+
+/// The `(valid, tx)` grid the correction is probed on.
+///
+/// `pub` so `report.rs` and the tests read one grid rather than two that could
+/// drift apart. `build` records at 1000 and steps by 10; the correction below
+/// lands at 9000, so 5000 is before it on both axes and 12000 is after.
+pub fn rescope_probes() -> Vec<(Timestamp, Timestamp)> {
+    let mut out = Vec::new();
+    for valid_t in [5_000, 12_000] {
+        for tx_t in [5_000, 12_000] {
+            out.push((valid_t, tx_t));
+        }
+    }
+    out
+}
+
+/// A position from which `scope` reaches, for asking "is it here".
+///
+/// `*` reaches everywhere, so any position does; for anything else the scope
+/// itself is the nearest position that admits it.
+fn position_for(scope: &str) -> &str {
+    if scope == "*" {
+        "anywhere/at/all"
+    } else {
+        scope
+    }
+}
+
+/// Whether correcting a reach leaves the past alone.
+///
+/// Three claims, and the middle one is the reason this row exists:
+///
+/// - At a transaction time *before* the correction, the store had not heard of
+///   the new reach, so the decision answers under its original one.
+/// - At a valid time before the correction but a transaction time after it, the
+///   decision answers under its **original** reach -- a correction is dated
+///   from now, because the reach genuinely changed today. Dating it from the
+///   decision's start would assert it always reached somewhere it did not.
+/// - At both after, the new reach applies.
+///
+/// Checked by asking from a position the reach admits and seeing whether the
+/// title comes back, rather than by reading the scope attribute -- the question
+/// is what a reader is shown, not what is stored.
+pub fn rescope_history(seeds: std::ops::Range<u64>, params: &Params) -> bool {
+    const CORRECTED_AT: Timestamp = 9_000;
+    let embedder = Hashed::new(3);
+
+    seeds.into_iter().all(|seed| {
+        let w = world(seed, params);
+        let mut e = build(&w);
+        let (title, original) = w.decisions[0].clone();
+        // A reach the original does not cover, so the two are distinguishable.
+        let new_scope = if original == "*" { "work" } else { "*" };
+
+        let Ok(plan) = command::plan_rescope(&title, new_scope, CORRECTED_AT, "conform", &embedder)
+        else {
+            return false;
+        };
+        if command::commit_rescope(&mut e, plan).is_err() {
+            return false;
+        }
+
+        rescope_probes().into_iter().all(|(valid_t, tx_t)| {
+            let at = At {
+                valid: valid_t,
+                tx: tx_t,
+            };
+            let under = |scope: &str| {
+                let Ok(Outcome::Decisions(ds)) =
+                    command::decisions(&e, None, at, Some(position_for(scope)))
+                else {
+                    return false;
+                };
+                ds.into_iter().any(|d| d.title == title)
+            };
+            let corrected = tx_t >= CORRECTED_AT && valid_t >= CORRECTED_AT;
+            // `original.as_str()`, not `&original`: both arms of an if-else
+            // must be the same type, and `&String` does not coerce here.
+            let want = if corrected {
+                new_scope
+            } else {
+                original.as_str()
+            };
+            under(want)
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +581,70 @@ mod tests {
         assert!(
             pairs > 20,
             "only {pairs} nested position pairs across 40 worlds, so the              property is close to vacuous"
+        );
+    }
+
+    #[test]
+    fn a_correction_does_not_rewrite_what_was_true_before_it() {
+        assert!(
+            rescope_history(0..40, &Params::default()),
+            "a corrected reach answered wrongly on some (valid, tx) probe"
+        );
+    }
+
+    /// This is where the correction branch stops being unexercised. Every one
+    /// of the 219 records in the live store was a backfill, so `rescope` with a
+    /// previous scope has only ever run in unit tests.
+    #[test]
+    fn the_correction_branch_actually_fires() {
+        let params = Params::default();
+        let w = world(3, &params);
+        let mut e = build(&w);
+        let embedder = Hashed::new(3);
+        let (title, original) = w.decisions[0].clone();
+
+        let new_scope = if original == "*" { "work" } else { "*" };
+        let plan = command::plan_rescope(&title, new_scope, 9_000, "conform", &embedder)
+            .expect("a known title with a valid scope");
+        let Outcome::Rescoped { previous, .. } =
+            command::commit_rescope(&mut e, plan).expect("the title resolves")
+        else {
+            panic!("rescope did not report a rescope")
+        };
+        assert_eq!(
+            previous.as_deref(),
+            Some(original.as_str()),
+            "the correction branch did not see a previous scope"
+        );
+    }
+
+    /// Re-stating a reach writes nothing. Cheap to get wrong, and the failure
+    /// is silent: a second identical scope version would inflate every
+    /// backfilled record's history without changing a single answer.
+    #[test]
+    fn restating_the_same_reach_writes_nothing() {
+        let params = Params::default();
+        let w = world(5, &params);
+        let mut e = build(&w);
+        let embedder = Hashed::new(3);
+        let (title, original) = w.decisions[0].clone();
+
+        let plan = command::plan_rescope(&title, &original, 9_000, "conform", &embedder)
+            .expect("a known title with a valid scope");
+        // The entity comes from the outcome; `find_decision` is private to
+        // `rm-host` and widening it for a test's convenience would be the
+        // wrong trade.
+        let Outcome::Rescoped {
+            entity, previous, ..
+        } = command::commit_rescope(&mut e, plan).expect("the title resolves")
+        else {
+            panic!("rescope did not report a rescope")
+        };
+        assert_eq!(previous.as_deref(), Some(original.as_str()));
+        assert_eq!(
+            e.store_history(entity, "scope").len(),
+            1,
+            "re-stating a reach wrote a second version"
         );
     }
 }
