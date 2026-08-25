@@ -792,7 +792,6 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
 /// valid-time question is answered without a survivorship strategy -- and
 /// therefore without depending on `[policy]`, where the shipped default is
 /// `most_recent` and a valid time has nothing to index into.
-#[allow(dead_code)] // callers arrive in Task 2
 fn visible<'a>(engine: &'a Engine, id: StableId, attr: &str, at: At) -> Vec<&'a Version> {
     engine
         .store_history(id, attr)
@@ -809,7 +808,6 @@ fn visible<'a>(engine: &'a Engine, id: StableId, attr: &str, at: At) -> Vec<&'a 
 /// empty one in the detail. This is `decision`'s reading: a tombstone asserts
 /// the attribute has no value, and stepping past it to report a superseded one
 /// would answer with something the store has been told is no longer true.
-#[allow(dead_code)] // callers arrive in Task 2
 fn held(engine: &Engine, id: StableId, attr: &str, at: At) -> Option<String> {
     visible(engine, id, attr, at)
         .last()
@@ -817,7 +815,7 @@ fn held(engine: &Engine, id: StableId, attr: &str, at: At) -> Option<String> {
 }
 
 /// Every decision the store holds, most recently recorded first.
-pub fn decisions(engine: &Engine, only: Option<&str>) -> Result<Outcome, HostError> {
+pub fn decisions(engine: &Engine, only: Option<&str>, at: At) -> Result<Outcome, HostError> {
     // Checked before the scan rather than silently matching nothing. A status
     // nobody uses and a status that does not exist both return an empty list,
     // and the difference between "we have never rejected anything" and "you
@@ -838,20 +836,15 @@ pub fn decisions(engine: &Engine, only: Option<&str>) -> Result<Outcome, HostErr
         if record.get("kind") != Some("decision") {
             continue;
         }
-        let latest = |attr: &str| {
-            engine
-                .store_history(id, attr)
-                .iter()
-                .filter_map(|v| v.value.clone())
-                .next_back()
-        };
-        let Some(choice) = latest("choice") else {
+        // Not visible at `at` means the store had not heard of it yet, and the
+        // existing `continue` is exactly the "absent from the list" answer.
+        let Some(choice) = held(engine, id, "choice", at) else {
             continue;
         };
-        let status = latest("status").unwrap_or_else(|| DEFAULT_STATUS.into());
+        let status = held(engine, id, "status", at).unwrap_or_else(|| DEFAULT_STATUS.into());
         // Read once: it decides the mark and it is shown on the line.
         let superseded_by = engine
-            .edges_into(id, Timestamp::MAX, Timestamp::MAX)
+            .edges_into(id, at.valid, at.tx)
             .iter()
             .find(|e| e.predicate == SUPERSEDES)
             .map(|e| (e.subject, title_of(engine, e.subject)));
@@ -869,11 +862,11 @@ pub fn decisions(engine: &Engine, only: Option<&str>) -> Result<Outcome, HostErr
             // print as standing while printing `[superseded]` beside itself,
             // which is the one combination that cannot be true.
             still_stands: superseded_by.is_none() && status == DEFAULT_STATUS,
-            revisions: engine.store_history(id, "choice").len(),
+            revisions: visible(engine, id, "choice", at).len(),
             superseded_by,
             status,
             choice,
-            because: latest("because"),
+            because: held(engine, id, "because", at),
         });
     }
     if let Some(want) = only {
@@ -1485,6 +1478,83 @@ pub(crate) mod tests {
 
     // ---- decisions ---------------------------------------------------------
 
+    /// A decision the store had not yet heard of is not in the list, and the
+    /// count of revisions is the count it had then.
+    #[test]
+    fn the_list_is_answered_as_of_a_transaction_time() {
+        const MARCH: Timestamp = 1_772_236_800_000;
+        const AUGUST: Timestamp = 1_787_532_411_419;
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+
+        decide(
+            &mut e,
+            "Early",
+            "chosen in March",
+            None,
+            None,
+            None,
+            None,
+            Some(MARCH),
+            MARCH,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Late",
+            "chosen in August",
+            None,
+            None,
+            None,
+            None,
+            Some(AUGUST),
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Early",
+            "revised in August",
+            None,
+            None,
+            None,
+            None,
+            Some(AUGUST),
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let titles = |at: At| {
+            let Outcome::Decisions(ds) = decisions(&e, None, at).unwrap() else {
+                panic!("decisions did not return decisions")
+            };
+            ds.into_iter()
+                .map(|d| (d.title, d.choice, d.revisions))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            titles(At {
+                valid: Timestamp::MAX,
+                tx: MARCH
+            }),
+            vec![("Early".to_string(), "chosen in March".to_string(), 1)],
+            "August had not happened yet"
+        );
+
+        let now = titles(At::latest());
+        assert_eq!(now.len(), 2, "both decisions exist now");
+        let early = now.iter().find(|(t, ..)| t == "Early").unwrap();
+        assert_eq!(early.1, "revised in August");
+        assert_eq!(early.2, 2, "revised once, so two choices");
+    }
+
     /// Both axes bite, and a tombstone is an answer rather than something to
     /// skip past.
     #[test]
@@ -1566,7 +1636,7 @@ pub(crate) mod tests {
 
     /// Every decision in the store, as (title, entity, still standing).
     fn recorded(e: &mut Engine) -> Vec<(String, StableId, bool)> {
-        let Outcome::Decisions(ds) = decisions(e, None).unwrap() else {
+        let Outcome::Decisions(ds) = decisions(e, None, At::latest()).unwrap() else {
             panic!("decisions did not return decisions")
         };
         ds.iter()
@@ -1846,7 +1916,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decisions(lines) = decisions(&e, None).unwrap() else {
+        let Outcome::Decisions(lines) = decisions(&e, None, At::latest()).unwrap() else {
             panic!()
         };
         let queue: Vec<_> = lines.iter().filter(|l| l.title == "Pick a queue").collect();
@@ -2095,7 +2165,7 @@ pub(crate) mod tests {
         }
 
         let titles = |only: Option<&str>| {
-            let Outcome::Decisions(l) = decisions(&e, only).unwrap() else {
+            let Outcome::Decisions(l) = decisions(&e, only, At::latest()).unwrap() else {
                 panic!()
             };
             let mut t: Vec<String> = l.iter().map(|d| d.title.clone()).collect();
@@ -2120,7 +2190,7 @@ pub(crate) mod tests {
     #[test]
     fn filtering_by_a_status_that_does_not_exist_is_refused() {
         let e = engine();
-        let Err(HostError::Refused(why)) = decisions(&e, Some("declined")) else {
+        let Err(HostError::Refused(why)) = decisions(&e, Some("declined"), At::latest()) else {
             panic!("a bad status should be refused")
         };
         assert!(
@@ -2129,7 +2199,7 @@ pub(crate) mod tests {
         );
         // `superseded` is not settable by `decide`, but it is a real status a
         // decision can hold, so filtering by it has to work.
-        assert!(decisions(&e, Some("superseded")).is_ok());
+        assert!(decisions(&e, Some("superseded"), At::latest()).is_ok());
     }
 
     /// An option considered and turned down is recordable as one.
@@ -2539,7 +2609,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decisions(lines) = decisions(&e, None).unwrap() else {
+        let Outcome::Decisions(lines) = decisions(&e, None, At::latest()).unwrap() else {
             panic!()
         };
         assert_eq!(lines.len(), 1);

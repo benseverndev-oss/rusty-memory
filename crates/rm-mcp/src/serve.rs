@@ -540,7 +540,9 @@ where
                 _,
             ) => command::about(engine, entity, &attribute, valid_at, as_of),
             (Call::Reviews, _) => command::review_list(engine),
-            (Call::Decisions { status }, _) => command::decisions(engine, status.as_deref()),
+            (Call::Decisions { status }, _) => {
+                command::decisions(engine, status.as_deref(), rm_host::time::At::latest())
+            }
             (Call::Decision { title }, _) => command::decision(engine, &title),
             (other, _) => unreachable!("{other:?} writes, or was not planned"),
         }
