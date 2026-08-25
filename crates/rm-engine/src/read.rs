@@ -31,6 +31,16 @@ pub struct Query {
     pub entity: Option<StableId>,
     pub source: Option<Source>,
     pub session: Option<String>,
+    /// Where the asker stands. `None` suspends the applicability rule.
+    ///
+    /// A *filter*, unlike [`Query::boost`], and the reason the two differ is
+    /// worth keeping straight. `boost` is a boost because turning a name into
+    /// an entity is fallible -- measured at J = 0.33 on this corpus -- so
+    /// filtering on it would discard the answer every time the guess was wrong.
+    /// A position is not a guess: it is a declared string compared to a stored
+    /// one, so filtering discards nothing on a bad inference because there is
+    /// no inference.
+    pub position: Option<String>,
     /// Entities whose assertions are worth more for this query, and how much.
     ///
     /// A *boost*, not a filter, and the distinction is the whole design.
@@ -170,6 +180,7 @@ impl Query {
             entity: None,
             source: None,
             session: None,
+            position: None,
             boost: BTreeSet::new(),
             boost_by: 0.0,
         }
@@ -199,6 +210,12 @@ impl Query {
 
     pub fn in_session(mut self, session: impl Into<String>) -> Self {
         self.session = Some(session.into());
+        self
+    }
+
+    /// Ask from `position`, returning only what reaches it.
+    pub fn at(mut self, position: impl Into<String>) -> Self {
+        self.position = Some(position.into());
         self
     }
 
@@ -463,6 +480,26 @@ impl Engine {
         if let Some(source) = &q.source {
             if &version.provenance.source != source {
                 return false;
+            }
+        }
+        if let Some(position) = &q.position {
+            // The scope lives on the entity, as an ordinary attribute, because
+            // that is how `decide` writes it. Read at the query's own clocks so
+            // a scoped recall and a scoped `decisions` agree about the same
+            // instant; unqualified, that is the latest of both axes.
+            let (valid_t, tx_t) = q.as_of.unwrap_or((Timestamp::MAX, Timestamp::MAX));
+            let reach = self
+                .store
+                .history(entry.entity, "scope")
+                .iter()
+                .rfind(|v| v.provenance.observed_at <= tx_t && v.valid.from <= valid_t)
+                .and_then(|v| v.value.clone());
+            // No scope recorded reaches everywhere -- the legacy rule, and what
+            // keeps `remember`'s facts from ever being hidden.
+            if let Some(reach) = reach {
+                if !rm_core::scope::applies_at(&reach, position) {
+                    return false;
+                }
             }
         }
         if let Some((valid_t, tx_t)) = q.as_of {
