@@ -102,6 +102,13 @@ pub fn table() -> String {
         "| recall applicability | {} |\n",
         verdict(recall_agreement(0..SCOPE_SEEDS, &scope_params))
     ));
+    // Measured at the read rather than the merge, which is where
+    // `ValidInterval`'s refusal lives now. `refusal correctness` above no
+    // longer reaches it.
+    out.push_str(&format!(
+        "| instant-local refusal agreement | {} |\n",
+        verdict(crate::differential::instant_agreement(0..300).exact())
+    ));
 
     out.push_str(&format!(
         "\n{} of {comparisons} comparisons reached a refusal, {} answered. \
@@ -137,6 +144,7 @@ mod tests {
             "depth monotonicity",
             "rescope keeps its history",
             "recall applicability",
+            "instant-local refusal agreement",
         ] {
             assert!(t.contains(row), "row missing from the table: {row}\n{t}");
         }
