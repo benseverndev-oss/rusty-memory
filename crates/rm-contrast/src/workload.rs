@@ -194,7 +194,6 @@ pub fn truth(w: &Workload, q: &Query) -> Truth {
 /// The pieces `rm_engine::Observation` needs that do not vary here.
 ///
 /// `pub(crate)` so `score.rs` builds the engine the same way every time.
-#[allow(dead_code)] // callers arrive in Task 3
 pub(crate) fn provenance(observed_at: Timestamp) -> Provenance {
     Provenance {
         source: Source::UserAssertion,
@@ -206,7 +205,6 @@ pub(crate) fn provenance(observed_at: Timestamp) -> Provenance {
 }
 
 /// The interval a write claims, open-ended from when it began to hold.
-#[allow(dead_code)] // callers arrive in Task 3
 pub(crate) fn interval(valid_from: Timestamp) -> Interval {
     Interval {
         from: valid_from,
@@ -220,7 +218,6 @@ pub(crate) fn interval(valid_from: Timestamp) -> Interval {
 /// the store does not read it during survivorship, and claiming `Corrects` or
 /// `Joins` would assert something the generator has no basis for. There is no
 /// `Extends` variant -- the enum is `Corrects`, `Joins`, `Unstated`.
-#[allow(dead_code)] // callers arrive in Task 3
 pub(crate) fn supersession() -> Supersession {
     Supersession::Unstated
 }
