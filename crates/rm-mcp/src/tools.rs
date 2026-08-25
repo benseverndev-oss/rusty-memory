@@ -309,8 +309,8 @@ pub enum Call {
     About {
         entity: StableId,
         attribute: String,
-        valid_at: Timestamp,
-        as_of: Timestamp,
+        valid_at: Option<Timestamp>,
+        as_of: Option<Timestamp>,
     },
     Reviews,
     ResolveReview {
@@ -396,12 +396,14 @@ impl Call {
         })
     }
 
-    pub fn read(
-        name: &str,
-        arguments: &Value,
-        now: Timestamp,
-        client: Option<&str>,
-    ) -> Result<Call, Unreadable> {
+    /// Read a tool call from its arguments.
+    ///
+    /// Takes no clock. It used to, to default `about`'s two axes to now -- and
+    /// that default was the bug: once applied, "what held in March" and "what
+    /// holds now" are the same call, so nothing downstream could refuse a
+    /// valid-time question the attribute could not answer. The axes travel as
+    /// `Option`s and the default is applied where the refusal lives.
+    pub fn read(name: &str, arguments: &Value, client: Option<&str>) -> Result<Call, Unreadable> {
         match name {
             "remember" => Ok(Call::Remember {
                 text: string(arguments, "text")?,
@@ -430,8 +432,11 @@ impl Call {
             "about" => Ok(Call::About {
                 entity: non_negative(arguments, "entity")? as StableId,
                 attribute: string(arguments, "attribute")?,
-                valid_at: optional_integer(arguments, "valid_at")?.unwrap_or(now),
-                as_of: optional_integer(arguments, "as_of")?.unwrap_or(now),
+                // Left unresolved, so `command::about` can tell a valid-time
+                // question from its absence and refuse one the attribute's
+                // strategy cannot answer.
+                valid_at: optional_integer(arguments, "valid_at")?,
+                as_of: optional_integer(arguments, "as_of")?,
             }),
             "reviews" => Ok(Call::Reviews),
             "decisions" => Ok(Call::Decisions {
@@ -589,10 +594,8 @@ fn non_negative(args: &Value, field: &str) -> Result<i64, Unreadable> {
 mod tests {
     use super::*;
 
-    const NOW: Timestamp = 1_000;
-
     fn read(name: &str, args: Value) -> Result<Call, Unreadable> {
-        Call::read(name, &args, NOW, None)
+        Call::read(name, &args, None)
     }
 
     #[test]
@@ -655,13 +658,12 @@ mod tests {
     /// `session` argument is asking for the writes where it was forgotten.
     #[test]
     fn a_write_is_attributed_to_the_client_that_made_it() {
-        let with =
-            |client: Option<&str>, args: Value| match Call::read("decide", &args, NOW, client)
-                .unwrap()
-            {
-                Call::Decide { session, .. } => session,
-                other => panic!("{other:?}"),
-            };
+        let with = |client: Option<&str>, args: Value| match Call::read("decide", &args, client)
+            .unwrap()
+        {
+            Call::Decide { session, .. } => session,
+            other => panic!("{other:?}"),
+        };
         let bare = json!({"title": "T", "choice": "C", "scope": "work"});
 
         // The handshake name alone.
@@ -793,8 +795,11 @@ mod tests {
             Call::About {
                 entity: 2,
                 attribute: "employer".into(),
-                valid_at: NOW,
-                as_of: NOW
+                // Absent, not defaulted to now. Applying the default here is
+                // what made "what held in May" and "what holds now" the same
+                // call, so nothing downstream could refuse the first.
+                valid_at: None,
+                as_of: None
             }
         );
     }
@@ -814,8 +819,8 @@ mod tests {
             Call::About {
                 entity: 1,
                 attribute: "employer".into(),
-                valid_at: 500,
-                as_of: 900
+                valid_at: Some(500),
+                as_of: Some(900)
             }
         );
     }

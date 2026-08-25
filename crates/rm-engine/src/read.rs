@@ -314,6 +314,17 @@ impl Engine {
         self
     }
 
+    /// The policy this engine reads under.
+    ///
+    /// Exposed so a host can ask what governs an attribute *before* asking
+    /// about it -- `Policy::for_attribute` then names the strategy, and
+    /// `Strategy::keeps_a_timeline` says whether a valid-time question has an
+    /// answer at all. Without this the caller can only ask and be told
+    /// something plausible.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
     /// The `k` nearest assertions matching the query's scope.
     ///
     /// Scoping is handed to `rm_index::VectorIndex::search_filtered` as a

@@ -298,6 +298,21 @@ impl Strategy {
             Strategy::MostRecent | Strategy::SourcePriority(_) | Strategy::ValidInterval
         )
     }
+
+    /// Whether this strategy's outcome can be asked about a moment in time.
+    ///
+    /// Only [`Strategy::ValidInterval`] emits a timeline. Every other strategy
+    /// collapses a history to one winner, and a winner has no time dimension,
+    /// so `held_at` returns the same value whatever instant it is handed.
+    ///
+    /// Exposed for the same reason as [`Self::needs_provenance`]: so a host can
+    /// check up front rather than discovering it per read. Without it a caller
+    /// asking what held in March gets an answer that is right about now and
+    /// silent about the difference -- which is exactly what `rmem about
+    /// --valid-at` did on every attribute but one.
+    pub fn keeps_a_timeline(&self) -> bool {
+        matches!(self, Strategy::ValidInterval)
+    }
 }
 
 /// Resolve `candidates` under `strategy`.
@@ -965,5 +980,28 @@ mod tests {
             None,
             "as_of reports an absence as no value"
         );
+    }
+
+    /// The mirror of `needs_provenance_flags_exactly_the_strategies_that_read_it`.
+    /// A strategy added later that emits a timeline and is not listed here
+    /// would be silently unaskable about time.
+    #[test]
+    fn keeps_a_timeline_flags_exactly_the_strategy_that_emits_one() {
+        assert!(Strategy::ValidInterval.keeps_a_timeline());
+        for s in [
+            Strategy::MostRecent,
+            Strategy::MostComplete,
+            Strategy::LongestValue,
+            Strategy::MajorityVote,
+            Strategy::ConfidenceMajority,
+            Strategy::FirstNonNull,
+            Strategy::UnanimousOrNull,
+            Strategy::SourcePriority(vec![]),
+        ] {
+            assert!(
+                !s.keeps_a_timeline(),
+                "{s:?} collapses to a winner, which has no time dimension"
+            );
+        }
     }
 }
