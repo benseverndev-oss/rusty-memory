@@ -47,6 +47,9 @@ pub fn run(
     args: impl Iterator<Item = String>,
     config_path: &Path,
     now: Timestamp,
+    // Where this session stands, from `RMEM_SCOPE`. `None` is no position,
+    // which suspends the applicability rule entirely.
+    session_scope: Option<String>,
 ) -> Result<Outcome, CliError> {
     let command = parse(args)?;
 
@@ -219,6 +222,7 @@ pub fn run(
             Command::Decide {
                 title,
                 choice,
+                scope,
                 status,
                 decided_at,
                 because,
@@ -232,6 +236,7 @@ pub fn run(
                 Some(Planned::Decide(command::plan_decide(
                     title,
                     choice,
+                    scope,
                     status.as_deref(),
                     because.as_deref(),
                     context.as_deref(),
@@ -308,31 +313,53 @@ pub fn run(
                         status,
                         valid_at,
                         as_of,
+                        scope,
+                        all,
                     },
                     _,
-                ) => command::decisions(
-                    engine,
-                    status.as_deref(),
-                    At {
-                        valid: valid_at.unwrap_or(Timestamp::MAX),
-                        tx: as_of.unwrap_or(Timestamp::MAX),
-                    },
-                ),
+                ) => {
+                    // `--all` beats `--scope`, which beats the environment.
+                    // `None` is no position, which suspends the rule.
+                    let here = if all {
+                        None
+                    } else {
+                        scope.or_else(|| session_scope.clone())
+                    };
+                    command::decisions(
+                        engine,
+                        status.as_deref(),
+                        At {
+                            valid: valid_at.unwrap_or(Timestamp::MAX),
+                            tx: as_of.unwrap_or(Timestamp::MAX),
+                        },
+                        here.as_deref(),
+                    )
+                }
                 (
                     Command::Decision {
                         title,
                         valid_at,
                         as_of,
+                        scope,
+                        all,
                     },
                     _,
-                ) => command::decision(
-                    engine,
-                    &title,
-                    At {
-                        valid: valid_at.unwrap_or(Timestamp::MAX),
-                        tx: as_of.unwrap_or(Timestamp::MAX),
-                    },
-                ),
+                ) => {
+                    let here = if all {
+                        None
+                    } else {
+                        scope.or_else(|| session_scope.clone())
+                    };
+                    command::decision(
+                        engine,
+                        &title,
+                        At {
+                            valid: valid_at.unwrap_or(Timestamp::MAX),
+                            tx: as_of.unwrap_or(Timestamp::MAX),
+                        },
+                        here.as_deref(),
+                    )
+                }
                 (Command::Init { .. }, _) => unreachable!("handled above"),
                 (other, _) => unreachable!("{other:?} writes, or was not planned"),
             }
@@ -375,7 +402,7 @@ mod tests {
     }
 
     fn go(config: &std::path::Path, args: &[&str]) -> Result<Outcome, CliError> {
-        run(args.iter().map(|s| s.to_string()), config, 1_000)
+        run(args.iter().map(|s| s.to_string()), config, 1_000, None)
     }
 
     #[test]

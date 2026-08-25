@@ -47,6 +47,7 @@ pub fn build_chain(titles: &[&str]) -> Engine {
             &mut e,
             title,
             "the chosen option",
+            "conform",
             None, // status: defaults to accepted
             Some("a stated reason"),
             None, // context
@@ -65,7 +66,7 @@ pub fn build_chain(titles: &[&str]) -> Engine {
 
 /// One decision in full, or a panic naming the title that did not resolve.
 pub fn detail(e: &Engine, title: &str) -> DecisionDetail {
-    match command::decision(e, title, At::latest()).expect("a recorded title resolves") {
+    match command::decision(e, title, At::latest(), None).expect("a recorded title resolves") {
         Outcome::Decision(Found::Decision(d)) => *d,
         _ => panic!("expected a decision for {title:?}"),
     }
@@ -116,7 +117,7 @@ pub fn time_coverage() -> f64 {
         // one carrying the `supersedes` edge into it.
         let retired = recorded_at[1] <= *tx_t && recorded_at[1] <= *valid_t;
 
-        let got = command::decision(&e, TITLES[0], at).expect("a recorded title resolves");
+        let got = command::decision(&e, TITLES[0], at, None).expect("a recorded title resolves");
         let ok = match got {
             Outcome::Decision(Found::NotYetRecorded { .. }) => !known,
             Outcome::Decision(Found::Decision(d)) => known && d.still_stands == !retired,
@@ -237,7 +238,7 @@ mod tests {
         let e = build_chain(&TITLES);
         let (mut not_yet, mut standing, mut retired) = (0, 0, 0);
         for (valid, tx) in coverage_probes() {
-            match command::decision(&e, TITLES[0], At { valid, tx }).unwrap() {
+            match command::decision(&e, TITLES[0], At { valid, tx }, None).unwrap() {
                 Outcome::Decision(Found::NotYetRecorded { .. }) => not_yet += 1,
                 Outcome::Decision(Found::Decision(d)) if d.still_stands => standing += 1,
                 Outcome::Decision(Found::Decision(_)) => retired += 1,

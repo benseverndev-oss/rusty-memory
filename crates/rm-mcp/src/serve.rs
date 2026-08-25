@@ -126,6 +126,22 @@ pub struct Handshake {
     pub negotiated: Option<String>,
 }
 
+/// Where a read is asked from.
+///
+/// `all` beats an explicit scope, which beats the environment; `None` is no
+/// position, which suspends the applicability rule.
+///
+/// The environment is read here rather than threaded from startup, matching
+/// `tools::definitions`, which reads `TOOLS_ENV` the same way. This binary has
+/// no clock-style spine to hang it on, and a long-lived process's environment
+/// does not change under it.
+fn position(scope: Option<String>, all: bool) -> Option<String> {
+    if all {
+        return None;
+    }
+    scope.or_else(|| std::env::var(crate::tools::SCOPE_ENV).ok())
+}
+
 impl<P, F> Server<P, F>
 where
     P: Completer + Embedder,
@@ -482,6 +498,7 @@ where
             Call::Decide {
                 title,
                 choice,
+                scope,
                 status,
                 decided_at,
                 because,
@@ -496,6 +513,7 @@ where
                 Ok(Planned::Decide(command::plan_decide(
                     title,
                     choice,
+                    scope,
                     status.as_deref(),
                     because.as_deref(),
                     context.as_deref(),
@@ -546,31 +564,43 @@ where
                     status,
                     valid_at,
                     as_of,
+                    scope,
+                    all,
                 },
                 _,
-            ) => command::decisions(
-                engine,
-                status.as_deref(),
-                At {
-                    valid: valid_at.unwrap_or(Timestamp::MAX),
-                    tx: as_of.unwrap_or(Timestamp::MAX),
-                },
-            ),
+            ) => {
+                let here = position(scope, all);
+                command::decisions(
+                    engine,
+                    status.as_deref(),
+                    At {
+                        valid: valid_at.unwrap_or(Timestamp::MAX),
+                        tx: as_of.unwrap_or(Timestamp::MAX),
+                    },
+                    here.as_deref(),
+                )
+            }
             (
                 Call::Decision {
                     title,
                     valid_at,
                     as_of,
+                    scope,
+                    all,
                 },
                 _,
-            ) => command::decision(
-                engine,
-                &title,
-                At {
-                    valid: valid_at.unwrap_or(Timestamp::MAX),
-                    tx: as_of.unwrap_or(Timestamp::MAX),
-                },
-            ),
+            ) => {
+                let here = position(scope, all);
+                command::decision(
+                    engine,
+                    &title,
+                    At {
+                        valid: valid_at.unwrap_or(Timestamp::MAX),
+                        tx: as_of.unwrap_or(Timestamp::MAX),
+                    },
+                    here.as_deref(),
+                )
+            }
             (other, _) => unreachable!("{other:?} writes, or was not planned"),
         }
     }

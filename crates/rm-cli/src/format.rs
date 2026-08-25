@@ -210,6 +210,18 @@ pub fn render(outcome: &Outcome) -> String {
             format_day(*first_recorded),
             format_day(*first_held),
         ),
+        // Not "no decision by that title": the title is real, so sending the
+        // reader after a spelling mistake would be a lie. Both places named,
+        // because knowing where it does apply is the actionable half.
+        Outcome::Decision(Found::NotHere {
+            title,
+            scope,
+            asked_from,
+        }) => format!(
+            "{title:?} is on record, but it does not apply here.\n\n  \
+             it reaches     {scope}\n  you asked from {asked_from}\n\n\
+             Use --scope {scope} to ask from there, or --all to ignore reach.\n"
+        ),
         Outcome::Decision(Found::Unknown) => {
             "no decision by that title — `rmem decisions` lists them, and the title has to match exactly".to_string()
         }
@@ -734,6 +746,21 @@ mod tests {
         }));
         assert!(out.contains("2026-08-24"), "the day it arrived: {out}");
         assert!(out.contains("2026-02-28"), "the day it holds from: {out}");
+        assert!(
+            !out.contains("no decision by that title"),
+            "must not read as a typo: {out}"
+        );
+    }
+
+    #[test]
+    fn a_decision_out_of_reach_names_both_places() {
+        let out = render(&Outcome::Decision(Found::NotHere {
+            title: "A sibling".into(),
+            scope: "work/other".into(),
+            asked_from: "work/goldenmatch".into(),
+        }));
+        assert!(out.contains("work/other"), "{out}");
+        assert!(out.contains("work/goldenmatch"), "{out}");
         assert!(
             !out.contains("no decision by that title"),
             "must not read as a typo: {out}"
