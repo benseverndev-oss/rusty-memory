@@ -21,4 +21,5 @@
 
 pub mod flat;
 pub mod score;
+pub mod surface;
 pub mod workload;

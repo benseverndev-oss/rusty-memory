@@ -51,6 +51,21 @@ pub struct Params {
     pub queries: usize,
     /// Percent of questions about a past instant. The y-axis.
     pub retrospective_pct: u64,
+    /// Percent of writes that reuse the previous write's entity and both of
+    /// its clocks.
+    ///
+    /// **Zero by default, so the grid is tie-free.** A tie makes the store
+    /// refuse the whole read -- `ValidInterval` cannot build a timeline when two
+    /// segments collide, even if the question asks about an instant where
+    /// nothing is ambiguous -- and mixing that into the surface would confound
+    /// the temporal axes with the refusal behaviour. It is measured separately.
+    ///
+    /// Without it no two writes can
+    /// share an `observed_at`, because those are handed out in order, so
+    /// [`Truth::Ambiguous`] is unreachable and the question with no right
+    /// answer never occurs. That question is where the two stores differ most
+    /// sharply: this store declines it and the control answers anyway.
+    pub tie_pct: u64,
 }
 
 impl Default for Params {
@@ -62,6 +77,7 @@ impl Default for Params {
             entities: 3,
             queries: 40,
             retrospective_pct: 0,
+            tie_pct: 0,
         }
     }
 }
@@ -113,6 +129,22 @@ pub fn workload(seed: u64, params: &Params) -> Workload {
     let mut writes = Vec::with_capacity(params.len);
 
     for i in 0..params.len {
+        // A tie reuses the previous write's entity and both clocks, so two
+        // different values end up with nothing ordering them.
+        let tie = i > 0 && rng.below(100) < params.tie_pct;
+        if tie {
+            let previous: &Write = &writes[i - 1];
+            let (entity, valid_from, observed_at) =
+                (previous.entity, previous.valid_from, previous.observed_at);
+            let n = rng.below(params.alphabet);
+            writes.push(Write {
+                entity,
+                value: Some(format!("value {n}")),
+                valid_from,
+                observed_at,
+            });
+            continue;
+        }
         let observed_at = FIRST + (i as Timestamp) * STEP;
         // Backdated writes claim to have begun somewhere earlier in the
         // history: heard in September, true since July.
@@ -373,6 +405,37 @@ mod tests {
             ),
             Truth::Ambiguous,
             "nothing orders them, so there is no true answer to get right"
+        );
+    }
+
+    /// Without ties no two writes share an `observed_at`, because those are
+    /// handed out in order -- so `Truth::Ambiguous` is unreachable and the one
+    /// question the two stores answer most differently never occurs.
+    #[test]
+    fn ties_produce_questions_with_no_right_answer() {
+        let none = Params {
+            tie_pct: 0,
+            ..Params::default()
+        };
+        for seed in 0..20 {
+            let w = workload(seed, &none);
+            assert!(
+                w.queries.iter().all(|q| truth(&w, q) != Truth::Ambiguous),
+                "no ties should mean no ambiguity"
+            );
+        }
+
+        let some = Params {
+            tie_pct: 25,
+            ..Params::default()
+        };
+        let ambiguous = (0..20).any(|seed| {
+            let w = workload(seed, &some);
+            w.queries.iter().any(|q| truth(&w, q) == Truth::Ambiguous)
+        });
+        assert!(
+            ambiguous,
+            "a 25% tie rate produced no unanswerable question, so the store's              refusal has nothing to refuse"
         );
     }
 }

@@ -18,12 +18,30 @@ use crate::workload::{interval, provenance, supersession, truth, Truth, Workload
 pub struct Score {
     pub right: usize,
     pub wrong: usize,
+    /// The store refused a question that *did* have an answer.
     pub declined: usize,
+    /// The question had no right answer, so neither store can be graded on it.
+    ///
+    /// Excluded from [`Score::accuracy`] entirely rather than counted for or
+    /// against. Two values with nothing ordering them make a question the
+    /// benchmark cannot mark, and marking it either way is the thumb on the
+    /// scale this whole design exists to avoid.
+    ///
+    /// It is still the sharpest difference between the two stores, and it is
+    /// reported rather than scored: this store declines these, and the control
+    /// answers them, because it has no way not to.
+    pub ungradeable: usize,
 }
 
 impl Score {
+    /// The questions that could be graded.
     pub fn total(&self) -> usize {
         self.right + self.wrong + self.declined
+    }
+
+    /// Every question asked, gradeable or not.
+    pub fn asked(&self) -> usize {
+        self.total() + self.ungradeable
     }
 
     /// `right / (right + wrong + declined)`.
@@ -93,13 +111,14 @@ enum Outcome {
     Right,
     Wrong,
     Declined,
+    Ungradeable,
 }
 
 /// Mark one answer against the truth.
 fn mark(answer: Option<Option<String>>, truth: &Truth) -> Outcome {
     match (answer, truth) {
-        // Nothing to get right: the question has no answer.
-        (_, Truth::Ambiguous) => Outcome::Declined,
+        // No right answer exists, so no answer can be right or wrong.
+        (_, Truth::Ambiguous) => Outcome::Ungradeable,
         (Some(v), Truth::Value(t)) if &v == t => Outcome::Right,
         (None, Truth::Nothing) => Outcome::Right,
         _ => Outcome::Wrong,
@@ -113,6 +132,7 @@ fn tally(outcomes: impl Iterator<Item = Outcome>) -> Score {
             Outcome::Right => s.right += 1,
             Outcome::Wrong => s.wrong += 1,
             Outcome::Declined => s.declined += 1,
+            Outcome::Ungradeable => s.ungradeable += 1,
         }
     }
     s
@@ -123,7 +143,11 @@ pub fn score_store(w: &Workload) -> Score {
     let (engine, ids) = load(w);
     tally(w.queries.iter().map(|q| {
         match engine.about(ids[q.entity], ATTRIBUTE, q.valid_t, q.tx_t) {
-            // A refusal from survivorship is a decline, whatever the truth is.
+            // A refusal of a question that had no answer is the store doing
+            // its job, and ungradeable rather than a miss. A refusal of one
+            // that *did* have an answer is a decline, and counts against it --
+            // that split is the informative half.
+            Err(_) if truth(w, q) == Truth::Ambiguous => Outcome::Ungradeable,
             Err(_) => Outcome::Declined,
             Ok(Believed::Unknown) => mark(None, &truth(w, q)),
             Ok(Believed::Absent) => mark(Some(None), &truth(w, q)),
@@ -180,9 +204,14 @@ mod tests {
             right: 3,
             wrong: 1,
             declined: 1,
+            ungradeable: 4,
         };
-        assert_eq!(s.total(), 5);
-        assert!((s.accuracy() - 0.6).abs() < 1e-9);
+        assert_eq!(s.total(), 5, "gradeable only");
+        assert_eq!(s.asked(), 9);
+        assert!(
+            (s.accuracy() - 0.6).abs() < 1e-9,
+            "ungradeable is excluded from the denominator, not counted for or              against either store"
+        );
     }
 
     /// The control cannot decline. It has no way to.
