@@ -103,8 +103,17 @@ impl Sessions {
     pub fn resume(&self, id: &str, now: Timestamp) -> Option<Handshake> {
         let mut live = self.lock();
         let entry = live.get_mut(id)?;
-        entry.touched = now;
-        Some(entry.handshake.clone())
+        if !expired(entry, now) {
+            entry.touched = now;
+            return Some(entry.handshake.clone());
+        }
+        // Expired, and dropped here rather than left for the next `mint`.
+        // Checking on the read is what makes the timeout a property of the
+        // clock: eviction alone runs only when something is minted, so on a
+        // server nobody new is handshaking against, a session idle for a day
+        // would still answer. The hour is what this module says it is.
+        live.remove(id);
+        None
     }
 
     /// End a session on the client's say-so. `false` if it was not there.
@@ -129,9 +138,23 @@ impl Sessions {
     }
 }
 
+/// Whether an entry has gone untouched for longer than the timeout.
+///
+/// One definition with two callers -- [`Sessions::resume`] on the read and
+/// [`evict`] on the write -- because two copies of this comparison are two
+/// places for the boundary to drift, and a session that one considers live and
+/// the other does not is the bug this exists to prevent.
+fn expired(entry: &Entry, now: Timestamp) -> bool {
+    now.saturating_sub(entry.touched) >= IDLE_MS
+}
+
 /// Drop what has expired, then the oldest, until the table fits.
+///
+/// The bound, not the timeout: `resume` is what enforces the hour, and this
+/// keeps the table from growing without one. A session nobody ever returns to
+/// is dropped here and never read either way.
 fn evict(live: &mut HashMap<String, Entry>, now: Timestamp) {
-    live.retain(|_, e| now.saturating_sub(e.touched) < IDLE_MS);
+    live.retain(|_, e| !expired(e, now));
     // `>=`, because this runs before an insert and the room has to exist
     // afterwards.
     while live.len() >= MAX_SESSIONS {
@@ -225,13 +248,61 @@ mod tests {
             );
         }
 
-        // The idle one went with the first eviction after its hour.
-        s.mint(hs("anyone"), t);
         assert_eq!(
             s.resume(&idle, t),
             None,
             "an idle session outlived its timeout"
         );
+    }
+
+    /// The timeout is the clock's, not the traffic's.
+    ///
+    /// This is the case the first version of this module got wrong: `evict`
+    /// runs only from `mint`, so a server nobody new handshakes against never
+    /// collected anything, and a session idle for a day still answered. The
+    /// test above passed anyway because it minted to force the sweep -- which
+    /// was the tell, since a timeout needing unrelated traffic to fire is not
+    /// the hour this module promises.
+    ///
+    /// Nothing is minted here after the first, deliberately.
+    #[test]
+    fn a_quiet_server_still_expires_its_sessions() {
+        let s = Sessions::new();
+        let id = s.mint(hs("agent-a"), 0);
+
+        assert!(
+            s.resume(&id, IDLE_MS - 1).is_some(),
+            "expired a millisecond early"
+        );
+        // Touched at IDLE_MS - 1 above, so the hour runs from there.
+        assert_eq!(s.resume(&id, IDLE_MS * 24), None, "answered a day late");
+        assert_eq!(s.len(), 0, "an expired session was left in the table");
+    }
+
+    /// The boundary is one comparison, so the two paths cannot disagree about
+    /// which side of it a session falls on.
+    #[test]
+    fn the_read_and_the_sweep_agree_on_what_expired_means() {
+        for (idle_for, still_live) in [(0, true), (IDLE_MS - 1, true), (IDLE_MS, false)] {
+            // The read path.
+            let s = Sessions::new();
+            let id = s.mint(hs("a"), 0);
+            assert_eq!(
+                s.resume(&id, idle_for).is_some(),
+                still_live,
+                "resume disagreed at {idle_for}"
+            );
+
+            // The sweep, reached by minting something else.
+            let s = Sessions::new();
+            let id = s.mint(hs("a"), 0);
+            s.mint(hs("b"), idle_for);
+            assert_eq!(
+                s.resume(&id, idle_for).is_some(),
+                still_live,
+                "evict disagreed at {idle_for}"
+            );
+        }
     }
 
     #[test]
