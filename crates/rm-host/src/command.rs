@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rm_engine::{
     Believed, Embedder, Engine, Ingested, Interval, Metric, Observation, Prepared, Provenance,
-    Query, Recalled, Record, ReviewId, Source, StableId, Supersession, Timestamp,
+    Query, Recalled, Record, ReviewId, Source, StableId, Supersession, Timestamp, Version,
 };
 use rm_extract::{Completer, Extraction, Turn};
 
@@ -18,6 +18,7 @@ use rm_extract::{Completer, Extraction, Turn};
 pub use rm_extract::Dropped;
 
 use crate::config::TEMPLATE;
+use crate::time::At;
 use crate::HostError;
 
 /// One mention and where it ended up.
@@ -784,6 +785,37 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
     })
 }
 
+/// The versions of one attribute both clocks admit, oldest first.
+///
+/// The raw version log filtered rather than `Engine::about`, deliberately. A
+/// decision's timeline is built here from the versions themselves, so a
+/// valid-time question is answered without a survivorship strategy -- and
+/// therefore without depending on `[policy]`, where the shipped default is
+/// `most_recent` and a valid time has nothing to index into.
+#[allow(dead_code)] // callers arrive in Task 2
+fn visible<'a>(engine: &'a Engine, id: StableId, attr: &str, at: At) -> Vec<&'a Version> {
+    engine
+        .store_history(id, attr)
+        .iter()
+        .filter(|v| v.provenance.observed_at <= at.tx && v.valid.from <= at.valid)
+        .collect()
+}
+
+/// The value standing at `at`, or `None` if there is none.
+///
+/// Replaces two `latest()` closures that disagreed. `decisions` read the last
+/// *non-tombstone* version and `decision` read the last version and then its
+/// value, so a tombstoned `choice` showed the old choice in the list and an
+/// empty one in the detail. This is `decision`'s reading: a tombstone asserts
+/// the attribute has no value, and stepping past it to report a superseded one
+/// would answer with something the store has been told is no longer true.
+#[allow(dead_code)] // callers arrive in Task 2
+fn held(engine: &Engine, id: StableId, attr: &str, at: At) -> Option<String> {
+    visible(engine, id, attr, at)
+        .last()
+        .and_then(|v| v.value.clone())
+}
+
 /// Every decision the store holds, most recently recorded first.
 pub fn decisions(engine: &Engine, only: Option<&str>) -> Result<Outcome, HostError> {
     // Checked before the scan rather than silently matching nothing. A status
@@ -1452,6 +1484,85 @@ pub(crate) mod tests {
     }
 
     // ---- decisions ---------------------------------------------------------
+
+    /// Both axes bite, and a tombstone is an answer rather than something to
+    /// skip past.
+    #[test]
+    fn a_visible_version_is_one_both_clocks_admit() {
+        const MARCH: Timestamp = 1_772_236_800_000; // 2026-02-28
+        const AUGUST: Timestamp = 1_787_532_411_419; // 2026-08-24
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+
+        // Decided in March, recorded in March.
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "first choice",
+            None,
+            None,
+            None,
+            None,
+            Some(MARCH),
+            MARCH,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        // Re-decided in August under the same title.
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "second choice",
+            None,
+            None,
+            None,
+            None,
+            Some(AUGUST),
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let id = find_decision(&e, "Pin the compiler").expect("recorded");
+
+        // As of March the store had heard only the first.
+        assert_eq!(
+            held(
+                &e,
+                id,
+                "choice",
+                At {
+                    valid: Timestamp::MAX,
+                    tx: MARCH
+                }
+            ),
+            Some("first choice".to_string())
+        );
+        // As of now it has both, and the later one is the answer.
+        assert_eq!(
+            held(&e, id, "choice", At::latest()),
+            Some("second choice".to_string())
+        );
+        // Valid time alone: in March the second had not begun to hold.
+        assert_eq!(
+            held(
+                &e,
+                id,
+                "choice",
+                At {
+                    valid: MARCH,
+                    tx: Timestamp::MAX
+                }
+            ),
+            Some("first choice".to_string())
+        );
+        // Before either clock, nothing at all.
+        assert_eq!(held(&e, id, "choice", At { valid: 1, tx: 1 }), None);
+        assert!(visible(&e, id, "choice", At { valid: 1, tx: 1 }).is_empty());
+        assert_eq!(visible(&e, id, "choice", At::latest()).len(), 2);
+    }
 
     /// Every decision in the store, as (title, entity, still standing).
     fn recorded(e: &mut Engine) -> Vec<(String, StableId, bool)> {
