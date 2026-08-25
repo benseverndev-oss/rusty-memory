@@ -125,6 +125,17 @@ pub enum Outcome {
     /// reported rather than empty, because "no such decision" and "a decision
     /// with nothing in it" are different answers.
     Decision(Found),
+    /// A decision's reach was corrected, and nothing else about it changed.
+    Rescoped {
+        entity: StableId,
+        title: String,
+        scope: String,
+        /// What it reached before. `None` when it had no scope at all, which
+        /// is the backfill case -- and worth distinguishing, because
+        /// "widened from work/goldenmatch" and "had none" are different
+        /// things to have done.
+        previous: Option<String>,
+    },
 }
 
 /// One decision as a caller sees it.
@@ -855,6 +866,150 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
 /// valid-time question is answered without a survivorship strategy -- and
 /// therefore without depending on `[policy]`, where the shipped default is
 /// `most_recent` and a valid time has nothing to index into.
+/// A correction to one decision's reach, embedded and ready to write.
+pub struct RescopePlan {
+    title: String,
+    scope: String,
+    observed_at: Timestamp,
+    session: String,
+    field: FieldWrite,
+}
+
+/// Embed a new reach for an existing decision. No store, no lock.
+///
+/// # Why this is not `decide` with one argument changed
+///
+/// `decide` writes every field it is given, and `choice` is one of them. Two
+/// of them, after a re-decide: `revisions` counts the visible versions of
+/// `choice`, so re-deciding a decision purely to attach a scope leaves it
+/// reading "revised 2 times" when nothing about the choice was revised. Across
+/// a backfill that is every decision in the log claiming a revision that never
+/// happened -- a decision log that lies about its own history is worse than
+/// one missing an attribute.
+///
+/// This writes `scope` and touches nothing else, so the count stays true.
+pub fn plan_rescope(
+    title: &str,
+    scope: &str,
+    observed_at: Timestamp,
+    session: &str,
+    embedder: &impl Embedder,
+) -> Result<RescopePlan, HostError> {
+    if title.trim().is_empty() {
+        return Err(HostError::Refused(
+            "rescope needs the title of the decision to correct".into(),
+        ));
+    }
+    // Before the embedder, so a typo costs nothing -- the same bargain
+    // `plan_decide` makes.
+    crate::scope::validate(scope).map_err(HostError::Refused)?;
+    Ok(RescopePlan {
+        title: title.to_string(),
+        scope: scope.to_string(),
+        observed_at,
+        session: session.to_string(),
+        field: embed_field(title, "scope", scope, embedder)?,
+    })
+}
+
+/// Write the new reach. Touches no network.
+///
+/// # An unknown title is refused, never created
+///
+/// `decide` creates a decision when the title is new. This must not: a
+/// decision holding a scope and no choice is not a decision, and the case
+/// where a title does not resolve is overwhelmingly a typo -- which, during a
+/// backfill of hundreds, is precisely when a silent create is most expensive
+/// and least visible.
+///
+/// # Backfill and correction want opposite valid times, and are told apart by
+/// whether a scope was already recorded
+///
+/// Two callers, two right answers:
+///
+/// * **Backfill** -- a reach that was always true and never written down. Its
+///   valid time is the decision's own start, because that is when it started
+///   being true.
+/// * **Correction** -- the reach genuinely changed today, because an effort was
+///   renamed or absorbed. Its valid time is now. Dating it from the decision's
+///   start would assert the decision always reached somewhere it did not, which
+///   is the rewrite-history door that putting scope on a bi-temporal attribute
+///   exists to keep shut.
+///
+/// No flag distinguishes them, because the store already knows: a decision with
+/// no scope recorded is a backfill, and one with a scope is a correction. That
+/// cannot be passed wrong during a run of hundreds.
+///
+/// Note what dating from now does NOT do. A scope invisible at some earlier
+/// clock does not hide the decision from a query at that clock -- `held`
+/// returns `None`, the applicability check does not run, and the decision is
+/// INCLUDED, because a decision with no scope recorded reaches everywhere. So
+/// the failure a backfill dated from now would cause is over-reach in history:
+/// every past query would see it as universal. That is the costly direction,
+/// which is why the backfill case takes the decision's valid time.
+pub fn commit_rescope(engine: &mut Engine, plan: RescopePlan) -> Result<Outcome, HostError> {
+    let RescopePlan {
+        title,
+        scope,
+        observed_at,
+        session,
+        field,
+    } = plan;
+
+    let Some(entity) = find_decision(engine, &title) else {
+        return Err(HostError::Refused(format!(
+            "no decision is titled {title:?}. rescope corrects the reach of a decision that already exists; it does not create one -- a scope with no choice under it is not a decision. Check the title against `rmem decisions`."
+        )));
+    };
+
+    let at = At {
+        valid: observed_at,
+        tx: observed_at,
+    };
+    let previous = held(engine, entity, "scope", at);
+
+    // Writing nothing is the honest answer to "set it to what it already is".
+    // A no-op write would land a second identical version and make the
+    // attribute's history claim a correction that never happened -- the same
+    // falsified-history problem, one attribute over, that keeps this command
+    // out of `decide`.
+    if previous.as_deref() == Some(scope.as_str()) {
+        return Ok(Outcome::Rescoped {
+            entity,
+            title,
+            scope,
+            previous,
+        });
+    }
+
+    let valid_from = match previous {
+        // Correction: the reach changed today, and only today.
+        Some(_) => observed_at,
+        // Backfill: it always reached this far. Read at the latest clock, not
+        // at `at` -- reading the decision's start through a narrower clock
+        // would make it depend on when the backfill happened to run.
+        None => visible(engine, entity, "choice", At::latest())
+            .first()
+            .map_or(observed_at, |v| v.valid.from),
+    };
+
+    write_field(
+        engine,
+        Some(entity),
+        &field,
+        valid_from,
+        observed_at,
+        &session,
+    )?;
+
+    Ok(Outcome::Rescoped {
+        entity,
+        title,
+        scope,
+        previous,
+    })
+}
+
 fn visible<'a>(engine: &'a Engine, id: StableId, attr: &str, at: At) -> Vec<&'a Version> {
     engine
         .store_history(id, attr)
@@ -3305,5 +3460,174 @@ pub(crate) mod tests {
             (line.a_kind.as_str(), line.b_kind.as_str()),
             ("person", "person")
         );
+    }
+}
+
+#[cfg(test)]
+mod rescope_tests {
+    use super::tests::engine;
+    use super::*;
+    use crate::testing::StubProvider;
+
+    const MARCH: Timestamp = 1_772_236_800_000;
+    const AUGUST: Timestamp = 1_787_532_411_419;
+
+    fn rescope(
+        e: &mut Engine,
+        title: &str,
+        scope: &str,
+        observed_at: Timestamp,
+        stub: &StubProvider,
+    ) -> Result<Outcome, HostError> {
+        let plan = plan_rescope(title, scope, observed_at, "t", stub)?;
+        commit_rescope(e, plan)
+    }
+
+    fn decided(e: &mut Engine, title: &str, scope: &str, at: Timestamp, stub: &StubProvider) {
+        decide(
+            e,
+            title,
+            "the choice",
+            scope,
+            None,
+            None,
+            None,
+            None,
+            Some(at),
+            at,
+            "t",
+            stub,
+        )
+        .unwrap();
+    }
+
+    /// The reason this command exists rather than being `decide` with one
+    /// argument changed.
+    #[test]
+    fn rescoping_does_not_count_as_revising_the_choice() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decided(&mut e, "D", "work", MARCH, &stub);
+
+        let before = visible(&e, find_decision(&e, "D").unwrap(), "choice", At::latest()).len();
+        rescope(&mut e, "D", "work/goldenmatch", AUGUST, &stub).unwrap();
+        let after = visible(&e, find_decision(&e, "D").unwrap(), "choice", At::latest()).len();
+
+        assert_eq!(before, 1);
+        assert_eq!(
+            after, 1,
+            "a scope-only write must leave the choice history alone -- \
+             `revisions` counts choice versions, so a second one here would make \
+             every backfilled decision read as revised when none was"
+        );
+    }
+
+    /// A record written before scopes existed: status and choice, no scope.
+    /// This is the shape the 219-decision backfill actually operates on, and
+    /// `decide` cannot produce it -- it refuses without a scope.
+    fn decided_without_a_scope(e: &mut Engine, title: &str, at: Timestamp, stub: &StubProvider) {
+        for (attr, value) in [("status", "accepted"), ("choice", "the choice")] {
+            let w = embed_field(title, attr, value, stub).unwrap();
+            let entity = find_decision(e, title);
+            write_field(e, entity, &w, at, at, "t").unwrap();
+        }
+    }
+
+    /// Backfill: the reach was always true, so it takes the decision's own
+    /// valid time -- not the day the backfill happened to run.
+    #[test]
+    fn a_backfilled_scope_is_valid_from_when_the_decision_was() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decided_without_a_scope(&mut e, "D", MARCH, &stub);
+        let id = find_decision(&e, "D").unwrap();
+        assert!(
+            held(&e, id, "scope", At::latest()).is_none(),
+            "precondition: this is a pre-scope record"
+        );
+
+        rescope(&mut e, "D", "work/goldenmatch", AUGUST, &stub).unwrap();
+
+        // March, long before the backfill ran, already reads the new reach.
+        let march = At {
+            valid: MARCH,
+            tx: Timestamp::MAX,
+        };
+        assert_eq!(
+            held(&e, id, "scope", march).as_deref(),
+            Some("work/goldenmatch"),
+            "a backfilled scope dated from now would leave every historical              query reading the decision as unscoped -- and an unscoped decision              reaches EVERYWHERE, so the failure is over-reach in history"
+        );
+    }
+
+    /// Correction: the reach changed today, so today is when it changed. The
+    /// old reach must still stand in the past, or the store has been made to
+    /// claim the decision always reached somewhere it did not.
+    #[test]
+    fn a_corrected_scope_starts_today_and_leaves_the_past_alone() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decided(&mut e, "D", "*", MARCH, &stub);
+        let id = find_decision(&e, "D").unwrap();
+
+        rescope(&mut e, "D", "work/goldenmatch", AUGUST, &stub).unwrap();
+
+        let march = At {
+            valid: MARCH,
+            tx: Timestamp::MAX,
+        };
+        assert_eq!(
+            held(&e, id, "scope", march).as_deref(),
+            Some("*"),
+            "March still reached everywhere; only August narrowed it"
+        );
+        assert_eq!(
+            held(&e, id, "scope", At::latest()).as_deref(),
+            Some("work/goldenmatch")
+        );
+    }
+
+    /// Setting a scope to what it already is writes nothing: a second
+    /// identical version would make the attribute's own history claim a
+    /// correction that never happened.
+    #[test]
+    fn rescoping_to_the_same_scope_writes_nothing() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decided(&mut e, "D", "work", MARCH, &stub);
+        let id = find_decision(&e, "D").unwrap();
+        let before = visible(&e, id, "scope", At::latest()).len();
+
+        let out = rescope(&mut e, "D", "work", AUGUST, &stub).unwrap();
+
+        assert_eq!(visible(&e, id, "scope", At::latest()).len(), before);
+        let Outcome::Rescoped { previous, .. } = out else {
+            panic!("not a rescope")
+        };
+        assert_eq!(previous.as_deref(), Some("work"));
+    }
+
+    /// An unknown title is a typo, and during a backfill of hundreds a silent
+    /// create is the most expensive and least visible thing that could happen.
+    #[test]
+    fn an_unknown_title_is_refused_and_creates_nothing() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        let before = e.entity_ids().len();
+
+        let err = rescope(&mut e, "never decided", "work", AUGUST, &stub).unwrap_err();
+
+        assert!(matches!(err, HostError::Refused(_)), "{err:?}");
+        assert_eq!(e.entity_ids().len(), before, "nothing was created");
+    }
+
+    /// A typo costs no embedding, the same bargain `plan_decide` makes.
+    #[test]
+    fn an_invalid_scope_is_refused_before_the_embedder() {
+        let stub = StubProvider::new(vec![]);
+        assert!(matches!(
+            plan_rescope("D", "", AUGUST, "t", &stub),
+            Err(HostError::Refused(_))
+        ));
     }
 }

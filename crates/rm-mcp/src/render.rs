@@ -335,6 +335,27 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }
         }
 
+        Outcome::Rescoped {
+            entity,
+            title,
+            scope,
+            previous,
+        } => Rendered {
+            text: match previous {
+                None => format!("{title:?} now reaches {scope}. It had no scope before."),
+                Some(was) if was == scope => {
+                    format!("{title:?} already reached {scope}. Nothing changed.")
+                }
+                Some(was) => format!("{title:?} now reaches {scope}, where it reached {was}."),
+            },
+            structured: json!({
+                "entity": entity.to_string(),
+                "title": title,
+                "scope": scope,
+                "previous": previous,
+            }),
+        },
+
         Outcome::Reindexed {
             assertions,
             dimension,

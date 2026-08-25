@@ -290,6 +290,22 @@ pub fn render(outcome: &Outcome) -> String {
             out
         }
 
+        Outcome::Rescoped {
+            title,
+            scope,
+            previous,
+            ..
+        } => match previous {
+            // Named rather than folded into one sentence: a decision that had
+            // no reach and one whose reach was wrong are different mistakes,
+            // and across a backfill the second is the one worth noticing.
+            None => format!("{title:?} now reaches {scope}. It had no scope before."),
+            Some(was) if was == scope => {
+                format!("{title:?} already reached {scope}. Nothing changed.")
+            }
+            Some(was) => format!("{title:?} now reaches {scope}, where it reached {was}."),
+        },
+
         Outcome::Reindexed {
             assertions,
             dimension,

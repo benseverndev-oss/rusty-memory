@@ -58,6 +58,9 @@ rmem — a memory that resolves contradictions deterministically
     rmem decisions [--status <s>] [--scope <s>] [--all]
                    [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
                                      every decision, and whether it still stands
+    rmem rescope \"<title>\" --scope <scope>
+                                     correct how far one decision reaches,
+                                     without recording a new choice
     rmem reindex                     re-embed every assertion under the current provider
     rmem decision \"<title>\" [--scope <s>] [--all]
                    [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
@@ -124,6 +127,15 @@ pub enum Command {
         valid_at: Option<Timestamp>,
         /// What the store knew then. `None` is what it knows now.
         as_of: Option<Timestamp>,
+    },
+    /// Correct how far one existing decision reaches, and nothing else.
+    ///
+    /// Separate from `Decide` because re-deciding to attach a scope writes a
+    /// second `choice`, and `revisions` counts those -- every backfilled
+    /// decision would read as revised when none was.
+    Rescope {
+        title: String,
+        scope: String,
     },
     /// Rebuild every vector in the store under the current provider.
     Reindex,
@@ -334,6 +346,34 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                 because: flag(&args, "--because")?,
                 context: flag(&args, "--context")?,
                 supersedes: flag(&args, "--supersedes")?,
+            })
+        }
+
+        "rescope" => {
+            let Some(title) = args.get(1) else {
+                return Err(CliError::Usage(format!(
+                    "rescope needs the title of the decision to correct
+
+{USAGE}"
+                )));
+            };
+            if title.starts_with("--") {
+                return Err(CliError::Usage(format!(
+                    "rescope takes the title first, before any flags
+
+{USAGE}"
+                )));
+            }
+            let Some(scope) = flag(&args, "--scope")? else {
+                return Err(CliError::Usage(format!(
+                    "rescope needs --scope: how far this decision reaches. {UNIVERSAL:?} for everywhere, or a path like \"work/goldenmatch\"
+
+{USAGE}"
+                )));
+            };
+            Ok(Command::Rescope {
+                title: title.clone(),
+                scope,
             })
         }
 
