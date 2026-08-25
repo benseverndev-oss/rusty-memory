@@ -13,6 +13,7 @@ pub fn render(outcome: &Outcome) -> String {
         Outcome::Initialised {
             path,
             dimension,
+            local,
             replaced_unparsable,
         } => {
             let notice = match replaced_unparsable {
@@ -22,8 +23,16 @@ pub fn render(outcome: &Outcome) -> String {
                 None => String::new(),
             };
             format!(
-                "{notice}wrote {}\nembedding dimension {dimension}, taken from the model\n\nnext: rmem remember \"something you want to remember\"",
-                path.display()
+                // Where the dimension came from, said accurately. `--local`
+                // asks no model anything, so reporting "taken from the model"
+                // there was a claim about a call that never happened.
+                "{notice}wrote {}\nembedding dimension {dimension}, {}\n\nnext: rmem remember \"something you want to remember\"",
+                path.display(),
+                if *local {
+                    "the offline embedder's own -- no model was asked"
+                } else {
+                    "taken from the model"
+                }
             )
         }
 
@@ -529,6 +538,7 @@ mod tests {
         let text = render(&Outcome::Initialised {
             path: std::path::PathBuf::from("rmem.toml"),
             dimension: 1536,
+            local: false,
             replaced_unparsable: Some(
                 "rmem.toml is not valid: that is not valid TOML (line 1, column 1)".to_string(),
             ),
@@ -545,6 +555,7 @@ mod tests {
         let text = render(&Outcome::Initialised {
             path: std::path::PathBuf::from("rmem.toml"),
             dimension: 1536,
+            local: false,
             replaced_unparsable: None,
         });
         assert!(!text.contains("could not be parsed"), "{text}");

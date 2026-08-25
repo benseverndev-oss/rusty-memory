@@ -26,6 +26,19 @@ use crate::HostError;
 /// Kept as one literal so the test that parses it is testing the same bytes a
 /// user gets. A template assembled at runtime could pass its own test and still
 /// write something unreadable.
+/// The dimension [`TEMPLATE`] ships with.
+///
+/// Named because `rmem init --local` writes it without probing a model, and a
+/// second copy of the number would be free to drift from the file. The test
+/// `the_named_dimension_is_the_one_the_template_carries` reads it back out of
+/// the template so the two cannot disagree.
+///
+/// It is the template's value rather than a number chosen for subword hashing:
+/// `benches/locomo` measured the local embedder at whatever the config said,
+/// and nothing in the documentation tells a reader to change it, so this is the
+/// configuration the published 6/12 recall figure actually describes.
+pub const TEMPLATE_DIMENSION: usize = 1536;
+
 pub const TEMPLATE: &str = r#"# rmem configuration.
 #
 # Written by `rmem init`. The numbers below are a working starting point, not
@@ -842,7 +855,16 @@ fn table_hint(text: &str, span: Option<std::ops::Range<usize>>) -> String {
     while !text.is_char_boundary(start) {
         start -= 1;
     }
-    let Some(header) = text[..start]
+    // Search back from the END of the line `start` falls on, so that line is
+    // included. A *missing field* error carries the span of the table header
+    // itself, and searching `text[..start]` excluded it: the second table
+    // onward named the table *before* the one at fault, and the first table
+    // got no hint at all, because there was nothing before it to find. Both
+    // on exactly the errors where the hint is the useful part. Reported by a
+    // session that hand-wrote a minimal config and was told its `[provider]`
+    // problem was about `[store] takes path`.
+    let line_end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+    let Some(header) = text[..line_end]
         .lines()
         .rev()
         .map(str::trim)
@@ -2144,5 +2166,63 @@ api_key = \"sk-PASTED-FAKE-SECRET-LEAK-CHECK-1234\"",
                 );
             }
         }
+    }
+    /// The hint names the table the error is *in*, not the one before it.
+    ///
+    /// A missing-field error carries the span of the table header itself, and
+    /// `table_hint` used to search `text[..span.start]` -- which excludes that
+    /// header and finds the previous one. Every missing-field error in the
+    /// second table onward named the wrong table, on exactly the errors where
+    /// the hint is what a reader needs. Reported by a session that hand-wrote
+    /// a minimal config and was told its `[provider]` problem was about
+    /// `[store] takes path`.
+    #[test]
+    fn a_missing_field_hint_names_its_own_table() {
+        let text = "[store]
+path = \"m.json\"
+
+[provider]
+embedder = \"local\"
+";
+        let err = Config::parse(Path::new("rmem.toml"), text)
+            .expect_err("provider is missing required fields");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[provider] takes"),
+            "hint must name the table the error is in: {msg}"
+        );
+        assert!(
+            !msg.contains("[store] takes"),
+            "and must not name the one before it: {msg}"
+        );
+    }
+
+    /// The first table got no hint at all, which is how this turned out worse
+    /// than reported: searching `text[..span.start]` from offset 0 gives an
+    /// empty string, so there was no header to find and the message simply
+    /// ended after the location.
+    #[test]
+    fn a_missing_field_in_the_first_table_still_names_it() {
+        let text = "[store]
+";
+        let err = Config::parse(Path::new("rmem.toml"), text).expect_err("store is missing path");
+        assert!(err.to_string().contains("[store] takes path"), "{err}");
+    }
+    /// The named constant and the template's literal are the same number.
+    ///
+    /// Two copies of a value with nothing checking them is how the
+    /// `ValidInterval` sentence and the inert `--valid-at` flag both happened.
+    #[test]
+    fn the_named_dimension_is_the_one_the_template_carries() {
+        let line = TEMPLATE
+            .lines()
+            .find(|l| l.trim_start().starts_with("dimension ="))
+            .expect("the template sets a dimension");
+        let written: usize = line
+            .split('=')
+            .nth(1)
+            .and_then(|v| v.trim().parse().ok())
+            .expect("and sets it to a number");
+        assert_eq!(written, TEMPLATE_DIMENSION);
     }
 }

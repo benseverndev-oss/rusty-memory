@@ -69,6 +69,14 @@ pub enum Outcome {
         /// this crate, so it names a location and never a value out of the
         /// file it describes.
         replaced_unparsable: Option<String>,
+        /// Whether the dimension came from `--local` rather than from the
+        /// model.
+        ///
+        /// Carried so the message can say which. `rmem init --local` reported
+        /// "taken from the model" while asking no model anything -- true of
+        /// the http path, false here, and exactly the shape of claim this
+        /// project keeps finding.
+        local: bool,
     },
     Remembered {
         ingested: Ingested,
@@ -298,7 +306,8 @@ pub const SUPERSEDED: &str = "superseded";
 /// `edges_into` for what replaced this.
 pub const SUPERSEDES: &str = "supersedes";
 
-/// Write a config, with the embedding dimension taken from the model.
+/// Write a config, with the embedding dimension taken from the model unless
+/// `local` is set, in which case nothing is asked and no key is needed.
 ///
 /// `probe` is a closure rather than a provider so this is testable without a
 /// socket; the binary passes one that calls `HttpProvider::probe_dimension`.
@@ -319,6 +328,7 @@ pub const SUPERSEDES: &str = "supersedes";
 pub fn init(
     config_path: &Path,
     force: bool,
+    local: bool,
     replaced_unparsable: Option<String>,
     probe: &dyn Fn() -> Result<usize, String>,
 ) -> Result<Outcome, HostError> {
@@ -329,12 +339,30 @@ pub fn init(
         )));
     }
 
-    let dimension = probe().map_err(HostError::Refused)?;
+    // The short-circuit lives here rather than in the caller's closure, so
+    // "--local demands no key" is a property of this function's contract and
+    // not of one call site's discipline. A caller that forgot the branch would
+    // otherwise reintroduce the probe silently.
+    let dimension = if local {
+        crate::config::TEMPLATE_DIMENSION
+    } else {
+        probe().map_err(HostError::Refused)?
+    };
 
     // The template's own value is an example. Substituting rather than
     // formatting keeps the file one literal, so the test that parses it is
     // testing the bytes a user receives.
-    let contents = TEMPLATE.replace("dimension = 1536", &format!("dimension = {dimension}"));
+    let mut contents = TEMPLATE.replace("dimension = 1536", &format!("dimension = {dimension}"));
+    if local {
+        // The `[provider]` fields stay in the file even though the local
+        // embedder never dials. Making them optional would weaken validation
+        // on the http path -- the one where a wrong `api_key_env` costs money
+        // -- to tidy four inert lines here. Left required, they are also a
+        // safety property: `api_key_env` naming a variable nobody sets means
+        // an accidental fall back to `http` fails loudly rather than quietly
+        // spending someone's key.
+        contents = contents.replace("embedder = \"http\"", "embedder = \"local\"");
+    }
 
     std::fs::write(config_path, contents).map_err(|e| {
         HostError::Config(format!("could not write {}: {e}", config_path.display()))
@@ -343,6 +371,7 @@ pub fn init(
     Ok(Outcome::Initialised {
         path: config_path.to_path_buf(),
         dimension,
+        local,
         replaced_unparsable,
     })
 }
@@ -1469,13 +1498,14 @@ pub(crate) mod tests {
         // nothing reports it.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
-        let out = init(&path, false, None, &|| Ok(1536)).unwrap();
+        let out = init(&path, false, false, None, &|| Ok(1536)).unwrap();
 
         assert_eq!(
             out,
             Outcome::Initialised {
                 path: path.clone(),
                 dimension: 1536,
+                local: false,
                 replaced_unparsable: None,
             }
         );
@@ -1490,7 +1520,7 @@ pub(crate) mod tests {
         // silently produce a broken store.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
-        init(&path, false, None, &|| Ok(3072)).unwrap();
+        init(&path, false, false, None, &|| Ok(3072)).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("dimension = 3072"), "{written}");
         assert!(!written.contains("dimension = 1536"), "{written}");
@@ -1502,7 +1532,7 @@ pub(crate) mod tests {
         let path = dir.path().join("rmem.toml");
         std::fs::write(&path, "# hand-edited, do not lose").unwrap();
 
-        let err = init(&path, false, None, &|| Ok(1536)).unwrap_err();
+        let err = init(&path, false, false, None, &|| Ok(1536)).unwrap_err();
         assert!(err.to_string().contains("--force"), "{err}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1524,7 +1554,10 @@ pub(crate) mod tests {
         let path = dir.path().join("rmem.toml");
         std::fs::write(&path, "# hand-edited, do not lose").unwrap();
 
-        let err = init(&path, false, None, &|| panic!("the probe must not run")).unwrap_err();
+        let err = init(&path, false, false, None, &|| {
+            panic!("the probe must not run")
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("--force"), "{err}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1538,7 +1571,7 @@ pub(crate) mod tests {
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
         std::fs::write(&path, "# old").unwrap();
-        init(&path, true, None, &|| Ok(768)).unwrap();
+        init(&path, true, false, None, &|| Ok(768)).unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("dimension = 768"));
@@ -1556,13 +1589,14 @@ pub(crate) mod tests {
         std::fs::write(&path, "# not valid toml at all [[[").unwrap();
 
         let notice = "rmem.toml is not valid: that is not valid TOML (line 1, column 1)";
-        let out = init(&path, false, Some(notice.to_string()), &|| Ok(1536)).unwrap();
+        let out = init(&path, false, false, Some(notice.to_string()), &|| Ok(1536)).unwrap();
 
         assert_eq!(
             out,
             Outcome::Initialised {
                 path: path.clone(),
                 dimension: 1536,
+                local: false,
                 replaced_unparsable: Some(notice.to_string()),
             }
         );
@@ -1577,7 +1611,10 @@ pub(crate) mod tests {
         // fail somewhere less obvious.
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
-        let err = init(&path, false, None, &|| Err("quota exceeded".to_string())).unwrap_err();
+        let err = init(&path, false, false, None, &|| {
+            Err("quota exceeded".to_string())
+        })
+        .unwrap_err();
         assert!(err.to_string().contains("quota exceeded"), "{err}");
         assert!(!path.exists(), "no config may be left behind");
     }
@@ -1586,7 +1623,7 @@ pub(crate) mod tests {
     fn what_init_writes_is_what_the_config_loader_reads() {
         let dir = TempDir::new();
         let path = dir.path().join("rmem.toml");
-        init(&path, false, None, &|| Ok(1536)).unwrap();
+        init(&path, false, false, None, &|| Ok(1536)).unwrap();
         let config = crate::config::Config::load(&path).unwrap();
         assert_eq!(config.provider.dimension, 1536);
         config.ruleset().unwrap();
@@ -3508,6 +3545,64 @@ pub(crate) mod tests {
             (line.a_kind.as_str(), line.b_kind.as_str()),
             ("person", "person")
         );
+    }
+    /// `--local` writes a config without asking any model anything.
+    ///
+    /// The probe panics here rather than returning a value: the property is
+    /// not that the dimension is right, it is that **nothing is asked**. A
+    /// probe that ran and happened to succeed would pass a weaker test while
+    /// leaving the key requirement exactly where it was.
+    #[test]
+    fn a_local_init_never_reaches_the_probe() {
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        let out = init(&path, false, true, None, &|| {
+            panic!("--local must not probe a model")
+        })
+        .unwrap();
+        assert_eq!(
+            out,
+            Outcome::Initialised {
+                path: path.clone(),
+                dimension: crate::config::TEMPLATE_DIMENSION,
+                local: true,
+                replaced_unparsable: None,
+            }
+        );
+    }
+
+    /// And what it writes is a config this build can read back, with the
+    /// local embedder selected.
+    ///
+    /// The `[provider]` fields stay in the file. They are inert under `local`,
+    /// and left required deliberately -- see `init`. The check that matters is
+    /// that the file parses, because the defect this fixes was a documented
+    /// path that produced nothing loadable.
+    #[test]
+    fn a_local_init_writes_a_config_that_loads_and_selects_the_local_embedder() {
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        init(&path, false, true, None, &|| panic!("no probe")).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"embedder = "local""#), "{text}");
+        assert!(
+            !text.contains(r#"embedder = "http""#),
+            "the http line must be replaced, not joined: {text}"
+        );
+        crate::config::Config::load(&path).expect("a config init wrote must load");
+    }
+
+    /// Without `--local` the probe still runs and still decides the dimension.
+    /// The keyless path is an addition, not a replacement.
+    #[test]
+    fn a_default_init_still_asks_the_model() {
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        init(&path, false, false, None, &|| Ok(3072)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("dimension = 3072"), "{text}");
+        assert!(text.contains(r#"embedder = "http""#), "{text}");
     }
 }
 

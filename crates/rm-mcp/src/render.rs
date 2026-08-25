@@ -476,6 +476,10 @@ pub fn render(outcome: &Outcome) -> Rendered {
         Outcome::Initialised {
             path,
             dimension,
+            // Not rendered here: `init` is not reachable over MCP, so this
+            // arm exists only so an unexpected value cannot take the whole
+            // conversation with it.
+            local: _,
             replaced_unparsable,
         } => Rendered {
             // The notice leads, for the same reason it leads in `rmem`'s own

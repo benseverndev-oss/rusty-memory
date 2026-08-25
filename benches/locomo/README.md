@@ -1407,6 +1407,14 @@ of them) embedded through `text-embedding-3-small`, then pooled five ways:
 | IDF + stopwords | 6/12 |
 | subword hashing, no weights at all | **6/12** |
 
+**What dimension these were measured at is not recorded here, and should
+have been.** `src/main.rs` builds its index from `config.provider.dimension`,
+so the figure describes whatever the `rmem.toml` of the day said -- almost
+certainly the template's 1536, since nothing tells a reader to change it.
+`rmem init --local` writes 1536 for that reason: so the number above keeps
+describing the configuration `init` actually produces. Noticed while adding
+that flag, not while measuring this.
+
 The best pooling reaches exactly where free hashing already is — for the price
 of a bootstrap pass over a vocabulary, a weights artifact in the repository, and
 a megabyte budget. Plain averaging is *worse than hashing*, and the zipf
