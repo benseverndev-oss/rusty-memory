@@ -1,6 +1,6 @@
 [package]
 name = "rm-resolve"
-version = "0.0.0"
+version = "0.1.0"
 description = "Probabilistic entity resolution for agent memory, with an explicit review band"
 edition.workspace = true
 rust-version.workspace = true

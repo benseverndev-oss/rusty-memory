@@ -501,20 +501,51 @@ reversible: `rmem reindex` rebuilds the index under whichever is configured.
 
 ## Crates
 
-| Crate | Status | Role |
+**`0.1` means the surface will not break without a version bump. `0.0` means it
+moves.** Nothing is published to crates.io — sibling dependencies are declared
+by path with no version, which cargo refuses to publish — so these are promises
+to a reader of this repository, not to a package manager. Publishing is a
+separate decision with a release cadence and a deprecation policy behind it.
+
+| Crate | Version | Role |
 |---|---|---|
-| `rm-core` | in progress | Provenance and the bi-temporal model |
-| `rm-survivor` | in progress | Survivorship strategies |
-| `rm-store` | in progress | Bi-temporal record store with attribute history |
-| `rm-graph` | in progress | Entity graph, k-hop retrieval |
-| `rm-resolve` | in progress | Probabilistic entity resolution, with a review band |
-| `rm-index` | in progress | Exact vector search: deletion, filtering, persistence |
-| `rm-extract` | in progress | Turn → mentions/edges, and whether arrival implies departure |
-| `rm-engine` | in progress | `remember()` / `recall()` / `forget()` |
-| `rm-providers` | in progress | `Completer`/`Embedder` over an OpenAI-compatible API |
-| `rm-host` | in progress | Config, store file, and the operations over them |
-| `rm-cli` | in progress | `rmem`, the command line |
-| `rm-mcp` | in progress | `rmem-mcp`, the MCP server |
+| `rm-core` | 0.1 | Provenance and the bi-temporal model |
+| `rm-survivor` | 0.1 | Survivorship strategies |
+| `rm-store` | 0.1 | Bi-temporal record store with attribute history |
+| `rm-graph` | 0.1 | Entity graph, k-hop retrieval |
+| `rm-resolve` | 0.1 | Probabilistic entity resolution, with a review band |
+| `rm-index` | 0.1 | Exact vector search: deletion, filtering, persistence |
+| `rm-embed` | 0.1 | Subword hashing, for vectors without a service |
+| `rm-providers` | 0.0 | `Completer`/`Embedder` over an OpenAI-compatible API |
+| `rm-extract` | 0.0 | Turn → mentions/edges, and whether arrival implies departure |
+| `rm-engine` | 0.0 | `remember()` / `recall()` / `forget()` |
+| `rm-host` | 0.0 | Config, store file, and the operations over them |
+| `rm-cli` | 0.0 | `rmem`, the command line |
+| `rm-mcp` | 0.0 | `rmem-mcp`, the MCP server |
+| `rm-conform` | 0.0 | The conformance suite. Internal; nothing depends on it |
+
+The split is measured rather than felt. Counting source files touched across
+the last thirty commits — a run that added two features, a command, a bug fix
+and a conformance axis:
+
+| | | | |
+|---|---|---|---|
+| `rm-embed` | 1 | `rm-extract` | 12 |
+| `rm-graph` | 1 | `rm-conform` | 17 |
+| `rm-core` | 2 | `rm-engine` | 28 |
+| `rm-survivor` | 4 | `rm-host` | 32 |
+| `rm-store`, `rm-resolve`, `rm-index` | 5 | `rm-mcp` | 50 |
+| `rm-providers` | 5 | `rm-cli` | 54 |
+
+Everything is at or below 5, or at or above 12. The gap is the line.
+`rm-survivor`'s only change in that window was a doc comment, and it is the
+crate `rm-conform` differentially verifies across 500 generated histories,
+which is the difference between calling a surface stable and having checked.
+
+`rm-providers` is the one exception to the measurement: its churn is 5, but its
+*behaviour* depends on a third-party API contract this project does not
+control, and promising stability for that is a different promise from promising
+it for a pure function. It stays 0.0 deliberately.
 
 No *library* crate touches the network, and every library crate's third-party
 dependencies come from `serde` and `serde_json` alone. The two things that need

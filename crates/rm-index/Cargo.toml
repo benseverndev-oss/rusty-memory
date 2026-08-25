@@ -1,6 +1,6 @@
 [package]
 name = "rm-index"
-version = "0.0.0"
+version = "0.1.0"
 description = "Vector index for agent memory: exact search with deletion, filtering and persistence"
 edition.workspace = true
 rust-version.workspace = true
