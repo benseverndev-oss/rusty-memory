@@ -215,6 +215,49 @@ rmem decide "Retrieval reranking" "a cross-encoder over the top 200" \
   --because "the k-curve is still 0.926 at k=200 -- there is nothing to rerank into"
 ```
 
+### How far a decision reaches
+
+`decide` requires a `--scope`, and it is the one argument with no default.
+
+A scope is not a label of where a decision was made. It is a statement of where
+it *applies*. "Never run scale benchmarks on this laptop" gets written while
+working on one project and is true of every project on the machine; tagged with
+where it was written, it would disappear the moment you started something else.
+So the question is not "what was I working on" but "where would this still be
+true".
+
+There is one rule:
+
+> A decision applies where its scope is an ancestor-or-self of the asker's
+> position.
+
+A session at `work/goldenmatch/fs` sees decisions scoped `work/goldenmatch/fs`,
+`work/goldenmatch`, `work` and `*`. It does not see `work/goldenmatch/er`, and
+it does not see `personal`. Segments are compared one at a time, so `prod` never
+matches `production`, and the store never interprets the names — depth and
+naming are yours.
+
+```sh
+rmem decide "Never benchmark on the laptop" "run heavy compute in CI" --scope '*'
+rmem decide "Route scorers by class" "dispatch on the class, not the mass"   --scope work/goldenmatch/fs
+
+RMEM_SCOPE=work/goldenmatch/fs rmem decisions   # both of the above
+RMEM_SCOPE=personal rmem decisions              # only the first
+rmem decisions --all                            # everything, reach ignored
+```
+
+`RMEM_SCOPE` says where a session stands and is **read-side only**. It is never
+a write default, because reach varies per decision and only the writer knows
+it — which is also why `decide` refuses rather than guessing.
+
+Asking for a title that exists but does not reach you is not the same as asking
+for one that does not exist, and does not read like it: you are told where it
+does apply. A decision recorded before scopes existed carries none and reaches
+everywhere, so nothing disappeared when this arrived.
+
+Reach is about relevance, not permission. `--all` shows everything; none of this
+is a boundary.
+
 That example is not invented. `docs/seed-decision-log.sh` records this project's
 own log — thirty decisions from eleven merged pull requests, the options tried
 and turned down with the numbers that killed them, and the three supersession
@@ -297,6 +340,7 @@ separate processes, all eight landing.
   "command": "rmem-mcp",
   "env": {
     "RMEM_CONFIG": "D:/memory/rmem.toml",
+    "RMEM_SCOPE": "work/goldenmatch",
     "RMEM_TOOLS": "decide,decisions,decision"
   }
 }
@@ -307,20 +351,29 @@ it each session reads `./rmem.toml` from its own directory, and eventually one
 of them points somewhere else -- a divergence nothing reports, because two
 stores are not an error.
 
+`RMEM_SCOPE` is what makes one shared store readable by many projects. Without
+it every session sees every decision, which is the state that made a flat log of
+219 unusable — and it says where a session *stands*, never how far its writes
+reach, which each `decide` states for itself.
+
 `RMEM_TOOLS` is what it costs. The tool table is sent on every turn of every
 session that has this configured, used or not:
 
 | exposed | tools | tokens per turn |
 |---|---|---|
-| everything | 8 | ~1,850 |
-| `decide,decisions,decision,recall` | 4 | ~1,210 |
-| `decide,decisions,decision` | 3 | ~960 |
-| `decisions,decision` | 2 | ~510 |
+| everything | 8 | ~2,010 |
+| `decide,decisions,decision,recall` | 4 | ~1,370 |
+| `decide,decisions,decision` | 3 | ~1,130 |
+| `decisions,decision` | 2 | ~610 |
 
-Every row went up by about 154 tokens when `decisions` and `decision` gained
-`as_of` and `valid_at`, because both tools are in every row. That is what the
-two clocks cost, and it is written here rather than absorbed quietly: the first
-draft of those parameter descriptions cost 209 and was cut back.
+These figures are measured, and they have moved twice. The two clocks
+(`as_of`, `valid_at`) added about 154 tokens to every row, because `decisions`
+and `decision` appear in all of them. Scope added about 162 more to the rows
+carrying `decide`, and about 93 to the row that does not — it gains the two read
+parameters but not `decide`'s own.
+
+Both are written down rather than absorbed quietly, and both first drafts came
+in over budget and were cut back: 209 tokens for the clocks, 236 for scope.
 
 For comparison, a thirty-decision log is about 1,850 tokens to read in full. A
 project that only ever consults decisions should not pay most of that again,

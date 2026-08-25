@@ -29,7 +29,12 @@
 # The rusty-memory decision log, recorded from eleven merged pull requests.
 set -euo pipefail
 R="${RMEM_BIN:-rmem}"
-d() { "$R" decide "$@" >/dev/null; printf '.'; }
+# Every decision here is about this project, so they share a reach.
+# Overridable, because the same script seeds demo stores that may sit elsewhere.
+SEED_SCOPE="${SEED_SCOPE:-rusty-memory}"
+# The scope goes after "$@", not before it: `decide` wants the title and the
+# choice ahead of any flag, and refuses when the first argument starts with --.
+d() { "$R" decide "$@" --scope "$SEED_SCOPE" >/dev/null; printf '.'; }
 
 echo -n "accepted "
 d "Store bi-temporally" "every assertion carries valid time and transaction time" \
