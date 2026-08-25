@@ -1,0 +1,17 @@
+[package]
+name = "read-cost"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Measures what a read costs against history depth, for the two strategies and the flat control"
+
+# Two path deps rather than four: rm-engine re-exports Interval, Provenance,
+# Source, Supersession, Timestamp, Metric, VectorIndex, Record and the whole
+# rm-resolve ruleset vocabulary, so naming those crates again would only add
+# ways for the versions to disagree.
+[dependencies]
+rm-contrast = { path = "../../crates/rm-contrast" }
+rm-engine = { path = "../../crates/rm-engine" }
+
+[profile.release]
+opt-level = 3

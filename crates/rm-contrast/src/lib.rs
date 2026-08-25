@@ -19,6 +19,7 @@
 //! The control wins the entire low end of the surface by design, and a test
 //! asserts it does. See [`surface::calibration`].
 
+pub mod cost;
 pub mod flat;
 pub mod report;
 pub mod score;

@@ -157,16 +157,43 @@ real alternative.
 answers many retrospective questions correctly because the value had not
 changed, which is why the columns slope rather than cliff.
 
-## Cost, stated not measured
+## Cost, measured
 
 This store appends to a version log and runs survivorship over that log on every
-read. The control does a hash-map insert and a lookup. The difference is
-asymptotic rather than a constant factor, and it is not measured here — a
-half-built cost model would be worse than this sentence.
+read. The control does a hash-map insert and a lookup. That difference is
+asymptotic rather than a constant factor, and it is now measured:
+`benches/read-cost` sweeps history depth for the control and for both
+strategies, and `src/cost.rs` holds the model it checks against.
 
-Nothing in the surface above accounts for it. A reader deciding between the two
-should weigh a control that is cheaper and right at the origin against a store
-that holds its accuracy as the workload leaves it.
+On one laptop, at the depth that matters:
+
+| depth | flat | most_recent | valid_interval |
+|---|---|---|---|
+| 1 | 142 ns | 320 ns | 462 ns |
+| 1000 | 142 ns | 8,268 ns | 181,667 ns |
+
+**Fixed cost dominates a read until roughly depth 42.** Below that, most of
+what a read pays is an entity lookup, a `Vec` allocation and a returned
+`Believed`, none of which depends on history at all. The marginal cost is
+1.9 ns per predicted unit under `most_recent` and 10.8 under `valid_interval`.
+
+The number that matters for a reader choosing between the two is where the real
+store sits on that curve. **A live store of 219 decisions holds 1,086 attribute
+slots, every one of them at depth 1** — nothing has been revised — and at depth
+1 there is no history to scan and no timeline to sort. The whole difference
+between the two strategies there is about 140 nanoseconds.
+
+Two caveats on that anchor, because it is doing a lot of work. That store is
+two days old and was seeded once, so depth 1 says where it sits and not that
+revisions are rare. And a `rescope` pass ran across all 219 records: if
+`rescope` appends a version those `scope` slots should be at depth 2, and they
+are not. Either the store was rebuilt rather than amended or `rescope`
+overwrites, and nobody should read depth 1 as a fact about `rescope` until that
+is settled.
+
+The measurement deliberately does not decide the shipped default. That is a
+separate argument with a correctness half, and letting a benchmark author settle
+it here would be the thumb on the scale this crate is built to avoid.
 
 ## What this does not say
 
