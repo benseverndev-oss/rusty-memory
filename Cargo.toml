@@ -14,6 +14,7 @@ members = [
     "crates/rm-cli",
     "crates/rm-mcp",
     "crates/rm-conform",
+    "crates/rm-contrast",
 ]
 resolver = "2"
 # The ANN bake-off is run by hand, not in CI: it pulls hnsw_rs and takes
@@ -42,6 +43,7 @@ rm-host = { path = "crates/rm-host" }
 rm-cli = { path = "crates/rm-cli" }
 rm-mcp = { path = "crates/rm-mcp" }
 rm-conform = { path = "crates/rm-conform" }
+rm-contrast = { path = "crates/rm-contrast" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2", default-features = false, features = ["tls"] }

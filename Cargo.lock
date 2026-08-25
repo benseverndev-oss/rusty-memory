@@ -293,6 +293,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rm-contrast"
+version = "0.0.0"
+dependencies = [
+ "rm-core",
+ "rm-engine",
+ "rm-index",
+ "rm-resolve",
+]
+
+[[package]]
 name = "rm-core"
 version = "0.1.0"
 dependencies = [
