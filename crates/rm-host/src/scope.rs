@@ -42,6 +42,22 @@ pub fn applies_at(scope: &str, position: &str) -> bool {
         .all(|segment| here.next() == Some(segment))
 }
 
+/// A position, from a source that can hand back an empty value.
+///
+/// An unset `RMEM_SCOPE` and one set to the empty string look identical in a
+/// shell and in a JSON `env` block, and they used to behave nothing alike:
+/// unset suspends the applicability rule, while empty was read as a position
+/// and split into one empty segment -- the root, where only [`UNIVERSAL`]
+/// reaches. Measured on a 219-decision store, `RMEM_SCOPE=` returned 32
+/// records where unset returned all 219.
+///
+/// That is the worst shape a defect can take here: a configuration that looks
+/// unconfigured, hiding most of the store, reporting nothing. Whitespace is
+/// trimmed for the same reason -- `RMEM_SCOPE=" "` is a typo, not a position.
+pub fn position(raw: Option<String>) -> Option<String> {
+    raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Whether `scope` is a scope at all.
 ///
 /// The refusals exist so that two spellings cannot mean one thing. `work` and
@@ -141,5 +157,43 @@ mod tests {
             e.contains('*'),
             "the message should name the character: {e}"
         );
+    }
+
+    /// An empty value is not a position. It arrives that way from a shell that
+    /// says `RMEM_SCOPE=` and from a JSON `env` block with an empty string,
+    /// both of which read as "not configured" to whoever wrote them.
+    #[test]
+    fn an_empty_position_is_no_position_at_all() {
+        assert_eq!(position(None), None);
+        assert_eq!(position(Some(String::new())), None);
+        assert_eq!(position(Some("   ".into())), None, "whitespace is a typo");
+        assert_eq!(
+            position(Some(
+                "	
+"
+                .into()
+            )),
+            None
+        );
+
+        assert_eq!(position(Some("work".into())), Some("work".into()));
+        assert_eq!(
+            position(Some("  work/goldenmatch  ".into())),
+            Some("work/goldenmatch".into()),
+            "trimmed, because a stray space is never meant"
+        );
+        // `*` is a real position -- the root -- and must survive.
+        assert_eq!(position(Some(UNIVERSAL.into())), Some(UNIVERSAL.into()));
+    }
+
+    /// The bug this exists to prevent, stated as the two behaviours it kept
+    /// apart. Without the filter above, `""` splits into one empty segment and
+    /// nothing but `*` reaches it.
+    #[test]
+    fn an_empty_string_would_otherwise_be_the_root_position() {
+        assert!(!applies_at("work", ""), "this is what made it dangerous");
+        assert!(applies_at(UNIVERSAL, ""));
+        // ...so the normalisation, not the rule, is what has to catch it.
+        assert_eq!(position(Some(String::new())), None);
     }
 }
