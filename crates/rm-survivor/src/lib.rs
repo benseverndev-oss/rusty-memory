@@ -271,10 +271,19 @@ pub enum Strategy {
     /// record. Within the winning source, ties resolve by [`Strategy::MostRecent`].
     SourcePriority(Vec<Source>),
     /// Do not pick a winner. Emit each distinct value with the validity range
-    /// over which it stood, inferred from observation order.
+    /// over which it stood.
     ///
-    /// Refuses when two different values share an observation timestamp: with
-    /// no order between them there is no way to say which superseded which.
+    /// Refuses only when two different values collide on *both* axes -- same
+    /// `valid.from` and same `observed_at` -- because then nothing orders them
+    /// and there is no way to say which superseded which.
+    ///
+    /// This sentence used to say "refuses when two different values share an
+    /// observation timestamp", which was true when a `Candidate` carried a
+    /// value and a provenance and no interval, so the timeline could only be
+    /// cut at observation. A `Candidate` carries its validity now, and two
+    /// values heard in the same instant are ordered by when they held. The
+    /// code moved and the prose did not; `rm-conform`'s differential sweep
+    /// found the gap by disagreeing on 53 generated histories.
     ValidInterval,
 }
 

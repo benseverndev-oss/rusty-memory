@@ -75,14 +75,19 @@ Four corrections were needed to reach the green table. All four were in the
 reference model rather than the engine, which is the expected direction — the
 engine has ~590 tests behind it. Two of them are findings about the store.
 
-**`Strategy::ValidInterval`'s doc comment is stale.** It says the strategy
-refuses when "two different values share an observation timestamp". It does
-not: it refuses only when `valid.from` *and* `observed_at` *and* the values all
-collide. The narrower behaviour is the correct one — the sentence was written
-when a `Candidate` carried no valid time and the timeline was cut at
-observation, at which point two values sharing an observation really did have
-no order between them. Adding valid time gave them one. The code moved and the
-prose did not.
+**`Strategy::ValidInterval`'s doc comment was stale — since corrected.** It
+said the strategy refuses when "two different values share an observation
+timestamp". It did not: it refuses only when `valid.from` *and* `observed_at`
+*and* the values all collide. The narrower behaviour was the correct one — the
+sentence was written when a `Candidate` carried no valid time and the timeline
+was cut at observation, at which point two values sharing an observation really
+did have no order between them. Adding valid time gave them one. The code moved
+and the prose did not.
+
+The comment now states the rule the code follows. Worth keeping on this list
+anyway: the finding was that a written premise and a behaviour had drifted
+apart with nothing checking, and closing one instance does not retire the
+class.
 
 **`--valid-at` is inert under the shipped default.** `Engine::about` applies
 `held_at(valid_t)` to the *outcome*, and under `Strategy::MostRecent` the
@@ -99,8 +104,9 @@ and it is invisible from any single file.
 Both are pinned as named tests
 (`sharing_an_observation_instant_is_not_enough_to_refuse`,
 `valid_time_is_inert_under_the_default_strategy`) so they fail loudly if either
-changes. The second test still passes, and still should: `about` is unchanged.
-What changed is that the decision reads no longer go through it.
+changes. Both still pass, and should: they pin behaviour, and neither behaviour
+moved. Correcting the first finding changed a sentence; the decision reads
+stopped going through the second.
 
 ## What this deliberately does not do
 

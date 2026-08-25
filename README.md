@@ -258,8 +258,37 @@ everywhere, so nothing disappeared when this arrived.
 Reach is about relevance, not permission. `--all` shows everything; none of this
 is a boundary.
 
+### Correcting a reach without re-deciding
+
+```sh
+rmem rescope "Pin the compiler" --scope '*'
+```
+
+`decide` takes the title and the choice positionally, so attaching a scope
+through it writes a second `choice`. Nothing about the decision changed, but
+`revisions` counts choice versions, so the entry then reads *revised 2 times*
+and the log has a revision in it that never happened. Over a backfill of a few
+hundred records that is the whole log falsified.
+
+`rescope` writes the scope and nothing else. It refuses a title it cannot find
+rather than creating one, because a decision holding a reach and no choice is
+not a decision — and during a backfill an unresolved title is overwhelmingly a
+typo, which is when a silent create is least visible and most expensive.
+
+It reports what the decision reached before, and the three cases are different
+things to have done: it had none, it reached somewhere else, or it already
+reached exactly this and nothing was written.
+
+**The scope's valid time follows the decision, not the clock.** Attaching a
+reach to a decision that never had one says *this is how far it always reached*,
+so it is dated from the decision's own earliest choice — transaction time stays
+now, because the store genuinely only just learned it. Changing a reach that was
+already recorded is the other thing: the reach changed today, so that one is
+dated from today. Backfilling from now would have the store claim every
+decision's reach began the day the backfill ran.
+
 That example is not invented. `docs/seed-decision-log.sh` records this project's
-own log — thirty decisions from eleven merged pull requests, the options tried
+own log — the options tried
 and turned down with the numbers that killed them, and the three supersession
 chains that actually happened. Run it against an empty store to see what the
 thing reads like holding real history rather than a demo.
