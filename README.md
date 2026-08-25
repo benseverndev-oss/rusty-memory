@@ -73,9 +73,10 @@ rmem-mcp                        # reads ./rmem.toml, serves stdin
 
 Eight tools — `remember`, `recall`, `about`, `reviews`, `resolve_review`,
 `decide`, `decisions`, `decision` — which are `rmem`'s own commands over shared
-code rather than a second implementation of them. `about` is the one that differs: it takes
-both time axes, so an agent can ask what was true in May and, separately, what
-was known last Tuesday.
+code rather than a second implementation of them. Three take both time axes, so
+an agent can ask what was true in May and, separately, what was known last
+Tuesday: `about`, and the two decision reads `decisions` and `decision`. Their
+`as_of` and `valid_at` accept a `YYYY-MM-DD` string or a millisecond instant.
 
 `decide`, `decisions` and `decision` are the decision log. A decision is an
 entity with four attributes — `status`, `choice`, `because`, `context` — written
@@ -166,6 +167,26 @@ first, and most strategies collapse a history to one winner — a winner has no
 timeline, so there is nothing for a valid time to index into. Only an attribute
 under `valid_interval` can be asked, which is `employer` in the template and
 whatever else you configure.
+
+**The decision reads are the exception.** `rmem decisions` and `rmem decision`
+take the same two flags, and `--valid-at` works on them whatever `[policy]`
+says, because they do not go through survivorship at all: a decision's timeline
+is the versions of its own `choice`, so "what stood in March" is a cut over that
+list rather than a question for a strategy.
+
+```sh
+rmem decision "Pin the compiler" --as-of 2026-03-01   # what the log said then
+rmem decisions --as-of 2026-03-01                     # the whole log, then
+```
+
+A decision recorded after the date asked about is not missing, and does not read
+as one. It says so and names both days — the day it arrived and the day it holds
+from — because either clock can be the one that excluded it, and "no decision by
+that title" would send you looking for a spelling mistake instead.
+
+A decision that stood then and does not now reads as *stood as of*, not *still
+stands*. The walk to whatever replaced it is made at the same clock, so a
+supersession recorded in August does not retire anything in March.
 
 That timeline used to be cut at **observation** times rather than valid ones, so
 the case this store's design opens with — told in September that a job changed
@@ -291,10 +312,15 @@ session that has this configured, used or not:
 
 | exposed | tools | tokens per turn |
 |---|---|---|
-| everything | 8 | ~1,700 |
-| `decide,decisions,decision,recall` | 4 | ~1,060 |
-| `decide,decisions,decision` | 3 | ~810 |
-| `decisions,decision` | 2 | ~360 |
+| everything | 8 | ~1,850 |
+| `decide,decisions,decision,recall` | 4 | ~1,210 |
+| `decide,decisions,decision` | 3 | ~960 |
+| `decisions,decision` | 2 | ~510 |
+
+Every row went up by about 154 tokens when `decisions` and `decision` gained
+`as_of` and `valid_at`, because both tools are in every row. That is what the
+two clocks cost, and it is written here rather than absorbed quietly: the first
+draft of those parameter descriptions cost 209 and was cut back.
 
 For comparison, a thirty-decision log is about 1,850 tokens to read in full. A
 project that only ever consults decisions should not pay most of that again,
