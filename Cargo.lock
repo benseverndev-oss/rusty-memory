@@ -294,14 +294,14 @@ dependencies = [
 
 [[package]]
 name = "rm-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "rm-embed"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rm-engine",
 ]
@@ -332,7 +332,7 @@ dependencies = [
 
 [[package]]
 name = "rm-graph"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rm-core",
  "rm-store",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "rm-index"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "rm-resolve"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "rm-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rm-core",
  "rm-survivor",
@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "rm-survivor"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rm-core",
  "serde",

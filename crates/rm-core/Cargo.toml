@@ -1,6 +1,6 @@
 [package]
 name = "rm-core"
-version = "0.0.0"
+version = "0.1.0"
 description = "Core types for rusty-memory: memories, provenance, and the temporal model"
 edition.workspace = true
 rust-version.workspace = true
