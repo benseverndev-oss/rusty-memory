@@ -119,6 +119,9 @@ d "Mint session ids from RandomState rather than a CSPRNG" "128 bits of SipHash 
 d "Refuse a request whose session id is unknown" "404, and re-handshake" \
   --because "a client holding a stale id would otherwise be served as a stranger and never learn its session had gone; a request with no id at all is still served, because refusing it would reverse the decision already made for a client that never handshakes"
 
+d "Expire a session on the read, not only on the sweep" "resume checks the clock and drops what has gone stale" \
+  --because "eviction ran only from mint, so a server nobody new handshaked against never collected anything and a session idle for a day still answered -- the module promised an hour the code only approximated, and the test passed because it minted to force the sweep"
+
 echo; echo -n "proposed "
 d "Index raw turn text beside assertions" "one vector per turn as well as one per assertion" --status proposed \
   --because "raw turns beat the pipeline by 0.086 pooled over three conversations, never negative -- but fusing the two loses to raw turns alone, so the shape is unsettled"
