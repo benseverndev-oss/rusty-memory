@@ -29,7 +29,21 @@ use rm_engine::Strategy;
 /// general -- it is two days old and was seeded once.
 pub const LIVE_STORE_DEPTH: usize = 1;
 
-/// Predicted work for one `about()` against a slot holding `v` versions.
+/// Predicted **variable** work for one `about()` against a slot holding `v`
+/// versions.
+///
+/// # Fixed cost is measured, not modelled
+///
+/// A read also pays a cost that does not depend on `v` at all: the entity
+/// lookup, the `Vec` allocation, the `Believed` it returns. `benches/read-cost`
+/// measures that at roughly 350ns against a marginal ~7.6ns per version, so it
+/// **dominates every read below about depth 50** -- which is every read this
+/// project's live store performs.
+///
+/// It is deliberately absent here. A constant is not a function of `v`, so
+/// modelling it would mean fitting a number from the engine's own timings, and
+/// a model fitted to what it judges is not a reference model. The bench fits
+/// it instead, with [`fit`], and reports it as a measurement.
 ///
 /// # This models the path where the value changes
 ///
@@ -67,6 +81,46 @@ pub fn predicted_work(v: usize, strategy: &Strategy) -> f64 {
     shared + by_strategy
 }
 
+/// A read's cost, split into the part that depends on history and the part
+/// that does not.
+///
+/// `ns = fixed_ns + marginal_ns * predicted_work(v, strategy)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fit {
+    /// Cost paid by every read regardless of depth.
+    pub fixed_ns: f64,
+    /// Cost per unit of [`predicted_work`] -- roughly, per candidate touched.
+    pub marginal_ns: f64,
+}
+
+/// Least squares over `(predicted_work, measured_ns)` samples.
+///
+/// A pure function, so CI can check it recovers a line it was given rather
+/// than trusting it on measured data where the right answer is unknown.
+///
+/// Returns `None` for fewer than two samples, or when every sample sits at the
+/// same `x` -- there is no slope to find and inventing one would be worse than
+/// declining.
+pub fn fit(samples: &[(f64, f64)]) -> Option<Fit> {
+    let n = samples.len() as f64;
+    if samples.len() < 2 {
+        return None;
+    }
+    let sx: f64 = samples.iter().map(|(x, _)| x).sum();
+    let sy: f64 = samples.iter().map(|(_, y)| y).sum();
+    let sxx: f64 = samples.iter().map(|(x, _)| x * x).sum();
+    let sxy: f64 = samples.iter().map(|(x, y)| x * y).sum();
+    let denom = n * sxx - sx * sx;
+    if denom.abs() < f64::EPSILON {
+        return None;
+    }
+    let marginal_ns = (n * sxy - sx * sy) / denom;
+    Some(Fit {
+        fixed_ns: (sy - marginal_ns * sx) / n,
+        marginal_ns,
+    })
+}
+
 /// The shallowest depth at which `ValidInterval` costs `factor` times
 /// `MostRecent`.
 ///
@@ -83,19 +137,60 @@ pub fn depth_where_ratio_exceeds(factor: f64) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// The headline derived answer, and the reason this file exists.
+    /// What the live store's depth means for the variable term.
     ///
-    /// At depth 1, `log2(1)` is 0, so `ValidInterval` has no sort to pay and
-    /// the two strategies do identical work. That is the depth the live store
-    /// is actually at, so on this model the shipped-default question is not a
-    /// cost question at all -- which is a claim worth failing loudly if the
-    /// model ever stops supporting it.
+    /// An earlier version of this test asserted that the two strategies cost
+    /// *the same* at depth 1, since `log2(1)` is 0 and `ValidInterval` has no
+    /// sort to pay. The bench falsified it: 358ns against 528ns. The variable
+    /// terms really are equal; `ValidInterval` pays more in the fixed cost
+    /// this model does not carry, allocating a `Vec<Fact>` where `MostRecent`
+    /// returns one winner.
+    ///
+    /// So the true claim is narrower, and it is the one that matters: at the
+    /// depth the live store is at, the variable term is a rounding error
+    /// against what it becomes, and a read there is fixed-cost dominated.
     #[test]
-    fn at_the_live_store_depth_the_two_strategies_cost_the_same() {
+    fn the_live_store_sits_where_history_costs_almost_nothing() {
         assert_eq!(LIVE_STORE_DEPTH, 1);
+        for s in [Strategy::MostRecent, Strategy::ValidInterval] {
+            let here = predicted_work(LIVE_STORE_DEPTH, &s);
+            let deep = predicted_work(1000, &s);
+            assert!(
+                deep / here > 500.0,
+                "{s:?}: variable work at depth 1 is not negligible against depth 1000 ({:.0}x)",
+                deep / here
+            );
+        }
+    }
+
+    /// `fit` recovers a line it was given.
+    ///
+    /// Checked against a known answer rather than against measured data, where
+    /// nobody knows the right one. A fitter that quietly returned nonsense
+    /// would make every number in the bench nonsense too.
+    #[test]
+    fn the_fitter_recovers_a_line_it_was_handed() {
+        // y = 350 + 7.5x, sampled exactly.
+        let samples: Vec<(f64, f64)> = (1..=10)
+            .map(|i| {
+                let x = i as f64 * 4.0;
+                (x, 350.0 + 7.5 * x)
+            })
+            .collect();
+        let f = fit(&samples).expect("ten samples with distinct x");
+        assert!((f.fixed_ns - 350.0).abs() < 1e-6, "{f:?}");
+        assert!((f.marginal_ns - 7.5).abs() < 1e-9, "{f:?}");
+    }
+
+    /// And it declines rather than inventing a slope.
+    #[test]
+    fn the_fitter_declines_when_there_is_no_slope_to_find() {
+        assert_eq!(fit(&[]), None);
+        assert_eq!(fit(&[(4.0, 100.0)]), None, "one point is not a line");
         assert_eq!(
-            predicted_work(LIVE_STORE_DEPTH, &Strategy::MostRecent),
-            predicted_work(LIVE_STORE_DEPTH, &Strategy::ValidInterval),
+            fit(&[(4.0, 100.0), (4.0, 200.0)]),
+            None,
+            "two points at the same depth are not a line either"
         );
     }
 
