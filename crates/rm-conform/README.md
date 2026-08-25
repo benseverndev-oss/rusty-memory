@@ -35,7 +35,10 @@ could reach it. It measures correctness like the others now.
 
 ## The table
 
-Seeds `0..500`, 20 probes per history, 12 assertions each.
+Seeds `0..500` for the merge sweep and `0..60` for the applicability rows, 20
+probes per history, 12 assertions each. Fewer seeds for the second group
+because each one builds a real engine and writes a dozen decisions through the
+command path, where the merge sweep compares two pure functions.
 
 | property | result |
 |---|---|
@@ -44,6 +47,9 @@ Seeds `0..500`, 20 probes per history, 12 assertions each.
 | transaction-time monotonicity | 1.000 |
 | arrival-order independence | 1.000 |
 | decision-layer time coverage | 1.000 |
+| applicability agreement | 1.000 |
+| depth monotonicity | 1.000 |
+| rescope keeps its history | 1.000 |
 
 750 of 4,000 comparisons reached a refusal; 3,250 answered.
 
@@ -68,6 +74,19 @@ metamorphic properties are the cover for that: they are derived from what
 bi-temporality means rather than from either implementation, so a shared
 misunderstanding that also satisfies transaction-time monotonicity is a much
 narrower target.
+
+The applicability rows have their own oracle, in `applicability.rs`, and it is
+independent in a stricter sense than the survivorship one: it never imports
+`rm_host::scope` at all, not even the `"*"` constant. Importing it would make
+the oracle track a change to the rule silently rather than reporting a
+disagreement. A test reads this module's own source to assert the import never
+appears — checked by adding one, which turns the suite red.
+
+Its second row earns its place the same way `transaction-time monotonicity`
+does. `depth monotonicity` says a deeper position never sees less, which
+follows from what ancestor-or-self *means* rather than from either
+implementation, so it survives the oracle and the engine sharing one author's
+misunderstanding.
 
 ## What it found
 
@@ -100,6 +119,14 @@ nothing says so.
 
 Each piece of that is individually defensible; the combination is the defect,
 and it is invisible from any single file.
+
+**The applicability rows found nothing.** They were added after the rule had
+shipped and was already governing a live store, which is the wrong order and is
+why a green result was the likely one. Worth recording rather than quietly
+enjoying: a green row proves the measurement exists, not that it was hard to
+pass. What makes these three worth keeping is that each was checked against a
+deliberate mutation — a string-prefix rule, and a correction backdated to its
+decision's start — and each went red.
 
 Both are pinned as named tests
 (`sharing_an_observation_instant_is_not_enough_to_refuse`,

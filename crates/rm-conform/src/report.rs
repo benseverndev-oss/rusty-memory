@@ -5,6 +5,7 @@
 //! is, with some irony, the exact failure this harness found twice in the
 //! codebase it measures.
 
+use crate::applicability::{self, agreement, depth_monotonic, rescope_history};
 use crate::differential::{default_strategies, refusal_agreement, sweep, Disagreement};
 use crate::generate::{generate, Params};
 use crate::invariants::{monotonic_in_transaction_time, order_independent, probe_grid};
@@ -13,6 +14,14 @@ use rm_engine::Strategy;
 /// Seeds swept for the reported figures. Fixed and printed, so any number here
 /// can be reproduced.
 pub const SEEDS: u64 = 500;
+
+/// Seeds swept for the applicability rows.
+///
+/// Fewer than [`SEEDS`] and printed alongside it, because each one builds an
+/// engine and writes a dozen decisions through the real command path rather
+/// than comparing two pure functions. A number that was quietly smaller than
+/// the one above it would overstate what was measured.
+pub const SCOPE_SEEDS: u64 = 60;
 
 fn verdict(passed: bool) -> &'static str {
     if passed {
@@ -47,7 +56,8 @@ pub fn table() -> String {
     let mut out = String::new();
 
     out.push_str(&format!(
-        "Seeds `0..{SEEDS}`, params `{params:?}`, {} probes per history.\n\n",
+        "Seeds `0..{SEEDS}` for the merge sweep and `0..{SCOPE_SEEDS}` for the \
+         applicability rows, params `{params:?}`, {} probes per history.\n\n",
         probes.len()
     ));
     out.push_str("| property | result |\n|---|---|\n");
@@ -70,6 +80,23 @@ pub fn table() -> String {
     out.push_str(&format!(
         "| decision-layer time coverage | {:.3} |\n",
         crate::decisions::time_coverage()
+    ));
+
+    // A smaller seed range than the merge sweep: each world builds a real
+    // engine and records a dozen decisions through it, where the merge sweep
+    // compares two pure functions.
+    let scope_params = applicability::Params::default();
+    out.push_str(&format!(
+        "| applicability agreement | {} |\n",
+        verdict(agreement(0..SCOPE_SEEDS, &scope_params))
+    ));
+    out.push_str(&format!(
+        "| depth monotonicity | {} |\n",
+        verdict(depth_monotonic(0..SCOPE_SEEDS, &scope_params))
+    ));
+    out.push_str(&format!(
+        "| rescope keeps its history | {} |\n",
+        verdict(rescope_history(0..SCOPE_SEEDS, &scope_params))
     ));
 
     out.push_str(&format!(
@@ -102,6 +129,9 @@ mod tests {
             "transaction-time monotonicity",
             "arrival-order independence",
             "decision-layer time coverage",
+            "applicability agreement",
+            "depth monotonicity",
+            "rescope keeps its history",
         ] {
             assert!(t.contains(row), "row missing from the table: {row}\n{t}");
         }
