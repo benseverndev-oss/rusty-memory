@@ -280,6 +280,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "rm-conform"
+version = "0.0.0"
+dependencies = [
+ "rm-core",
+ "rm-embed",
+ "rm-engine",
+ "rm-host",
+ "rm-index",
+ "rm-resolve",
+ "rm-survivor",
+]
+
+[[package]]
 name = "rm-core"
 version = "0.0.0"
 dependencies = [
