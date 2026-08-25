@@ -27,7 +27,11 @@ twenty-line control beats the pipeline on it, and none of the distinctive
 machinery serves it."*
 
 So the headline here is a claim to hold rather than a score to raise. Every row
-below but the last is a bug if it is not 1.000.
+below is a bug if it is not 1.000.
+
+The last row was `0.000` when this crate landed, and it was not a bug — it was
+the honest report of a decision API that took no time parameters, so no probe
+could reach it. It measures correctness like the others now.
 
 ## The table
 
@@ -39,7 +43,7 @@ Seeds `0..500`, 20 probes per history, 12 assertions each.
 | refusal correctness | 1.000 |
 | transaction-time monotonicity | 1.000 |
 | arrival-order independence | 1.000 |
-| decision-layer time coverage | 0.000 |
+| decision-layer time coverage | 1.000 |
 
 750 of 4,000 comparisons reached a refusal; 3,250 answered.
 
@@ -95,7 +99,8 @@ and it is invisible from any single file.
 Both are pinned as named tests
 (`sharing_an_observation_instant_is_not_enough_to_refuse`,
 `valid_time_is_inert_under_the_default_strategy`) so they fail loudly if either
-changes.
+changes. The second test still passes, and still should: `about` is unchanged.
+What changed is that the decision reads no longer go through it.
 
 ## What this deliberately does not do
 
@@ -107,7 +112,13 @@ changes.
   distribution and call it a resolver score.
 - **No retrieval scoring.** That is a second axis and a quality measure, not a
   correctness one. It stays in `benches/locomo`.
-- **No fix for what it found.** Both findings above are reported, not closed.
+- **No fix for what it found.** The first finding above is reported, not
+  closed. The second is what the decision-layer coverage row was measuring, and
+  it is closed: `rmem decisions` and `rmem decision` take both clocks. The
+  sidestep is deliberate and narrow — those reads build their own timeline from
+  the versions of a decision's `choice` rather than going through survivorship,
+  so `--valid-at` works on them whatever `[policy]` says. **`rmem about
+  --valid-at` is still inert under `most_recent`.**
 
 ## What a green table does not prove
 
