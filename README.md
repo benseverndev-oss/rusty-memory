@@ -272,6 +272,16 @@ for one that does not exist, and does not read like it: you are told where it
 does apply. A decision recorded before scopes existed carries none and reaches
 everywhere, so nothing disappeared when this arrived.
 
+`rmem recall` takes the same two flags, and for the same reason: a session that
+lists 78 of 219 decisions and then searches all 219 has two views of one store.
+The filter runs inside the index scan rather than over a fetched page, so `-k 5`
+still means five results that apply rather than five candidates of which some
+survive.
+
+`about` deliberately does not take them. It reads an entity you named by id,
+which is a deliberate act rather than a search — scope decides what you are
+*shown*, not what you are allowed to *name*.
+
 Reach is about relevance, not permission. `--all` shows everything; none of this
 is a boundary.
 
@@ -407,8 +417,8 @@ session that has this configured, used or not:
 
 | exposed | tools | tokens per turn |
 |---|---|---|
-| everything | 8 | ~2,010 |
-| `decide,decisions,decision,recall` | 4 | ~1,370 |
+| everything | 8 | ~2,060 |
+| `decide,decisions,decision,recall` | 4 | ~1,420 |
 | `decide,decisions,decision` | 3 | ~1,130 |
 | `decisions,decision` | 2 | ~610 |
 
@@ -418,8 +428,13 @@ and `decision` appear in all of them. Scope added about 162 more to the rows
 carrying `decide`, and about 93 to the row that does not — it gains the two read
 parameters but not `decide`'s own.
 
-Both are written down rather than absorbed quietly, and both first drafts came
-in over budget and were cut back: 209 tokens for the clocks, 236 for scope.
+Scoping `recall` added ~48 more, to the two rows that expose it — the other two
+are byte-identical, which is the check that the figure is the flag rather than
+something else drifting.
+
+All of it is written down rather than absorbed quietly, and the first drafts of
+the clock and scope descriptions both came in over budget and were cut back:
+209 tokens for the clocks, 236 for scope.
 
 For comparison, a thirty-decision log is about 1,850 tokens to read in full. A
 project that only ever consults decisions should not pay most of that again,

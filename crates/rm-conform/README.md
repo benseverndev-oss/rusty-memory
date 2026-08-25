@@ -50,6 +50,7 @@ command path, where the merge sweep compares two pure functions.
 | applicability agreement | 1.000 |
 | depth monotonicity | 1.000 |
 | rescope keeps its history | 1.000 |
+| recall applicability | 1.000 |
 
 750 of 4,000 comparisons reached a refusal; 3,250 answered.
 
@@ -81,6 +82,11 @@ independent in a stricter sense than the survivorship one: it never imports
 the oracle track a change to the rule silently rather than reporting a
 disagreement. A test reads this module's own source to assert the import never
 appears — checked by adding one, which turns the suite red.
+
+`recall applicability` measures the same claim as `applicability agreement`
+against a different read path. `decisions` filters in the host; `recall` filters
+inside the index scan, where `k` is applied. Agreeing on one says nothing about
+the other, which is why both are rows rather than one.
 
 Its second row earns its place the same way `transaction-time monotonicity`
 does. `depth monotonicity` says a deeper position never sees less, which
