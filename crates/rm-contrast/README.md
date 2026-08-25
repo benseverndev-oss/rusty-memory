@@ -1,0 +1,167 @@
+# rm-contrast
+
+Measures where this store's bi-temporal answering beats a flat latest-wins
+store, and where the two tie.
+
+```sh
+cargo test -p rm-contrast                        # the coarse grid, as CI runs it
+cargo run --release -p rm-contrast -- --report --full   # the surface below
+```
+
+Free and deterministic: writes go through `Engine::remember_as` with a fixed
+vector, so there is no embedder, no completion model, no key and no socket. The
+full sweep is 1.2 seconds. That is the constraint `benches/locomo` could not
+meet, and its own README records the cost — four measured findings shipped
+switched off because re-measuring was expensive enough that nobody re-measured.
+
+## The claim under test
+
+`benches/locomo` measured retrieval, found *"a twenty-line control beats the
+pipeline on it, and none of the distinctive machinery serves it"*, and this
+project answered:
+
+> Raw turns cannot answer `about(entity, attribute, valid_t, tx_t)`. They cannot
+> say a fact was corrected, or that two names are one person, or what was
+> believed last Tuesday about last May. None of that is retrieval and none of it
+> is in this number.
+
+That was an argument, not a measurement. This is the measurement.
+
+## Read this before the table
+
+**The store's column is 1.000 by construction, and is not the finding.**
+
+Ground truth is computed the way `Strategy::ValidInterval` answers — the latest
+value that had begun to hold, among those already heard. So the store agreeing
+with it is close to a tautology, and a perfect column is what that design
+predicts rather than an achievement. Checking the engine against an independent
+reading of its own rules is `rm-conform`'s job, not this crate's.
+
+**The finding is the control's curve**, which is measured against ground truth
+that owes nothing to the control's design. And the finding that cuts *against*
+this store is at the bottom of this page.
+
+## The surface
+
+Backdate rate down, retrospective query share across. Each cell is **flat /
+store** accuracy, summed over 200 seeds.
+
+| backdate | 0% retrospective | 25% retrospective | 50% retrospective | 75% retrospective | 100% retrospective |
+|---|---|---|---|---|---|
+| 0% | 1.000 / 1.000 | 0.798 / 1.000 | 0.597 / 1.000 | 0.395 / 1.000 | 0.196 / 1.000 |
+| 10% | 0.916 / 1.000 | 0.736 / 1.000 | 0.551 / 1.000 | 0.362 / 1.000 | 0.186 / 1.000 |
+| 20% | 0.873 / 1.000 | 0.703 / 1.000 | 0.535 / 1.000 | 0.363 / 1.000 | 0.199 / 1.000 |
+| 30% | 0.812 / 1.000 | 0.663 / 1.000 | 0.514 / 1.000 | 0.359 / 1.000 | 0.207 / 1.000 |
+| 40% | 0.726 / 1.000 | 0.592 / 1.000 | 0.465 / 1.000 | 0.340 / 1.000 | 0.208 / 1.000 |
+| 50% | 0.705 / 1.000 | 0.578 / 1.000 | 0.454 / 1.000 | 0.329 / 1.000 | 0.205 / 1.000 |
+| 60% | 0.650 / 1.000 | 0.545 / 1.000 | 0.430 / 1.000 | 0.311 / 1.000 | 0.198 / 1.000 |
+| 70% | 0.588 / 1.000 | 0.492 / 1.000 | 0.391 / 1.000 | 0.288 / 1.000 | 0.198 / 1.000 |
+| 80% | 0.594 / 1.000 | 0.499 / 1.000 | 0.398 / 1.000 | 0.292 / 1.000 | 0.203 / 1.000 |
+
+## The crossovers
+
+- **0% retrospective** — the control first drops below 0.95 at **10%
+  backdating**.
+- **25% and above** — the control is already below 0.95 at **0% backdating**.
+
+Two things follow, and the first is the sharper one.
+
+**Out-of-order arrival costs the control the present, not just the past.** At
+80% backdating and *no retrospective questions at all*, it answers 0.594. Every
+one of those questions was "what is true now", which is the only question a
+latest-wins store claims to answer. Learning in September that something changed
+in July, then learning in October something true in June, leaves it reporting
+June as current.
+
+**Any retrospective share at all puts it under the floor.** At 25% the control
+is at 0.798 with no backdating whatever. That is close to arithmetic — a quarter
+of questions ask about a past it overwrote — and it is the boring half of the
+result, reported for completeness rather than as a discovery.
+
+## The calibration cell
+
+At **0% backdating and 0% retrospective queries, both stores score 1.000.**
+
+That cell is the guard, and it is a test rather than a note: if the *control*
+missed it, the harness would fail and the report would print **RIGGED** instead
+of a surface. A benchmark whose control cannot win the workload it was built for
+is measuring an unfair generator.
+
+Three companions sit beside it: backdating must actually cost the control
+something, the control must get *some* retrospective questions right — it does,
+whenever the value had not changed — and unanswerable questions must actually
+occur.
+
+## What cuts against this store
+
+At a 25% tie rate, of 8,000 questions asked, 1,647 had no right answer. **Of the
+remainder the store refused 4,067 it could have answered.** The control refused
+none, because it has no way to.
+
+`Strategy::ValidInterval` cannot build a timeline when two segments collide, so
+it refuses **the whole read** — including for an instant where nothing is
+ambiguous. The refusal is history-wide, not instant-local. On a history with one
+in four writes colliding, that is most of the store's usefulness gone.
+
+This is measured separately from the grid, and the grid is tie-free, because
+otherwise it would confound the temporal axes with the refusal behaviour. It was
+found by the calibration cell failing on its first run.
+
+An unanswerable question is excluded from both stores' accuracy rather than
+counted for or against either. Marking it either way is a thumb on the scale:
+against, and refusal is punished; for, and the result is rigged.
+
+## The control
+
+Twenty lines, quoted in full so nobody has to take on trust that it was not
+sabotaged:
+
+```rust
+pub struct Flat {
+    latest: HashMap<(StableId, String), Option<String>>,
+}
+
+impl Flat {
+    pub fn remember(&mut self, entity: StableId, attribute: &str, value: Option<&str>) {
+        self.latest
+            .insert((entity, attribute.to_string()), value.map(str::to_string));
+    }
+
+    pub fn about(&self, entity: StableId, attribute: &str) -> Option<Option<String>> {
+        self.latest.get(&(entity, attribute.to_string())).cloned()
+    }
+}
+```
+
+It takes no time parameter, which is the design rather than a handicap. A
+cleverer control — latest by *valid* time — was considered and turned down: it
+is not what anyone actually builds, so beating it would prove less about the
+real alternative.
+
+**It gets full credit whenever it happens to be right.** At low backdating it
+answers many retrospective questions correctly because the value had not
+changed, which is why the columns slope rather than cliff.
+
+## Cost, stated not measured
+
+This store appends to a version log and runs survivorship over that log on every
+read. The control does a hash-map insert and a lookup. The difference is
+asymptotic rather than a constant factor, and it is not measured here — a
+half-built cost model would be worse than this sentence.
+
+Nothing in the surface above accounts for it. A reader deciding between the two
+should weigh a control that is cheaper and right at the origin against a store
+that holds its accuracy as the workload leaves it.
+
+## What this does not say
+
+- **Nothing about retrieval.** That is `benches/locomo`'s axis, already measured
+  and already reported against this project.
+- **Nothing about entity resolution.** Out for `rm-conform`'s stated reason:
+  generated names would measure the generator's name distribution and call it a
+  resolver score. Entities are pinned.
+- **Nothing about realistic workloads.** Generated histories are not real ones.
+  The crossover is a property of this generator's shape, and the honest use of
+  it is to ask what *your* backdating rate is, not to read 10% as a law.
+- **Nothing about whether the store is correct.** That is `rm-conform`, and its
+  answer is on its own page.
