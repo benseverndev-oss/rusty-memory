@@ -310,13 +310,11 @@ pub fn run(
                         as_of,
                     },
                     _,
-                ) => command::about(
-                    engine,
-                    entity,
-                    &attribute,
-                    valid_at.unwrap_or(now),
-                    as_of.unwrap_or(now),
-                ),
+                    // The `Option`s go through unresolved: `about` refuses a
+                    // valid-time question the attribute's strategy cannot
+                    // answer, and it can only tell it was asked if the default
+                    // has not already been applied here.
+                ) => command::about(engine, entity, &attribute, valid_at, as_of, now),
                 (Command::ReviewList, _) => command::review_list(engine),
                 // `Timestamp::MAX` rather than `now` for an absent flag, so
                 // dropping the flag reads exactly as it did before these

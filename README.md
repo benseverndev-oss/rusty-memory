@@ -162,11 +162,28 @@ query naming today sees what was recorded this morning.
 runs, so asking what the store knew before it knew anything answers `nothing
 known`.
 
-`--valid-at` needs an attribute whose policy keeps a timeline. Survivorship runs
-first, and most strategies collapse a history to one winner — a winner has no
-timeline, so there is nothing for a valid time to index into. Only an attribute
-under `valid_interval` can be asked, which is `employer` in the template and
-whatever else you configure.
+`--valid-at` needs an attribute whose policy keeps a timeline, and **refuses
+when it does not**. Survivorship runs first, and most strategies collapse a
+history to one winner — a winner has no timeline, so there is nothing for a
+valid time to index into. Only an attribute under `valid_interval` can be
+asked, which is `employer` in the template and whatever else you configure.
+
+The refusal names the attribute, the strategy in force, and the line that would
+change it:
+
+```
+"choice" is resolved by MostRecent, which picks one winner rather than keeping
+a timeline, so there is no moment to ask about -- every date would answer the
+same. Set `choice = "valid_interval"` under [policy.attribute] in rmem.toml to
+keep one, or drop --valid-at to read what stands.
+```
+
+It used to be accepted and ignored. The flag went in, survivorship collapsed
+the history, `held_at` was handed a time it had no use for, and the same answer
+came back for every date — on every attribute but `employer`. Nothing said so,
+and a test asserted the wrong behaviour was right. Refusing rather than warning
+is the same choice this store makes everywhere else: a warning on stderr is a
+wrong answer with a note attached.
 
 **The decision reads are the exception.** `rmem decisions` and `rmem decision`
 take the same two flags, and `--valid-at` works on them whatever `[policy]`

@@ -349,7 +349,7 @@ where
             .cloned()
             .unwrap_or_else(|| json!({}));
 
-        let call = match Call::read(name, &arguments, now, self.client.as_deref()) {
+        let call = match Call::read(name, &arguments, self.client.as_deref()) {
             Ok(call) => call,
             Err(why) => return Ok(refused(era, &why)),
         };
@@ -560,7 +560,7 @@ where
                     as_of,
                 },
                 _,
-            ) => command::about(engine, entity, &attribute, valid_at, as_of),
+            ) => command::about(engine, entity, &attribute, valid_at, as_of, now),
             (Call::Reviews, _) => command::review_list(engine),
             (
                 Call::Decisions {

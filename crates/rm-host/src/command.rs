@@ -523,15 +523,40 @@ pub fn commit_recall(
 }
 
 /// What the store believes an attribute held.
+///
+/// `valid_at` is an `Option` rather than a resolved timestamp because the two
+/// cases are different questions and only the caller can tell them apart.
+/// "What held in March" and "what holds now" arrive here identically once a
+/// default has been applied, and that collapse is precisely why `--valid-at`
+/// could be accepted, do nothing, and say nothing: the information needed to
+/// refuse was destroyed one layer above the check.
 pub fn about(
     engine: &Engine,
     entity: StableId,
     attribute: &str,
-    valid_t: rm_engine::Timestamp,
-    tx_t: rm_engine::Timestamp,
+    valid_at: Option<Timestamp>,
+    as_of: Option<Timestamp>,
+    now: Timestamp,
 ) -> Result<Outcome, HostError> {
+    // Asked about a moment, under a strategy that has no moments. Refused
+    // rather than warned, because a warning on stderr is a wrong answer with a
+    // note attached -- and this codebase refuses everywhere else it has faced
+    // the same choice.
+    if valid_at.is_some() {
+        let strategy = engine.policy().for_attribute(attribute);
+        if !strategy.keeps_a_timeline() {
+            return Err(HostError::Refused(format!(
+                "{attribute:?} is resolved by {strategy:?}, which picks one winner rather than keeping a timeline, so there is no moment to ask about -- every date would answer the same. Set `{attribute} = \"valid_interval\"` under [policy.attribute] in rmem.toml to keep one, or drop --valid-at to read what stands."
+            )));
+        }
+    }
     engine
-        .about(entity, attribute, valid_t, tx_t)
+        .about(
+            entity,
+            attribute,
+            valid_at.unwrap_or(now),
+            as_of.unwrap_or(now),
+        )
         .map(Outcome::About)
         .map_err(|e| HostError::Refused(e.to_string()))
 }
@@ -2323,9 +2348,15 @@ pub(crate) mod tests {
 
         let all = recorded(&mut e);
         assert_eq!(all.len(), 1, "one title is one decision: {all:?}");
-        let Outcome::About(Believed::Value(choice)) =
-            about(&e, all[0].1, "choice", Timestamp::MAX, Timestamp::MAX).unwrap()
-        else {
+        let Outcome::About(Believed::Value(choice)) = about(
+            &e,
+            all[0].1,
+            "choice",
+            None,
+            Some(Timestamp::MAX),
+            Timestamp::MAX,
+        )
+        .unwrap() else {
             panic!("no choice on the re-decided entity")
         };
         assert_eq!(choice, "on reflection, no");
@@ -2709,18 +2740,24 @@ pub(crate) mod tests {
             "the log should show when it was decided"
         );
 
-        // Valid time: it held in March.
+        // Valid time is refused here, and this assertion used to be its
+        // opposite. It read "Valid time: it held in March" and asserted the
+        // value came back -- which it did, because `choice` resolves under
+        // `most_recent`, whose outcome is a single winner with no time
+        // dimension, so `held_at` returned the same value for every instant.
+        // The test passed because the flag was ignored: a test endorsing the
+        // defect rather than catching it.
+        let Err(HostError::Refused(why)) = about(&e, d.entity, "choice", Some(MARCH), None, AUGUST)
+        else {
+            panic!("a valid-time question under most_recent should be refused")
+        };
+        assert!(why.contains("valid_interval"), "{why}");
+
+        // Transaction time still bites, and works under any strategy: the
+        // store did not know this in March, so asking what it believed then
+        // gives the answer it would have given then, which is nothing.
         assert_eq!(
-            about(&e, d.entity, "choice", MARCH, AUGUST).unwrap(),
-            Outcome::About(Believed::Value(
-                "rust-toolchain.toml names the version".into()
-            ))
-        );
-        // Transaction time: the store did not know it in March. Asking what it
-        // believed then gives the answer it would have given then, which is
-        // nothing.
-        assert_eq!(
-            about(&e, d.entity, "choice", MARCH, MARCH).unwrap(),
+            about(&e, d.entity, "choice", None, Some(MARCH), MARCH).unwrap(),
             Outcome::About(Believed::Unknown),
             "backdating must not rewrite what the store knew when"
         );
@@ -2744,7 +2781,7 @@ pub(crate) mod tests {
         };
         assert_eq!(d.history[0].0, NOW);
         assert_eq!(
-            about(&e, d.entity, "choice", NOW, NOW).unwrap(),
+            about(&e, d.entity, "choice", None, Some(NOW), NOW).unwrap(),
             Outcome::About(Believed::Value("a choice".into()))
         );
     }
@@ -3360,7 +3397,7 @@ pub(crate) mod tests {
             panic!()
         };
 
-        let out = about(&e, ingested.entities[0], "spouse", 1000, 1000).unwrap();
+        let out = about(&e, ingested.entities[0], "spouse", None, Some(1000), 1000).unwrap();
         assert_eq!(out, Outcome::About(rm_engine::Believed::Unknown));
     }
 
