@@ -333,6 +333,21 @@ It is safe by default and refuses rather than warns:
 - `GET` gets **405**: the stream it would open carries server-initiated
   messages, and there are none
 
+Each request arrives on its own connection, so the handshake and the calls
+after it land in different servers. `Mcp-Session-Id` is what carries the
+handshake across that gap: the server mints one when `initialize` settles
+something, returns it in the response header, and the client echoes it on
+everything after. Two things ride on it — which agent made a write, and which
+protocol revision that client agreed to. Without it a shared log recorded every
+write as `mcp` whoever made it, and a client that handshaked at a revision
+older than `structuredContent` was sent the field anyway.
+
+A `DELETE` ends a session. An id this server did not mint gets a **404**, so a
+client holding a stale one finds out rather than being quietly served as a
+stranger. A request carrying *no* session id is still answered, unattributed —
+the same choice this server already makes for a client that never handshakes at
+all.
+
 **No TLS and no OAuth.** The specification's authorization chapter describes an
 OAuth 2.1 resource server, which a bearer token is not. Anything facing a
 hostile network wants a reverse proxy in front that terminates TLS and does the

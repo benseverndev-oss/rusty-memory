@@ -22,19 +22,25 @@
 //! accommodating: exact framing, hard limits, and a refusal for anything it
 //! does not recognise.
 //!
-//! # What it does not do
+//! # Sessions
 //!
-//! **Writes over this transport are not attributed.** A client names itself in
-//! `initialize`, and [`crate::Server`] records that against everything it
-//! writes -- but each request here arrives on its own connection with its own
-//! server, so the handshake and the tool call never meet and every write is
-//! recorded as `mcp`. Over stdio, where the connection lives for the session,
-//! attribution works.
+//! Each request arrives on its own connection with its own
+//! [`Server`](crate::Server), so what `initialize` settles would be gone by
+//! the first tool call. `Mcp-Session-Id` is the transport's own answer: minted
+//! here when a handshake settles something, echoed by the client, and looked
+//! up in [`Sessions`](crate::session::Sessions) to restore it.
 //!
-//! The fix is the transport's own: `Mcp-Session-Id`, minted at `initialize`,
-//! echoed by the client, and looked up here. It is not implemented, and this
-//! says so rather than leaving somebody to find a shared log in which every
-//! entry has the same author.
+//! Two things rode on that and both were broken before it: writes were all
+//! recorded as `mcp` whoever made them, and a legacy client that agreed on a
+//! revision older than `structuredContent` was answered as though it had not.
+//!
+//! **A request with no session id is still served**, unattributed, exactly as
+//! before. The specification would rather have a 400 -- but this server
+//! already chose to answer a client that never handshakes at all, on the
+//! grounds that refusing the easiest client to help is a poor trade, and
+//! refusing it here would be that decision reversed by accident. An id this
+//! server did not mint is a different matter and gets a 404, because a client
+//! that thinks it has a session and does not needs to find out.
 //!
 //! No TLS and no OAuth. The specification's authorization chapter describes an
 //! OAuth 2.1 resource server, which is a great deal more than a bearer token,
@@ -45,10 +51,14 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rm_engine::{Completer, Embedder, Timestamp};
 use rm_host::config::Config;
 use rm_host::HostError;
+
+use crate::session::Sessions;
+use crate::Handshake;
 
 /// The most a request head may be, in bytes.
 ///
@@ -109,14 +119,25 @@ pub fn serve<F, P>(
     F: Fn(&Config) -> Result<P, HostError> + Copy + Send + 'static,
     P: Completer + Embedder,
 {
+    // One table across every connection, which is the point: the handshake
+    // and the calls that depend on it arrive on different ones.
+    let sessions = Arc::new(Sessions::new());
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let config = config.clone();
         let token = guard.token.clone();
+        let sessions = Arc::clone(&sessions);
         // Detached. A panic in one connection takes that connection and not the
         // listener, which is the reason each gets a thread rather than a loop.
         std::thread::spawn(move || {
-            let _ = answer(stream, &config, provider, token.as_deref(), clock);
+            let _ = answer(
+                stream,
+                &config,
+                provider,
+                token.as_deref(),
+                &sessions,
+                clock,
+            );
         });
     }
 }
@@ -126,6 +147,7 @@ fn answer<F, P>(
     config: &Path,
     provider: F,
     token: Option<&str>,
+    sessions: &Sessions,
     clock: fn() -> Timestamp,
 ) -> std::io::Result<()>
 where
@@ -140,6 +162,34 @@ where
     if let Err(s) = head.check(token) {
         return reply(&mut stream, s, "text/plain", s.reason());
     }
+    let now = clock();
+
+    // A client saying it is finished. Answered before the body is read,
+    // because there is not one.
+    if head.method == Method::Delete {
+        let ended = head.session.as_deref().is_some_and(|id| sessions.end(id));
+        let s = if ended {
+            Status::NoContent
+        } else {
+            Status::NotFound
+        };
+        return reply(&mut stream, s, "text/plain", s.reason());
+    }
+
+    // What a previous request settled, if the client named a session. An id
+    // this server did not mint -- or has since dropped -- is a 404 rather than
+    // a quiet fresh start: a client that believes it has a session needs to
+    // learn that it does not, and the answer either way is to handshake again.
+    let resumed = match head.session.as_deref() {
+        None => Handshake::default(),
+        Some(id) => match sessions.resume(id, now) {
+            Some(handshake) => handshake,
+            None => {
+                let s = Status::NotFound;
+                return reply(&mut stream, s, "text/plain", "no such session");
+            }
+        },
+    };
 
     let mut body = vec![0u8; head.length];
     if reader.read_exact(&mut body).is_err() {
@@ -166,20 +216,57 @@ where
         }
     };
 
-    match server.handle(body.trim(), clock()) {
+    server.resume(resumed.clone());
+    let response = server.handle(body.trim(), now);
+
+    // A handshake settles both fields at once and nothing else touches either,
+    // so a change here means this request was an `initialize` -- which is what
+    // decides whether the client leaves with a session id. Comparing the two
+    // beats re-parsing the body to look at the method.
+    let settled = server.handshake();
+    let minted = if settled == resumed {
+        None
+    } else {
+        // Re-handshaking on a live session replaces it rather than stacking a
+        // second row that nothing will ever read.
+        if let Some(old) = head.session.as_deref() {
+            sessions.end(old);
+        }
+        Some(sessions.mint(settled, now))
+    };
+
+    match response {
         // A notification, which MUST NOT be answered. 202 with no body is what
         // the transport says to send instead.
         None => reply(&mut stream, Status::Accepted, "text/plain", ""),
-        Some(response) => reply(&mut stream, Status::Ok, "application/json", &response),
+        Some(response) => reply_as(
+            &mut stream,
+            Status::Ok,
+            "application/json",
+            &response,
+            minted.as_deref(),
+        ),
     }
+}
+
+/// Which of the two methods this server answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Method {
+    /// A message. Everything this server does arrives this way.
+    Post,
+    /// End a session. The one thing a client can ask that is not a message.
+    Delete,
 }
 
 /// What a request said, once it is known to be one this server will answer.
 #[derive(Debug, PartialEq, Eq)]
 struct Head {
+    method: Method,
     length: usize,
     origin: Option<String>,
     authorization: Option<String>,
+    /// `Mcp-Session-Id`, when the client echoed one.
+    session: Option<String>,
 }
 
 impl Head {
@@ -223,14 +310,16 @@ fn read_head(reader: &mut impl BufRead) -> Result<Head, Status> {
         .read_line(&mut line)
         .map_err(|_| Status::BadRequest)?;
 
-    let method = line.split_whitespace().next().unwrap_or_default();
-    if method != "POST" {
+    let method = match line.split_whitespace().next().unwrap_or_default() {
+        "POST" => Method::Post,
+        "DELETE" => Method::Delete,
         // GET included: the standalone stream a GET opens carries
         // server-initiated messages, and this server sends none.
-        return Err(Status::MethodNotAllowed);
-    }
+        _ => return Err(Status::MethodNotAllowed),
+    };
 
     let (mut length, mut origin, mut authorization) = (None, None, None);
+    let mut session = None;
     loop {
         line.clear();
         read += reader
@@ -251,19 +340,24 @@ fn read_head(reader: &mut impl BufRead) -> Result<Head, Status> {
             "content-length" => length = value.parse::<usize>().ok(),
             "origin" => origin = Some(value),
             "authorization" => authorization = Some(value),
+            "mcp-session-id" => session = Some(value),
             _ => {}
         }
     }
 
     // No length, no body, no request. Chunked transfer is refused rather than
-    // half-supported.
-    let Some(length) = length else {
-        return Err(Status::LengthRequired);
+    // half-supported. A DELETE carries nothing, so it is exempt.
+    let length = match (length, method) {
+        (Some(length), _) => length,
+        (None, Method::Delete) => 0,
+        (None, Method::Post) => return Err(Status::LengthRequired),
     };
     Ok(Head {
+        method,
         length,
         origin,
         authorization,
+        session,
     })
 }
 
@@ -271,9 +365,11 @@ fn read_head(reader: &mut impl BufRead) -> Result<Head, Status> {
 enum Status {
     Ok,
     Accepted,
+    NoContent,
     BadRequest,
     Unauthorized,
     Forbidden,
+    NotFound,
     MethodNotAllowed,
     LengthRequired,
     TooLarge,
@@ -285,9 +381,11 @@ impl Status {
         match self {
             Status::Ok => 200,
             Status::Accepted => 202,
+            Status::NoContent => 204,
             Status::BadRequest => 400,
             Status::Unauthorized => 401,
             Status::Forbidden => 403,
+            Status::NotFound => 404,
             Status::MethodNotAllowed => 405,
             Status::LengthRequired => 411,
             Status::TooLarge => 413,
@@ -302,9 +400,11 @@ impl Status {
         match self {
             Status::Ok => "OK",
             Status::Accepted => "Accepted",
+            Status::NoContent => "No Content",
             Status::BadRequest => "Bad Request",
             Status::Unauthorized => "Unauthorized",
             Status::Forbidden => "Forbidden",
+            Status::NotFound => "Not Found",
             Status::MethodNotAllowed => "Method Not Allowed",
             Status::LengthRequired => "Length Required",
             Status::TooLarge => "Payload Too Large",
@@ -314,15 +414,38 @@ impl Status {
 }
 
 fn reply(out: &mut impl Write, status: Status, kind: &str, body: &str) -> std::io::Result<()> {
-    write!(
-        out,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        status.code(),
-        status.reason(),
-        kind,
-        body.len(),
-        body
-    )?;
+    reply_as(out, status, kind, body, None)
+}
+
+/// A reply that may hand the client a session id.
+///
+/// `session` is written only where there is one to give, which is the response
+/// to the `initialize` that minted it. Every later reply is on a connection
+/// whose session the client already holds.
+fn reply_as(
+    out: &mut impl Write,
+    status: Status,
+    kind: &str,
+    body: &str,
+    session: Option<&str>,
+) -> std::io::Result<()> {
+    write!(out, "HTTP/1.1 {} {}\r\n", status.code(), status.reason())?;
+    if let Some(id) = session {
+        write!(out, "Mcp-Session-Id: {id}\r\n")?;
+    }
+    // 204 means what it says: no body, and none of the headers describing one.
+    if status != Status::NoContent {
+        write!(
+            out,
+            "Content-Type: {}\r\nContent-Length: {}\r\n",
+            kind,
+            body.len()
+        )?;
+    }
+    write!(out, "Connection: close\r\n\r\n")?;
+    if status != Status::NoContent {
+        write!(out, "{body}")?;
+    }
     out.flush()
 }
 
@@ -360,6 +483,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_session_id_is_read_and_its_absence_is_not_an_error() {
+        let h = head("POST /mcp HTTP/1.1\r\nContent-Length: 3\r\nMcp-Session-Id: abc123\r\n\r\n")
+            .unwrap();
+        assert_eq!(h.session.as_deref(), Some("abc123"));
+
+        // Case-insensitive, like every other header here.
+        let h =
+            head("POST /mcp HTTP/1.1\r\ncontent-length: 3\r\nMCP-SESSION-ID: xyz\r\n\r\n").unwrap();
+        assert_eq!(h.session.as_deref(), Some("xyz"));
+
+        // A client that never handshaked sends none, and is still served.
+        let h = head("POST /mcp HTTP/1.1\r\nContent-Length: 3\r\n\r\n").unwrap();
+        assert_eq!(h.session, None);
+    }
+
+    /// `DELETE` ends a session and carries no body, so it is the one method
+    /// exempt from `Content-Length`. `GET` is still refused.
+    #[test]
+    fn delete_is_answered_and_needs_no_length_but_get_is_still_not() {
+        let h = head("DELETE /mcp HTTP/1.1\r\nMcp-Session-Id: abc\r\n\r\n").unwrap();
+        assert_eq!(h.method, Method::Delete);
+        assert_eq!(h.length, 0);
+        assert_eq!(h.session.as_deref(), Some("abc"));
+
+        assert_eq!(
+            head("GET /mcp HTTP/1.1\r\n\r\n"),
+            Err(Status::MethodNotAllowed),
+            "the stream a GET opens carries messages this server never sends"
+        );
+        assert_eq!(
+            head("PUT /mcp HTTP/1.1\r\nContent-Length: 1\r\n\r\n"),
+            Err(Status::MethodNotAllowed)
+        );
+    }
+
+    /// A session id is checked *after* the token, not instead of it.
+    ///
+    /// Worth pinning: the session table is not an access control mechanism and
+    /// this asserts nothing accidentally starts treating it as one.
+    #[test]
+    fn a_session_id_does_not_stand_in_for_a_token() {
+        let h = Head {
+            method: Method::Post,
+            length: 10,
+            origin: None,
+            authorization: None,
+            session: Some("a-known-looking-id".into()),
+        };
+        assert_eq!(h.check(Some("secret")), Err(Status::Unauthorized));
+    }
+
     /// A request carrying `Origin` is a browser, and this server has none.
     ///
     /// The specification requires the check by name: without it a page on any
@@ -367,9 +542,11 @@ mod tests {
     #[test]
     fn a_browser_origin_is_forbidden_even_with_a_good_token() {
         let h = Head {
+            method: Method::Post,
             length: 10,
             origin: Some("https://evil.example".into()),
             authorization: Some("Bearer secret".into()),
+            session: None,
         };
         assert_eq!(h.check(Some("secret")), Err(Status::Forbidden));
     }
@@ -377,9 +554,11 @@ mod tests {
     #[test]
     fn a_token_is_required_when_one_is_configured() {
         let with = |auth: Option<&str>| Head {
+            method: Method::Post,
             length: 10,
             origin: None,
             authorization: auth.map(str::to_string),
+            session: None,
         };
         assert_eq!(with(None).check(Some("secret")), Err(Status::Unauthorized));
         assert_eq!(
@@ -399,9 +578,11 @@ mod tests {
     #[test]
     fn a_body_over_the_limit_is_refused_before_it_is_read() {
         let h = Head {
+            method: Method::Post,
             length: MAX_BODY + 1,
             origin: None,
             authorization: None,
+            session: None,
         };
         assert_eq!(h.check(None), Err(Status::TooLarge));
     }

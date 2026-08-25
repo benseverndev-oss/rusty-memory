@@ -103,6 +103,28 @@ where
     client: Option<String>,
 }
 
+/// What `initialize` settled, for a transport that must carry it itself.
+///
+/// Over stdio the connection is the session: one [`Server`] handshakes and
+/// then answers every call, so this never leaves it. Streamable HTTP gives
+/// each request its own connection and its own `Server`, so the handshake and
+/// the calls after it land in different ones -- and both fields below are set
+/// by the first and read by the rest.
+///
+/// Losing them is two separate bugs, which is why they travel together:
+/// unattributed writes, and a legacy client sent a field it cannot read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Handshake {
+    /// What the client called itself. Recorded against everything it writes.
+    pub client: Option<String>,
+    /// The revision a legacy `initialize` agreed on.
+    ///
+    /// Load-bearing rather than bookkeeping: `structuredContent` exists from
+    /// `2025-06-18`, and a client that settled on something older and is
+    /// answered as though it had not gets a field its parser has never seen.
+    pub negotiated: Option<String>,
+}
+
 impl<P, F> Server<P, F>
 where
     P: Completer + Embedder,
@@ -135,6 +157,29 @@ where
             negotiated: None,
             client: None,
         })
+    }
+
+    /// What a handshake settled, for a transport that must carry it itself.
+    ///
+    /// Both fields at once, because they are lost together and for the same
+    /// reason: they are set by `initialize` and read by every call after it,
+    /// which over a connection-per-request transport is a different [`Server`].
+    /// See [`Handshake`].
+    pub fn handshake(&self) -> Handshake {
+        Handshake {
+            client: self.client.clone(),
+            negotiated: self.negotiated.clone(),
+        }
+    }
+
+    /// Restore what a previous request's handshake settled.
+    ///
+    /// The counterpart to [`Server::handshake`], and only for a transport
+    /// holding the session itself. On stdio the connection *is* the session
+    /// and nothing calls this.
+    pub fn resume(&mut self, handshake: Handshake) {
+        self.client = handshake.client;
+        self.negotiated = handshake.negotiated;
     }
 
     /// Read messages until the input ends.

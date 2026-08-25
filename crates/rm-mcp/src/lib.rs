@@ -55,10 +55,11 @@ pub mod http;
 pub mod jsonrpc;
 pub mod render;
 pub mod serve;
+pub mod session;
 pub mod tools;
 pub mod version;
 
-pub use serve::Server;
+pub use serve::{Handshake, Server};
 
 /// The `_meta` key carrying a request's protocol version.
 ///
