@@ -139,7 +139,10 @@ fn position(scope: Option<String>, all: bool) -> Option<String> {
     if all {
         return None;
     }
-    scope.or_else(|| std::env::var(crate::tools::SCOPE_ENV).ok())
+    // Normalised rather than taken raw: `RMEM_SCOPE=` in a shell, or an empty
+    // string in a JSON `env` block, reads as "not configured" and would
+    // otherwise be the root position, where only `*` reaches.
+    rm_host::scope::position(scope.or_else(|| std::env::var(crate::tools::SCOPE_ENV).ok()))
 }
 
 impl<P, F> Server<P, F>
