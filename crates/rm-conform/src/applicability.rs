@@ -11,7 +11,8 @@
 //!
 //! # This module never imports `rm_host::scope`
 //!
-//! Not `applies_at`, not `validate`, not `UNIVERSAL`. An oracle derived from
+//! Not `applies_at`, not `validate`, not `UNIVERSAL`, from `rm_core::scope`
+//! or its `rm_host` re-export. An oracle derived from
 //! the code it judges is not an oracle. Scopes reach the store through
 //! `command::decide` and `command::plan_rescope` like any other caller, so the
 //! store is exercised normally; only the *expectation* is computed here.
@@ -371,6 +372,64 @@ pub fn rescope_history(seeds: std::ops::Range<u64>, params: &Params) -> bool {
     })
 }
 
+/// The titles a scoped recall returns, sorted.
+///
+/// `k` is far above the decision count, so this measures *which* assertions
+/// come back rather than how many fit -- a smaller `k` would confound the
+/// filter with the cut and make a disagreement unattributable.
+pub fn recall_visible(engine: &Engine, position: &str) -> Vec<String> {
+    let q = rm_engine::Query::new(vec![1.0, 0.0, 0.0], 1_000).at(position);
+    // `Recalled::name` already carries the entity's name -- the field exists
+    // because "every caller wants it and the engine already holds it" -- so no
+    // second lookup per hit.
+    let mut out: Vec<String> = engine
+        .recall(&q)
+        .expect("recall cannot fail on a store this builds")
+        .into_iter()
+        .filter(|r| r.attribute == "choice")
+        .filter_map(|r| r.name)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Every title a recall returns with no position at all, sorted.
+///
+/// The unfiltered baseline. Note it is *not* `recall_visible(e, "*")`: as a
+/// scope `*` means everywhere, but as a *position* it is the root, where only
+/// universal-scoped decisions reach. It is the narrowest position, not the
+/// widest, and using it as a baseline would make the vacuity guard compare a
+/// filtered set against a smaller filtered set.
+pub fn recall_unfiltered(engine: &Engine) -> Vec<String> {
+    let q = rm_engine::Query::new(vec![1.0, 0.0, 0.0], 1_000);
+    let mut out: Vec<String> = engine
+        .recall(&q)
+        .expect("recall cannot fail on a store this builds")
+        .into_iter()
+        .filter(|r| r.attribute == "choice")
+        .filter_map(|r| r.name)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Whether a scoped recall and the oracle agree on every generated world.
+///
+/// The same expectation `applicability agreement` uses, against a different
+/// read path. `decisions` filters in the host and `recall` filters inside the
+/// index scan, so agreeing on one says nothing about the other.
+pub fn recall_agreement(seeds: std::ops::Range<u64>, params: &Params) -> bool {
+    seeds.into_iter().all(|seed| {
+        let w = world(seed, params);
+        let e = build(&w);
+        w.positions
+            .iter()
+            .all(|p| recall_visible(&e, p) == expected(&w, p))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,7 +477,12 @@ mod tests {
     #[test]
     fn this_module_does_not_import_the_code_it_judges() {
         let me = include_str!("applicability.rs");
-        for banned in ["rm_host::scope", "scope::applies_at", "scope::UNIVERSAL"] {
+        for banned in [
+            "rm_host::scope",
+            "rm_core::scope",
+            "scope::applies_at",
+            "scope::UNIVERSAL",
+        ] {
             let uses = me
                 .lines()
                 .filter(|l| l.trim_start().starts_with("use "))
@@ -645,6 +709,34 @@ mod tests {
             e.store_history(entity, "scope").len(),
             1,
             "re-stating a reach wrote a second version"
+        );
+    }
+
+    #[test]
+    fn a_scoped_recall_returns_exactly_what_applies() {
+        assert!(
+            recall_agreement(0..40, &Params::default()),
+            "a scoped recall disagreed with the oracle on some (world, position)"
+        );
+    }
+
+    /// The guard that matters for this row: the filter has to exclude
+    /// something similarity would otherwise have returned. A recall row that
+    /// never excludes anything reports 1.000 having measured the generator.
+    #[test]
+    fn the_recall_filter_actually_excludes_something() {
+        let params = Params::default();
+        let excluded = (0..40).any(|seed| {
+            let w = world(seed, &params);
+            let e = build(&w);
+            let unscoped = recall_unfiltered(&e);
+            w.positions
+                .iter()
+                .any(|p| recall_visible(&e, p).len() < unscoped.len())
+        });
+        assert!(
+            excluded,
+            "no position ever narrowed a recall, so the row measures the              generator rather than the filter"
         );
     }
 }

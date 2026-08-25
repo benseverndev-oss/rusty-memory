@@ -494,8 +494,9 @@ pub fn recall(
     k: usize,
     embedder: &impl Embedder,
     weak_below: f32,
+    here: Option<&str>,
 ) -> Result<Outcome, HostError> {
-    commit_recall(engine, plan_recall(query, embedder)?, k, weak_below)
+    commit_recall(engine, plan_recall(query, embedder)?, k, weak_below, here)
 }
 
 /// Embed a query, touching no store.
@@ -515,9 +516,17 @@ pub fn commit_recall(
     embedding: Vec<f32>,
     k: usize,
     weak_below: f32,
+    here: Option<&str>,
 ) -> Result<Outcome, HostError> {
+    // The position filters inside the index scan rather than over a fetched
+    // page, so `k` still means "k results that apply" rather than "k
+    // candidates, some of which survive".
+    let mut query = Query::new(embedding, k);
+    if let Some(here) = here {
+        query = query.at(here);
+    }
     let hits = engine
-        .recall(&Query::new(embedding, k))
+        .recall(&query)
         .map_err(|e| HostError::Refused(e.to_string()))?;
     Ok(Outcome::Recalled { hits, weak_below })
 }
@@ -2608,7 +2617,8 @@ pub(crate) mod tests {
         let query = stub
             .embed("decision Pin the compiler: choice is rust-toolchain.toml names the version")
             .unwrap();
-        let Outcome::Recalled { hits: was, .. } = commit_recall(&e, query.clone(), 5, 0.0).unwrap()
+        let Outcome::Recalled { hits: was, .. } =
+            commit_recall(&e, query.clone(), 5, 0.0, None).unwrap()
         else {
             panic!()
         };
@@ -2616,7 +2626,8 @@ pub(crate) mod tests {
         let plan = plan_reindex(reindex_texts(&e).unwrap(), &stub, 3, Metric::Cosine).unwrap();
         commit_reindex(&mut e, plan).unwrap();
 
-        let Outcome::Recalled { hits: now, .. } = commit_recall(&e, query, 5, 0.0).unwrap() else {
+        let Outcome::Recalled { hits: now, .. } = commit_recall(&e, query, 5, 0.0, None).unwrap()
+        else {
             panic!()
         };
         assert_eq!(was.len(), now.len());
@@ -3369,7 +3380,7 @@ pub(crate) mod tests {
         let stub = StubProvider::new(vec![EXTRACTION]);
         remember(&mut e, "I work at Globex", 100, "cli", None, &stub, &stub).unwrap();
 
-        let out = recall(&e, "Ben works at Globex", 5, &stub, 0.0).unwrap();
+        let out = recall(&e, "Ben works at Globex", 5, &stub, 0.0, None).unwrap();
         let Outcome::Recalled { hits, .. } = out else {
             panic!("{out:?}")
         };
@@ -3381,7 +3392,7 @@ pub(crate) mod tests {
     fn recalling_an_empty_store_is_an_empty_answer_not_a_failure() {
         let e = engine();
         let stub = StubProvider::new(vec![]);
-        let out = recall(&e, "anything", 5, &stub, 0.0).unwrap();
+        let out = recall(&e, "anything", 5, &stub, 0.0, None).unwrap();
         let Outcome::Recalled { hits, .. } = out else {
             panic!("{out:?}")
         };

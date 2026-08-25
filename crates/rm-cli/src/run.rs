@@ -299,8 +299,15 @@ pub fn run(
 
         store::with_read(&path, ruleset, policy, dimension, metric, |engine| {
             match (command, query_vector) {
-                (Command::Recall { k, .. }, Some(vector)) => {
-                    command::commit_recall(engine, vector, k, weak_below)
+                (Command::Recall { k, scope, all, .. }, Some(vector)) => {
+                    // `--all` beats `--scope`, which beats the environment.
+                    // `None` is no position, which suspends the rule.
+                    let here = rm_host::scope::position(if all {
+                        None
+                    } else {
+                        scope.or_else(|| session_scope.clone())
+                    });
+                    command::commit_recall(engine, vector, k, weak_below, here.as_deref())
                 }
                 (
                     Command::About {

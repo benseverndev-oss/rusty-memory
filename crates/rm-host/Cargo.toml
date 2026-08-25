@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+rm-core = { workspace = true }
 rm-engine = { workspace = true }
 rm-extract = { workspace = true }
 rm-providers = { workspace = true }

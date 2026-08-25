@@ -4434,4 +4434,71 @@ mod tests {
             "Globex should still be reachable"
         );
     }
+
+    /// Write one assertion, optionally giving its entity a reach, and return
+    /// the entity. The scope goes in as an ordinary attribute because that is
+    /// how `decide` writes it, and the filter has to find it the same way.
+    fn scoped(e: &mut Engine, scope: Option<&str>, attribute: &str, at: Timestamp) -> StableId {
+        let (id, _) = e
+            .remember_as(None, observation(attribute, attribute, "a value", at))
+            .expect("pinned write");
+        if let Some(scope) = scope {
+            e.remember_as(Some(id), observation(attribute, "scope", scope, at))
+                .expect("pinned write");
+        }
+        id
+    }
+
+    /// A recall answers from where it is asked. The filter runs inside the
+    /// scan, so `k` still means "k results that apply" rather than "k
+    /// candidates, some of which survive".
+    #[test]
+    fn a_recall_returns_only_what_reaches_the_position_it_was_asked_from() {
+        let mut e = engine();
+        scoped(&mut e, Some("*"), "everywhere", 1_000);
+        scoped(&mut e, Some("work/goldenmatch"), "here", 1_100);
+        scoped(&mut e, Some("work/other"), "sibling", 1_200);
+
+        let named = |hits: Vec<Recalled>| {
+            let mut v: Vec<String> = hits
+                .into_iter()
+                .filter(|r| r.attribute != "scope")
+                .map(|r| r.attribute)
+                .collect();
+            v.sort();
+            v
+        };
+
+        let all = named(e.recall(&Query::new(vec![1.0, 0.0, 0.0], 50)).unwrap());
+        assert_eq!(all, vec!["everywhere", "here", "sibling"], "unscoped");
+
+        let here = named(
+            e.recall(&Query::new(vec![1.0, 0.0, 0.0], 50).at("work/goldenmatch"))
+                .unwrap(),
+        );
+        assert_eq!(
+            here,
+            vec!["everywhere", "here"],
+            "the universal one and this project's, not the sibling"
+        );
+
+        let elsewhere = named(
+            e.recall(&Query::new(vec![1.0, 0.0, 0.0], 50).at("personal"))
+                .unwrap(),
+        );
+        assert_eq!(elsewhere, vec!["everywhere"], "only the universal one");
+    }
+
+    /// An entity with no scope recorded reaches everywhere, exactly as in the
+    /// decision reads. `remember`'s facts carry none, so a scoped recall must
+    /// never hide them.
+    #[test]
+    fn an_assertion_whose_entity_has_no_scope_is_never_hidden() {
+        let mut e = engine();
+        scoped(&mut e, None, "unscoped", 1_000);
+        let hits = e
+            .recall(&Query::new(vec![1.0, 0.0, 0.0], 50).at("anywhere/at/all"))
+            .unwrap();
+        assert_eq!(hits.len(), 1, "no scope recorded means it reaches here");
+    }
 }

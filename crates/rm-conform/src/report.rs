@@ -5,7 +5,7 @@
 //! is, with some irony, the exact failure this harness found twice in the
 //! codebase it measures.
 
-use crate::applicability::{self, agreement, depth_monotonic, rescope_history};
+use crate::applicability::{self, agreement, depth_monotonic, recall_agreement, rescope_history};
 use crate::differential::{default_strategies, refusal_agreement, sweep, Disagreement};
 use crate::generate::{generate, Params};
 use crate::invariants::{monotonic_in_transaction_time, order_independent, probe_grid};
@@ -98,6 +98,10 @@ pub fn table() -> String {
         "| rescope keeps its history | {} |\n",
         verdict(rescope_history(0..SCOPE_SEEDS, &scope_params))
     ));
+    out.push_str(&format!(
+        "| recall applicability | {} |\n",
+        verdict(recall_agreement(0..SCOPE_SEEDS, &scope_params))
+    ));
 
     out.push_str(&format!(
         "\n{} of {comparisons} comparisons reached a refusal, {} answered. \
@@ -132,6 +136,7 @@ mod tests {
             "applicability agreement",
             "depth monotonicity",
             "rescope keeps its history",
+            "recall applicability",
         ] {
             assert!(t.contains(row), "row missing from the table: {row}\n{t}");
         }
