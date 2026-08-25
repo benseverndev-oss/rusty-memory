@@ -558,6 +558,7 @@ where
                     valid: valid_at.unwrap_or(Timestamp::MAX),
                     tx: as_of.unwrap_or(Timestamp::MAX),
                 },
+                None,
             ),
             (
                 Call::Decision {
@@ -573,6 +574,7 @@ where
                     valid: valid_at.unwrap_or(Timestamp::MAX),
                     tx: as_of.unwrap_or(Timestamp::MAX),
                 },
+                None,
             ),
             (other, _) => unreachable!("{other:?} writes, or was not planned"),
         }

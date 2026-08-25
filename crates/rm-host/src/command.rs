@@ -189,6 +189,19 @@ pub enum Found {
         /// The first moment it claims to have held.
         first_held: Timestamp,
     },
+    /// The title resolves, and the decision does not reach where it was asked
+    /// from.
+    ///
+    /// Distinct from `Unknown` for the same reason `NotYetRecorded` is: the
+    /// title matched, so "no decision by that title" would read as a spelling
+    /// mistake. You named it exactly, so you are told where it lives.
+    NotHere {
+        title: String,
+        /// The reach the decision states.
+        scope: String,
+        /// The position it was asked from.
+        asked_from: String,
+    },
     /// No decision by that title.
     Unknown,
 }
@@ -865,7 +878,12 @@ fn held(engine: &Engine, id: StableId, attr: &str, at: At) -> Option<String> {
 }
 
 /// Every decision the store holds, most recently recorded first.
-pub fn decisions(engine: &Engine, only: Option<&str>, at: At) -> Result<Outcome, HostError> {
+pub fn decisions(
+    engine: &Engine,
+    only: Option<&str>,
+    at: At,
+    here: Option<&str>,
+) -> Result<Outcome, HostError> {
     // Checked before the scan rather than silently matching nothing. A status
     // nobody uses and a status that does not exist both return an empty list,
     // and the difference between "we have never rejected anything" and "you
@@ -885,6 +903,14 @@ pub fn decisions(engine: &Engine, only: Option<&str>, at: At) -> Result<Outcome,
         };
         if record.get("kind") != Some("decision") {
             continue;
+        }
+        // A decision with no scope recorded reaches everywhere. That is not a
+        // default for new writes -- those are refused without one -- it is how
+        // records written before scopes existed read, so nothing vanishes.
+        if let (Some(here), Some(reach)) = (here, held(engine, id, "scope", at)) {
+            if !crate::scope::applies_at(&reach, here) {
+                continue;
+            }
         }
         // Not visible at `at` means the store had not heard of it yet, and the
         // existing `continue` is exactly the "absent from the list" answer.
@@ -1040,7 +1066,12 @@ pub fn commit_reindex(engine: &mut Engine, plan: ReindexPlan) -> Result<Outcome,
 /// replaced; this says by what, and walks the chain to whatever stands now, so
 /// a reader who arrives at a retired decision is carried to the live one
 /// rather than left to guess.
-pub fn decision(engine: &Engine, title: &str, at: At) -> Result<Outcome, HostError> {
+pub fn decision(
+    engine: &Engine,
+    title: &str,
+    at: At,
+    here: Option<&str>,
+) -> Result<Outcome, HostError> {
     let Some(id) = find_decision(engine, title) else {
         return Ok(Outcome::Decision(Found::Unknown));
     };
@@ -1068,6 +1099,17 @@ pub fn decision(engine: &Engine, title: &str, at: At) -> Result<Outcome, HostErr
             first_recorded,
             first_held,
         }));
+    }
+    // Existence first, reach second. A decision the store had not heard of yet
+    // is a different answer from one it has heard of and that does not apply.
+    if let (Some(here), Some(reach)) = (here, held(engine, id, "scope", at)) {
+        if !crate::scope::applies_at(&reach, here) {
+            return Ok(Outcome::Decision(Found::NotHere {
+                title: title.to_string(),
+                scope: reach,
+                asked_from: here.to_string(),
+            }));
+        }
     }
     let history: Vec<(Timestamp, String)> = visible(engine, id, "choice", at)
         .iter()
@@ -1550,6 +1592,117 @@ pub(crate) mod tests {
 
     // ---- decisions ---------------------------------------------------------
 
+    /// Three decisions at three reaches, asked from one position.
+    #[test]
+    fn a_read_returns_what_applies_where_it_is_asked_from() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        let mut t = 1_000;
+        for (title, scope) in [
+            ("Machine wide", "*"),
+            ("Work wide", "work"),
+            ("This project", "work/goldenmatch"),
+            ("A sibling", "work/other"),
+            ("Personal", "personal"),
+        ] {
+            decide(
+                &mut e, title, "a choice", scope, None, None, None, None, None, t, "t", &stub,
+            )
+            .unwrap();
+            t += 10;
+        }
+
+        let titles = |here: Option<&str>| {
+            let Outcome::Decisions(ds) = decisions(&e, None, At::latest(), here).unwrap() else {
+                panic!("decisions did not return decisions")
+            };
+            let mut out: Vec<String> = ds.into_iter().map(|d| d.title).collect();
+            out.sort();
+            out
+        };
+
+        assert_eq!(
+            titles(Some("work/goldenmatch")),
+            vec![
+                "Machine wide".to_string(),
+                "This project".to_string(),
+                "Work wide".to_string()
+            ],
+            "ancestor-or-self, and nothing beside it"
+        );
+        assert_eq!(
+            titles(Some("personal")),
+            vec!["Machine wide".to_string(), "Personal".to_string()]
+        );
+        // No position, no filtering. This is `--all`, and it is also every
+        // caller that never set RMEM_SCOPE.
+        assert_eq!(titles(None).len(), 5);
+    }
+
+    /// An exact title that exists but does not reach here is its own answer,
+    /// for the same reason `NotYetRecorded` is: the title resolved, so "no
+    /// decision by that title" would read as a spelling mistake.
+    #[test]
+    fn a_title_out_of_reach_says_where_it_lives() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "A sibling",
+            "a choice",
+            "work/other",
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_000,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision(&e, "A sibling", At::latest(), Some("work/goldenmatch")).unwrap(),
+            Outcome::Decision(Found::NotHere {
+                title: "A sibling".to_string(),
+                scope: "work/other".to_string(),
+                asked_from: "work/goldenmatch".to_string(),
+            })
+        );
+
+        // Asked from where it lives, or from nowhere, it is just a decision.
+        for here in [Some("work/other"), None] {
+            assert!(matches!(
+                decision(&e, "A sibling", At::latest(), here).unwrap(),
+                Outcome::Decision(Found::Decision(_))
+            ));
+        }
+    }
+
+    /// The precondition the legacy rule rests on: an unwritten scope reads as
+    /// `None`, and `None` means the rule does not apply rather than that the
+    /// decision fails it.
+    #[test]
+    fn a_decision_with_no_scope_recorded_reaches_everywhere() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e, "Legacy", "a choice", "work", None, None, None, None, None, 1_000, "t", &stub,
+        )
+        .unwrap();
+        let id = find_decision(&e, "Legacy").expect("recorded");
+        let before = At {
+            valid: Timestamp::MAX,
+            tx: 999,
+        };
+        assert_eq!(
+            held(&e, id, "scope", before),
+            None,
+            "no scope at that clock"
+        );
+    }
+
     /// A scope is required and validated before the embedder is called, so a
     /// typo costs nothing -- the same bargain the status check already makes.
     #[test]
@@ -1646,6 +1799,7 @@ pub(crate) mod tests {
                 valid: Timestamp::MAX,
                 tx: MARCH,
             },
+            None,
         )
         .unwrap() else {
             panic!("not a decision outcome")
@@ -1670,7 +1824,8 @@ pub(crate) mod tests {
                 At {
                     valid: 1,
                     tx: Timestamp::MAX
-                }
+                },
+                None
             )
             .unwrap(),
             Outcome::Decision(Found::NotYetRecorded { .. })
@@ -1678,13 +1833,13 @@ pub(crate) mod tests {
 
         // A title nobody ever used is a different answer.
         assert_eq!(
-            decision(&e, "Never decided", At::latest()).unwrap(),
+            decision(&e, "Never decided", At::latest(), None).unwrap(),
             Outcome::Decision(Found::Unknown)
         );
 
         // And now, it is there.
         let Outcome::Decision(Found::Decision(d)) =
-            decision(&e, "Pin the compiler", At::latest()).unwrap()
+            decision(&e, "Pin the compiler", At::latest(), None).unwrap()
         else {
             panic!("expected a decision")
         };
@@ -1731,7 +1886,8 @@ pub(crate) mod tests {
         .unwrap();
 
         let stands = |at: At| {
-            let Outcome::Decision(Found::Decision(d)) = decision(&e, "First", at).unwrap() else {
+            let Outcome::Decision(Found::Decision(d)) = decision(&e, "First", at, None).unwrap()
+            else {
                 panic!("expected a decision")
             };
             (d.still_stands, d.superseded_by.len())
@@ -1804,7 +1960,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let titles = |at: At| {
-            let Outcome::Decisions(ds) = decisions(&e, None, at).unwrap() else {
+            let Outcome::Decisions(ds) = decisions(&e, None, at, None).unwrap() else {
                 panic!("decisions did not return decisions")
             };
             ds.into_iter()
@@ -1911,7 +2067,7 @@ pub(crate) mod tests {
 
     /// Every decision in the store, as (title, entity, still standing).
     fn recorded(e: &mut Engine) -> Vec<(String, StableId, bool)> {
-        let Outcome::Decisions(ds) = decisions(e, None, At::latest()).unwrap() else {
+        let Outcome::Decisions(ds) = decisions(e, None, At::latest(), None).unwrap() else {
             panic!("decisions did not return decisions")
         };
         ds.iter()
@@ -2201,7 +2357,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decisions(lines) = decisions(&e, None, At::latest()).unwrap() else {
+        let Outcome::Decisions(lines) = decisions(&e, None, At::latest(), None).unwrap() else {
             panic!()
         };
         let queue: Vec<_> = lines.iter().filter(|l| l.title == "Pick a queue").collect();
@@ -2386,7 +2542,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let Outcome::Decision(Found::Decision(d)) =
-            decision(&e, "Pin the compiler", At::latest()).unwrap()
+            decision(&e, "Pin the compiler", At::latest(), None).unwrap()
         else {
             panic!()
         };
@@ -2426,7 +2582,8 @@ pub(crate) mod tests {
             &mut e, "Plain", "a choice", "work", None, None, None, None, None, NOW, "t", &stub,
         )
         .unwrap();
-        let Outcome::Decision(Found::Decision(d)) = decision(&e, "Plain", At::latest()).unwrap()
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Plain", At::latest(), None).unwrap()
         else {
             panic!()
         };
@@ -2455,7 +2612,7 @@ pub(crate) mod tests {
         }
 
         let titles = |only: Option<&str>| {
-            let Outcome::Decisions(l) = decisions(&e, only, At::latest()).unwrap() else {
+            let Outcome::Decisions(l) = decisions(&e, only, At::latest(), None).unwrap() else {
                 panic!()
             };
             let mut t: Vec<String> = l.iter().map(|d| d.title.clone()).collect();
@@ -2480,7 +2637,8 @@ pub(crate) mod tests {
     #[test]
     fn filtering_by_a_status_that_does_not_exist_is_refused() {
         let e = engine();
-        let Err(HostError::Refused(why)) = decisions(&e, Some("declined"), At::latest()) else {
+        let Err(HostError::Refused(why)) = decisions(&e, Some("declined"), At::latest(), None)
+        else {
             panic!("a bad status should be refused")
         };
         assert!(
@@ -2489,7 +2647,7 @@ pub(crate) mod tests {
         );
         // `superseded` is not settable by `decide`, but it is a real status a
         // decision can hold, so filtering by it has to work.
-        assert!(decisions(&e, Some("superseded"), At::latest()).is_ok());
+        assert!(decisions(&e, Some("superseded"), At::latest(), None).is_ok());
     }
 
     /// An option considered and turned down is recordable as one.
@@ -2520,7 +2678,7 @@ pub(crate) mod tests {
         .unwrap();
 
         let Outcome::Decision(Found::Decision(d)) =
-            decision(&e, "Rerank the recall results", At::latest()).unwrap()
+            decision(&e, "Rerank the recall results", At::latest(), None).unwrap()
         else {
             panic!()
         };
@@ -2567,7 +2725,7 @@ pub(crate) mod tests {
         }
         // And nothing was written on the way through.
         assert_eq!(
-            decision(&e, "Some title", At::latest()).unwrap(),
+            decision(&e, "Some title", At::latest(), None).unwrap(),
             Outcome::Decision(Found::Unknown)
         );
     }
@@ -2613,7 +2771,8 @@ pub(crate) mod tests {
             &mut e, "Plain", "a choice", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
-        let Outcome::Decision(Found::Decision(d)) = decision(&e, "Plain", At::latest()).unwrap()
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Plain", At::latest(), None).unwrap()
         else {
             panic!()
         };
@@ -2649,7 +2808,7 @@ pub(crate) mod tests {
         }
 
         let Outcome::Decision(Found::Decision(d)) =
-            decision(&e, "Store as one JSON file", At::latest()).unwrap()
+            decision(&e, "Store as one JSON file", At::latest(), None).unwrap()
         else {
             panic!("the oldest decision should be readable")
         };
@@ -2665,7 +2824,7 @@ pub(crate) mod tests {
 
         // And back the other way, from the live one.
         let Outcome::Decision(Found::Decision(d)) =
-            decision(&e, "Store in Postgres", At::latest()).unwrap()
+            decision(&e, "Store in Postgres", At::latest(), None).unwrap()
         else {
             panic!()
         };
@@ -2726,7 +2885,8 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decision(Found::Decision(d)) = decision(&e, "A", At::latest()).unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) = decision(&e, "A", At::latest(), None).unwrap()
+        else {
             panic!()
         };
         // Exactly one hop each way, then the revisit stops it. Asserted
@@ -2780,7 +2940,8 @@ pub(crate) mod tests {
         )
         .expect("naming itself must not fail the write");
 
-        let Outcome::Decision(Found::Decision(d)) = decision(&e, "Only one", At::latest()).unwrap()
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Only one", At::latest(), None).unwrap()
         else {
             panic!()
         };
@@ -2793,7 +2954,7 @@ pub(crate) mod tests {
     fn reading_a_decision_that_does_not_exist_says_so() {
         let e = engine();
         assert_eq!(
-            decision(&e, "never recorded", At::latest()).unwrap(),
+            decision(&e, "never recorded", At::latest(), None).unwrap(),
             Outcome::Decision(Found::Unknown)
         );
     }
@@ -2922,7 +3083,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decisions(lines) = decisions(&e, None, At::latest()).unwrap() else {
+        let Outcome::Decisions(lines) = decisions(&e, None, At::latest(), None).unwrap() else {
             panic!()
         };
         assert_eq!(lines.len(), 1);

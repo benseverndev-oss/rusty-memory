@@ -218,6 +218,24 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }
         }
 
+        // `found: true` with `applies_here: false`, never `found: false`: the
+        // title is real, and telling a model otherwise is telling it something
+        // untrue about its own store.
+        Outcome::Decision(Found::NotHere {
+            title,
+            scope,
+            asked_from,
+        }) => Rendered {
+            text: format!(
+                "{title:?} is on record, but it does not apply here. It reaches {scope:?}                  and you asked from {asked_from:?}. Pass scope={scope:?} to ask from there,                  or all=true to ignore reach."
+            ),
+            structured: json!({
+                "found": true,
+                "applies_here": false,
+                "scope": scope,
+                "asked_from": asked_from,
+            }),
+        },
         Outcome::Decision(Found::Unknown) => Rendered {
             text: "No decision has that title. Titles are matched exactly -- call `decisions` to see them as recorded.".to_string(),
             structured: json!({"found": false}),

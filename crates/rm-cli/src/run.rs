@@ -320,6 +320,7 @@ pub fn run(
                         valid: valid_at.unwrap_or(Timestamp::MAX),
                         tx: as_of.unwrap_or(Timestamp::MAX),
                     },
+                    None,
                 ),
                 (
                     Command::Decision {
@@ -335,6 +336,7 @@ pub fn run(
                         valid: valid_at.unwrap_or(Timestamp::MAX),
                         tx: as_of.unwrap_or(Timestamp::MAX),
                     },
+                    None,
                 ),
                 (Command::Init { .. }, _) => unreachable!("handled above"),
                 (other, _) => unreachable!("{other:?} writes, or was not planned"),
