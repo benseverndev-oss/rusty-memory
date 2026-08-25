@@ -242,6 +242,37 @@ pub fn agreement(seeds: std::ops::Range<u64>, params: &Params) -> bool {
     })
 }
 
+/// Whether descending the tree only ever adds.
+///
+/// A metamorphic property, derived from what ancestor-or-self *means* rather
+/// than from either implementation: if a scope reaches `p`, it reaches every
+/// position below `p`, so `visible(p)` is a subset of `visible(q)` whenever `q`
+/// sits under `p`.
+///
+/// That derivation is the point. The oracle and the engine were written by the
+/// same author against the same mental model and can agree enthusiastically on
+/// a shared misunderstanding; this is the cover for that, in the same role
+/// `invariants::monotonic_in_transaction_time` plays on the temporal axis.
+///
+/// Nesting is decided with [`reaches`] rather than by asking the store, so the
+/// property does not depend on the thing it is checking.
+pub fn depth_monotonic(seeds: std::ops::Range<u64>, params: &Params) -> bool {
+    seeds.into_iter().all(|seed| {
+        let w = world(seed, params);
+        let e = build(&w);
+        w.positions.iter().all(|p| {
+            let above = visible(&e, p);
+            w.positions
+                .iter()
+                .filter(|q| *q != p && reaches(p, q))
+                .all(|q| {
+                    let below = visible(&e, q);
+                    above.iter().all(|t| below.contains(t))
+                })
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +453,36 @@ mod tests {
         assert!(
             differ,
             "a bare starts_with agreed with the oracle everywhere, so the              sweep cannot tell a segment rule from a string one"
+        );
+    }
+
+    #[test]
+    fn a_deeper_position_never_sees_less() {
+        assert!(
+            depth_monotonic(0..60, &Params::default()),
+            "descending removed a decision, which ancestor-or-self forbids"
+        );
+    }
+
+    /// The companion. If no generated pair were ever nested, the property
+    /// above would hold across every seed having compared nothing.
+    #[test]
+    fn the_monotonicity_check_finds_nested_pairs_to_compare() {
+        let params = Params::default();
+        let mut pairs = 0usize;
+        for seed in 0..40 {
+            let w = world(seed, &params);
+            for p in &w.positions {
+                for q in &w.positions {
+                    if p != q && reaches(p, q) {
+                        pairs += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            pairs > 20,
+            "only {pairs} nested position pairs across 40 worlds, so the              property is close to vacuous"
         );
     }
 }
