@@ -214,6 +214,13 @@ pub struct DecisionDetail {
     /// was made rather than the day it was typed up. One entry is a decision
     /// made once; more is a decision re-decided under the same title.
     pub history: Vec<(Timestamp, String)>,
+    /// The clock this answer was given under, or `None` for what stands now.
+    ///
+    /// A `DecisionDetail` is an answer at a time, not a timeless fact, and
+    /// renderers need to know which. `still_stands` is evaluated at this clock,
+    /// so a reader shown "this is what stands" under a past `as_of` would be
+    /// told the present tense about the past.
+    pub answered_at: Option<At>,
 }
 
 /// The attributes a decision is recorded under, and whether each admits one
@@ -1075,6 +1082,7 @@ pub fn decision(engine: &Engine, title: &str, at: At) -> Result<Outcome, HostErr
             supersedes: chain(engine, id, Direction::Back, at),
             superseded_by,
             history,
+            answered_at: (at != At::latest()).then_some(at),
         },
     ))))
 }

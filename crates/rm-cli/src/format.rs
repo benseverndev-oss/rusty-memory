@@ -6,6 +6,7 @@
 use rm_engine::{Believed, Standing};
 
 use rm_host::command::{Found, MentionLanding, Outcome};
+use rm_host::time::format_day;
 
 pub fn render(outcome: &Outcome) -> String {
     match outcome {
@@ -194,9 +195,21 @@ pub fn render(outcome: &Outcome) -> String {
             out
         }
 
-        // Replaced in Task 4 with a real message; here only so the crate
-        // compiles while `decision` grows its third answer.
-        Outcome::Decision(Found::NotYetRecorded { .. }) => String::new(),
+        // Not the same as "no decision by that title", and the difference is
+        // the point: the title is real, so the reader must not be sent looking
+        // for a spelling mistake. Both days, because either clock can be the
+        // one that excluded it.
+        Outcome::Decision(Found::NotYetRecorded {
+            title,
+            first_recorded,
+            first_held,
+        }) => format!(
+            "{title:?} is on record, but nothing of it stood at the time you asked.\n\n  \
+             first recorded  {}\n  holds from      {}\n\n\
+             Ask on or after both of those, or drop the flags for what stands now.\n",
+            format_day(*first_recorded),
+            format_day(*first_held),
+        ),
         Outcome::Decision(Found::Unknown) => {
             "no decision by that title — `rmem decisions` lists them, and the title has to match exactly".to_string()
         }
@@ -216,7 +229,16 @@ pub fn render(outcome: &Outcome) -> String {
             // line either confirms it stands or carries them to the one that
             // does.
             if d.still_stands {
-                out.push_str("\nthis is what stands.\n");
+                // Present tense only for a present-tense question. Under a past
+                // clock this sentence is the exact failure the feature exists
+                // to expose.
+                match d.answered_at {
+                    None => out.push_str("\nthis is what stands.\n"),
+                    Some(at) => out.push_str(&format!(
+                        "\nthis is what stood as of {}.\n",
+                        format_day(at.tx)
+                    )),
+                }
             } else if d.superseded_by.is_empty() {
                 out.push_str(
                     "\nreplaced, but nothing records by what — it was re-decided under this same\ntitle, so the history below is the whole story.\n",
@@ -655,6 +677,66 @@ mod tests {
         assert!(
             !text.contains("not remembered"),
             "an empty list must say nothing at all: {text}"
+        );
+    }
+
+    fn a_standing_decision() -> rm_host::command::DecisionDetail {
+        rm_host::command::DecisionDetail {
+            entity: 1,
+            title: "Pin the compiler".into(),
+            choice: "a choice".into(),
+            because: None,
+            context: None,
+            still_stands: true,
+            status: "accepted".into(),
+            supersedes: vec![],
+            superseded_by: vec![],
+            history: vec![],
+            answered_at: None,
+        }
+    }
+
+    /// The tense has to follow the clock. "this is what stands" under an
+    /// `--as-of` in the past is the present tense about the past, which is the
+    /// failure this feature exists to expose rather than commit.
+    #[test]
+    fn a_past_clock_is_not_described_in_the_present_tense() {
+        const AUGUST: rm_engine::Timestamp = 1_787_529_600_000;
+        let now = render(&Outcome::Decision(Found::Decision(Box::new(
+            a_standing_decision(),
+        ))));
+        assert!(now.contains("this is what stands."), "{now}");
+
+        let then = render(&Outcome::Decision(Found::Decision(Box::new(
+            rm_host::command::DecisionDetail {
+                answered_at: Some(rm_host::time::At {
+                    valid: AUGUST,
+                    tx: AUGUST,
+                }),
+                ..a_standing_decision()
+            },
+        ))));
+        assert!(then.contains("stood as of 2026-08-24"), "{then}");
+        assert!(
+            !then.contains("this is what stands."),
+            "present tense under a past clock: {then}"
+        );
+    }
+
+    #[test]
+    fn a_decision_the_store_had_not_heard_of_says_when_it_arrived() {
+        const AUGUST: rm_engine::Timestamp = 1_787_529_600_000;
+        const MARCH: rm_engine::Timestamp = 1_772_236_800_000;
+        let out = render(&Outcome::Decision(Found::NotYetRecorded {
+            title: "Pin the compiler".into(),
+            first_recorded: AUGUST,
+            first_held: MARCH,
+        }));
+        assert!(out.contains("2026-08-24"), "the day it arrived: {out}");
+        assert!(out.contains("2026-02-28"), "the day it holds from: {out}");
+        assert!(
+            !out.contains("no decision by that title"),
+            "must not read as a typo: {out}"
         );
     }
 }

@@ -51,9 +51,11 @@ rmem — a memory that resolves contradictions deterministically
                                      [--status proposed|accepted|rejected|deprecated]
                                      [--supersedes \"<title>\"] [--at YYYY-MM-DD]
                                      record a decision under a stable, findable title
-    rmem decisions [--status <s>]    every decision, and whether it still stands
+    rmem decisions [--status <s>] [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
+                                     every decision, and whether it still stands
     rmem reindex                     re-embed every assertion under the current provider
-    rmem decision \"<title>\"          one decision in full, and the chain it sits in
+    rmem decision \"<title>\" [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
+                                     one decision in full, and the chain it sits in
 
 Entity ids come from `remember` and `recall`. Review ids come from `review`.
 A decision is found again by its title, so write one you would search for.
@@ -105,13 +107,38 @@ pub enum Command {
     Decisions {
         /// Show only decisions with this status. `None` shows every one.
         status: Option<String>,
+        /// What held then. `None` is what holds now.
+        valid_at: Option<Timestamp>,
+        /// What the store knew then. `None` is what it knows now.
+        as_of: Option<Timestamp>,
     },
     /// Rebuild every vector in the store under the current provider.
     Reindex,
     /// Read one decision by its exact title.
     Decision {
         title: String,
+        /// What held then. `None` is what holds now.
+        valid_at: Option<Timestamp>,
+        /// What the store knew then. `None` is what it knows now.
+        as_of: Option<Timestamp>,
     },
+}
+
+/// A `YYYY-MM-DD` flag, as the *end* of the day it names.
+///
+/// Both axes read this way, so a query naming today sees what was recorded this
+/// morning. See `rm_host::time::parse_day_end`.
+///
+/// A free function rather than a closure per command: `about`, `decisions` and
+/// `decision` all take these two flags, and three copies is three places for
+/// the end-of-day reading to stop being true in one of them.
+fn day(args: &[String], name: &str) -> Result<Option<Timestamp>, CliError> {
+    match flag(args, name)? {
+        None => Ok(None),
+        Some(d) => rm_host::time::parse_day_end(&d)
+            .map(Some)
+            .map_err(CliError::Usage),
+    }
 }
 
 /// The value after a named flag, if the flag is there.
@@ -238,22 +265,11 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                     "{entity:?} is not an entity id -- they are numbers, printed by `remember` and `recall`\n\n{USAGE}"
                 ))
             })?;
-            // Both axes read as the *end* of the day they name, so a query
-            // naming today sees what was recorded this morning. See
-            // `rm_host::time::parse_day_end`.
-            let day = |name: &str| -> Result<Option<Timestamp>, CliError> {
-                match flag(&args, name)? {
-                    None => Ok(None),
-                    Some(d) => rm_host::time::parse_day_end(&d)
-                        .map(Some)
-                        .map_err(CliError::Usage),
-                }
-            };
             Ok(Command::About {
                 entity,
                 attribute: attribute.clone(),
-                valid_at: day("--valid-at")?,
-                as_of: day("--as-of")?,
+                valid_at: day(&args, "--valid-at")?,
+                as_of: day(&args, "--as-of")?,
             })
         }
 
@@ -300,6 +316,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
 
         "decisions" => Ok(Command::Decisions {
             status: flag(&args, "--status")?,
+            valid_at: day(&args, "--valid-at")?,
+            as_of: day(&args, "--as-of")?,
         }),
 
         // Singular, and a different command: `decisions` is the index and this
@@ -314,6 +332,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
             };
             Ok(Command::Decision {
                 title: title.clone(),
+                valid_at: day(&args, "--valid-at")?,
+                as_of: day(&args, "--as-of")?,
             })
         }
 
@@ -411,12 +431,18 @@ mod tests {
     fn decisions_parses_its_filter() {
         assert_eq!(
             parse_args(&["decisions"]).unwrap(),
-            Command::Decisions { status: None }
+            Command::Decisions {
+                status: None,
+                valid_at: None,
+                as_of: None
+            }
         );
         assert_eq!(
             parse_args(&["decisions", "--status", "rejected"]).unwrap(),
             Command::Decisions {
-                status: Some("rejected".into())
+                status: Some("rejected".into()),
+                valid_at: None,
+                as_of: None
             }
         );
     }
@@ -671,5 +697,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("--speaker needs a name"), "{err}");
+    }
+
+    #[test]
+    fn the_decision_reads_take_both_clocks() {
+        let Command::Decision {
+            valid_at,
+            as_of,
+            title,
+        } = parse_args(&[
+            "decision",
+            "Pin the compiler",
+            "--valid-at",
+            "2026-03-01",
+            "--as-of",
+            "2026-08-24",
+        ])
+        .unwrap()
+        else {
+            panic!("not a decision command")
+        };
+        assert_eq!(title, "Pin the compiler");
+        // End of the named day, same as `about`.
+        assert_eq!(valid_at, Some(1_772_323_200_000 + 86_399_999));
+        assert_eq!(as_of, Some(1_787_529_600_000 + 86_399_999));
+
+        let Command::Decisions {
+            valid_at, as_of, ..
+        } = parse_args(&["decisions", "--as-of", "2026-08-24"]).unwrap()
+        else {
+            panic!("not a decisions command")
+        };
+        assert_eq!(valid_at, None, "an absent flag stays absent");
+        assert_eq!(as_of, Some(1_787_529_600_000 + 86_399_999));
+
+        assert!(
+            parse_args(&["decision", "X", "--as-of", "not-a-date"]).is_err(),
+            "a date that is not one must be refused"
+        );
     }
 }
