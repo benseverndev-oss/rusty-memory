@@ -68,6 +68,12 @@ d "Pin the compiler" "rust-toolchain.toml names the version and CI asserts it bo
   --because "CI took whatever stable had become that week; a lint fired there that did not exist locally"
 
 echo; echo -n "rejected "
+# The premise of this one is a measurement that could stop being true, so the
+# condition that would reverse it is written into the reason rather than left
+# for a reader to rediscover -- see "re-verify the premise of a deferred
+# decision" elsewhere in this log.
+d "Make ValidInterval refusal instant-local" "build the timeline where it can be built and refuse only at the colliding span" --status rejected \
+  --because "rm-contrast measures the cost as 4,067 of 6,353 answerable questions refused at a 25 percent tie rate, which is large -- but the condition has never occurred: zero collisions across 1,086 attribute slots in a live store, because observed_at is millisecond-resolution and handed out per write. Reverse this if a bulk import ever carries day-resolution timestamps on both axes, where observed_at collides routinely and ties stop being freak events"
 d "Rerank the recall results" "a cross-encoder over a deep candidate list" --status rejected \
   --because "the k-curve is still 0.926 at k=200, so there is nothing to rerank into"
 d "Hybrid lexical retrieval" "BM25 beside the vector index" --status rejected \
