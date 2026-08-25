@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use rm_engine::{Completer, Embedder, Engine, Timestamp};
 use rm_host::command::{self, Outcome};
 use rm_host::config::Config;
+use rm_host::time::At;
 use rm_host::{store, HostError};
 
 use crate::jsonrpc::{self, Request};
@@ -540,12 +541,36 @@ where
                 _,
             ) => command::about(engine, entity, &attribute, valid_at, as_of),
             (Call::Reviews, _) => command::review_list(engine),
-            (Call::Decisions { status }, _) => {
-                command::decisions(engine, status.as_deref(), rm_host::time::At::latest())
-            }
-            (Call::Decision { title }, _) => {
-                command::decision(engine, &title, rm_host::time::At::latest())
-            }
+            (
+                Call::Decisions {
+                    status,
+                    valid_at,
+                    as_of,
+                },
+                _,
+            ) => command::decisions(
+                engine,
+                status.as_deref(),
+                At {
+                    valid: valid_at.unwrap_or(Timestamp::MAX),
+                    tx: as_of.unwrap_or(Timestamp::MAX),
+                },
+            ),
+            (
+                Call::Decision {
+                    title,
+                    valid_at,
+                    as_of,
+                },
+                _,
+            ) => command::decision(
+                engine,
+                &title,
+                At {
+                    valid: valid_at.unwrap_or(Timestamp::MAX),
+                    tx: as_of.unwrap_or(Timestamp::MAX),
+                },
+            ),
             (other, _) => unreachable!("{other:?} writes, or was not planned"),
         }
     }
