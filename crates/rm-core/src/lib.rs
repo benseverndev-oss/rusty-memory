@@ -14,6 +14,16 @@
 //!   wins when two sources disagree, so it travels with the value rather than
 //!   beside it.
 
+/// Where a memory reaches.
+///
+/// Here rather than a layer up, against this crate's own rule, because
+/// `rm_engine::Query` filters on it and `rm-engine` does not depend on
+/// `rm-host`. It *did* live a layer up until a second consumer appeared; the
+/// alternative was a second implementation of ancestor-or-self in the engine,
+/// which is the drift this project keeps finding. `rm-host` re-exports it, so
+/// nothing that used the old path had to change.
+pub mod scope;
+
 use serde::{Deserialize, Serialize};
 
 /// Milliseconds since the Unix epoch.

@@ -11,7 +11,8 @@
 //!
 //! # This module never imports `rm_host::scope`
 //!
-//! Not `applies_at`, not `validate`, not `UNIVERSAL`. An oracle derived from
+//! Not `applies_at`, not `validate`, not `UNIVERSAL`, from `rm_core::scope`
+//! or its `rm_host` re-export. An oracle derived from
 //! the code it judges is not an oracle. Scopes reach the store through
 //! `command::decide` and `command::plan_rescope` like any other caller, so the
 //! store is exercised normally; only the *expectation* is computed here.
@@ -418,7 +419,12 @@ mod tests {
     #[test]
     fn this_module_does_not_import_the_code_it_judges() {
         let me = include_str!("applicability.rs");
-        for banned in ["rm_host::scope", "scope::applies_at", "scope::UNIVERSAL"] {
+        for banned in [
+            "rm_host::scope",
+            "rm_core::scope",
+            "scope::applies_at",
+            "scope::UNIVERSAL",
+        ] {
             let uses = me
                 .lines()
                 .filter(|l| l.trim_start().starts_with("use "))
