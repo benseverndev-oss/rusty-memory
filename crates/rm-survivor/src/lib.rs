@@ -277,6 +277,26 @@ pub enum Strategy {
     /// `valid.from` and same `observed_at` -- because then nothing orders them
     /// and there is no way to say which superseded which.
     ///
+    /// # The refusal is history-wide, not instant-local
+    ///
+    /// A collision anywhere in the visible history refuses the whole read,
+    /// including a question about an instant nowhere near it. The outcome of
+    /// this strategy is a timeline, and a timeline with a hole in it is not one
+    /// that can be indexed into.
+    ///
+    /// `rm-contrast` measures what that costs where collisions are common: at a
+    /// 25% tie rate the store refuses 4,067 of 6,353 questions that did have
+    /// answers, against a flat control that refuses none because it has no way
+    /// to. Making the refusal instant-local was considered and turned down --
+    /// see the rejected decision "Make ValidInterval's refusal instant-local"
+    /// in `docs/seed-decision-log.sh` -- because it has never fired on real
+    /// data: zero collisions across 1,086 attribute slots in a live store,
+    /// `observed_at` being millisecond-resolution and handed out per write.
+    ///
+    /// The condition that would reverse that: a bulk import carrying
+    /// day-resolution timestamps on *both* axes, where `observed_at` collides
+    /// routinely and ties stop being freak events.
+    ///
     /// This sentence used to say "refuses when two different values share an
     /// observation timestamp", which was true when a `Candidate` carried a
     /// value and a provenance and no interval, so the timeline could only be

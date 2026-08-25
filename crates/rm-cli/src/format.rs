@@ -5,7 +5,7 @@
 
 use rm_engine::{Believed, Standing};
 
-use rm_host::command::{Found, MentionLanding, Outcome};
+use rm_host::command::{Found, MentionLanding, Outcome, DEFAULT_STATUS, SUPERSEDED};
 use rm_host::time::format_day;
 
 pub fn render(outcome: &Outcome) -> String {
@@ -251,9 +251,26 @@ pub fn render(outcome: &Outcome) -> String {
                         format_day(at.tx)
                     )),
                 }
+            } else if d.status != SUPERSEDED && d.superseded_by.is_empty() {
+                // Not replaced, and never in force. The status is the whole
+                // reason, and the sentence here used to say "replaced, but
+                // nothing records by what" -- which is false about a rejected
+                // option: nothing replaced it because it never stood. It sent
+                // a reader looking for a supersession that does not exist, on
+                // 11 of the decisions in this project's own seeded log.
+                //
+                // `rm-mcp`'s renderer has said the right thing since statuses
+                // arrived; this one was not brought along.
+                out.push_str(&format!(
+                    "\nthis never stood: its status is {:?}, not {DEFAULT_STATUS:?}.\n",
+                    d.status
+                ));
             } else if d.superseded_by.is_empty() {
+                // Marked replaced with no edge recording by what. `decide`
+                // cannot produce this -- `--supersedes` writes both ends -- so
+                // it means the edge was lost rather than never written.
                 out.push_str(
-                    "\nreplaced, but nothing records by what — it was re-decided under this same\ntitle, so the history below is the whole story.\n",
+                    "\nmarked replaced, but nothing records by what.\n",
                 );
             } else {
                 out.push_str("\nreplaced by:\n");
@@ -781,5 +798,46 @@ mod tests {
             !out.contains("no decision by that title"),
             "must not read as a typo: {out}"
         );
+    }
+
+    /// A rejected option was never in force, so nothing replaced it. Saying
+    /// "replaced, but nothing records by what" sent a reader looking for a
+    /// supersession that does not exist -- on 11 decisions in this project's
+    /// own seeded log, including the one recording why this was not fixed.
+    #[test]
+    fn a_decision_that_never_stood_says_so_rather_than_claiming_it_was_replaced() {
+        for status in ["rejected", "proposed", "deprecated"] {
+            let out = render(&Outcome::Decision(Found::Decision(Box::new(
+                rm_host::command::DecisionDetail {
+                    still_stands: false,
+                    status: status.to_string(),
+                    superseded_by: vec![],
+                    ..a_standing_decision()
+                },
+            ))));
+            assert!(out.contains("this never stood"), "{status}: {out}");
+            assert!(out.contains(status), "the status is the reason: {out}");
+            assert!(
+                !out.contains("replaced, but nothing records by what"),
+                "{status} was never replaced: {out}"
+            );
+        }
+    }
+
+    /// The one case the old sentence was actually about: marked replaced with
+    /// no edge saying by what. `decide` cannot produce it, so it means a lost
+    /// edge rather than a never-written one.
+    #[test]
+    fn a_superseded_decision_with_no_edge_still_says_something_true() {
+        let out = render(&Outcome::Decision(Found::Decision(Box::new(
+            rm_host::command::DecisionDetail {
+                still_stands: false,
+                status: "superseded".to_string(),
+                superseded_by: vec![],
+                ..a_standing_decision()
+            },
+        ))));
+        assert!(out.contains("marked replaced"), "{out}");
+        assert!(!out.contains("this never stood"), "{out}");
     }
 }
