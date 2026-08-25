@@ -1,6 +1,6 @@
 [package]
 name = "rm-embed"
-version = "0.0.0"
+version = "0.1.0"
 description = "An Embedder that opens no socket and reads no model file. Subword hashing, written out."
 edition.workspace = true
 rust-version.workspace = true

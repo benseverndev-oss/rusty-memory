@@ -29,7 +29,12 @@
 # The rusty-memory decision log, recorded from eleven merged pull requests.
 set -euo pipefail
 R="${RMEM_BIN:-rmem}"
-d() { "$R" decide "$@" >/dev/null; printf '.'; }
+# Every decision here is about this project, so they share a reach.
+# Overridable, because the same script seeds demo stores that may sit elsewhere.
+SEED_SCOPE="${SEED_SCOPE:-rusty-memory}"
+# The scope goes after "$@", not before it: `decide` wants the title and the
+# choice ahead of any flag, and refuses when the first argument starts with --.
+d() { "$R" decide "$@" --scope "$SEED_SCOPE" >/dev/null; printf '.'; }
 
 echo -n "accepted "
 d "Store bi-temporally" "every assertion carries valid time and transaction time" \
@@ -116,4 +121,17 @@ d "Index raw turn text beside assertions" "one vector per turn as well as one pe
   --because "raw turns beat the pipeline by 0.086 pooled over three conversations, never negative -- but fusing the two loses to raw turns alone, so the shape is unsettled"
 d "Retire recall@10 as the headline metric" "measure what the store is for -- contradiction, supersession, time -- instead" --status proposed \
   --because "a twenty-line control beats the pipeline on it, and none of the distinctive machinery serves it; but LoCoMo labels no ground truth for the alternative"
+echo
+echo; echo -n "re-decided "
+# The one decision here that changed its mind, and the only worked example in
+# this log of a title decided twice. `decisions` shows the latest choice and
+# `decision` shows both, with the reason each was taken.
+d "Retire recall@10 as the headline metric" "a reference model written from the docs, swept differentially against the engine, with the table computed rather than typed"   --because "the blocker was not the metric, it was the assumption that ground truth has to be labelled: a generated history has it by construction, so the reference model became possible and the sweep found two real divergences on its first green run"
+
+echo; echo -n "scope "
+d "A scope says how far a memory reaches, not where it was written" "one opaque string, and a memory applies where its scope is an ancestor-or-self of the asker"   --because "\"never run scale benchmarks on this laptop\" was written during one project and is true of every project on the machine; labelled by origin it disappears the moment the next session is about something else, and 155 of 219 real decisions had the project name smuggled into the title"
+d "Cut a decision timeline from its own versions, not through survivorship" "the decision reads build the timeline themselves"   --because "routing through about_under would make the answer depend on [policy], where the shipped default is most_recent and a valid time has nothing to index into -- inheriting a defect rather than sidestepping it"
+d "decide refuses without a scope rather than defaulting one" "no write default, on the CLI or over MCP"   --because "reach varies per decision, so RMEM_SCOPE cannot supply it; a default would answer silently and usually wrongly the one question only the writer can answer"
+d "Correct a reach with rescope rather than by re-deciding" "a command that writes the scope and nothing else"   --because "decide takes title and choice positionally, so attaching a scope writes a second choice and revisions counts those -- reproduced on a throwaway store, and across 219 records it falsifies the whole log's revision history"
+d "A setting that looks unset behaves as unset" "an empty or whitespace RMEM_SCOPE is no position"   --because "measured on the live store, RMEM_SCOPE= returned 32 records where unset returned 219 -- a configuration that looks unconfigured, hiding 85 percent of the store, reporting nothing"
 echo

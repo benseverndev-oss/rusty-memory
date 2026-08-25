@@ -98,30 +98,31 @@ fn most_recent(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
 /// Each distinct value with the span of valid time over which it stood.
 ///
 /// Documented rule: "Do not pick a winner. Emit each distinct value with the
-/// validity range over which it stood, inferred from observation order.
-/// Refuses when two different values share an observation timestamp: with no
-/// order between them there is no way to say which superseded which."
+/// validity range over which it stood. Refuses only when two different values
+/// collide on *both* axes -- same `valid.from` and same `observed_at` --
+/// because then nothing orders them and there is no way to say which
+/// superseded which."
 ///
 /// Ordered by when each value began to hold, ties broken by when it was heard.
 /// Sorting by `valid.from` rather than `observed_at` is the whole difference
 /// between a valid-time timeline and a transaction-time one wearing its name.
 ///
-/// # The doc comment quoted above is stale, and the sweep found it
+/// # That sentence is quotable because the sweep made it true
 ///
-/// Taken literally, "share an observation timestamp" refuses two values heard
-/// in the same instant however their valid spans differ. `rm_survivor` does
-/// not do that: it refuses only when `valid.from` *and* `observed_at` *and* the
-/// values all collide.
+/// It used to read "refuses when two different values share an observation
+/// timestamp", which taken literally refuses two values heard in the same
+/// instant however their valid spans differ. `rm_survivor` never did that: it
+/// refuses only on the double collision above.
 ///
-/// The implementation is the correct one and the sentence is out of date. It
-/// was written when a `Candidate` carried no `valid` and the timeline was cut
-/// at `observed_at` -- at which point two values sharing an observation really
-/// did have no order between them. Adding valid time gave them one, and the
-/// rationale in that same sentence ("with no order between them") is now
-/// satisfied by the narrower condition. The prose did not follow the code.
+/// The implementation was the correct one and the sentence was out of date,
+/// written when a `Candidate` carried no `valid` and the timeline was cut at
+/// `observed_at` -- at which point two values sharing an observation really did
+/// have no order between them. Adding valid time gave them one.
 ///
-/// This reference is written against the behaviour, with the divergence
-/// recorded here rather than quietly conformed to.
+/// The sweep found the gap by disagreeing on 53 generated histories. This
+/// reference was written against the behaviour and the divergence recorded
+/// here; `rm_survivor`'s comment has since been corrected to match, so the
+/// quote above is now the rule rather than a claim about it.
 fn valid_interval(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
     let claims = claims(candidates);
     if claims.is_empty() {

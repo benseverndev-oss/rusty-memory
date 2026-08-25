@@ -1,6 +1,6 @@
 [package]
 name = "rm-store"
-version = "0.0.0"
+version = "0.1.0"
 description = "Bi-temporal record store for agent memory, with attribute history"
 edition.workspace = true
 rust-version.workspace = true

@@ -37,6 +37,13 @@ use rm_engine::{ReviewId, StableId, Timestamp};
 /// A comma-separated list of names; unset means all of them.
 pub const TOOLS_ENV: &str = "RMEM_TOOLS";
 
+/// Where this session stands, for deciding what applies to it.
+///
+/// Read-side only, and deliberately: reach varies per decision, so a session
+/// value would answer -- silently and usually wrongly -- the one question the
+/// writer is uniquely placed to answer.
+pub const SCOPE_ENV: &str = "RMEM_SCOPE";
+
 /// The tools this server offers, honouring [`TOOLS_ENV`].
 ///
 /// # Why a session should be able to ask for fewer
@@ -166,6 +173,10 @@ fn all_definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "What was decided."
                     },
+                    "scope": {
+                        "type": "string",
+                        "description": "How far this decision reaches: a path like \"work/goldenmatch/fs\", or \"*\" for every project. Ask where it would still be true, not where you learned it -- a rule about this machine is \"*\" even if you found it in one project."
+                    },
                     "status": {
                         "type": "string",
                         "enum": ["proposed", "accepted", "rejected", "deprecated"],
@@ -188,7 +199,7 @@ fn all_definitions() -> Vec<Value> {
                         "description": "The day it was made, as YYYY-MM-DD, if that is not today. Sets when it held from, not when the store heard it."
                     }
                 },
-                "required": ["title", "choice"],
+                "required": ["title", "choice", "scope"],
                 "additionalProperties": false
             }
         }),
@@ -203,6 +214,22 @@ fn all_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": ["proposed", "accepted", "rejected", "deprecated", "superseded"],
                         "description": "Show only decisions with this status. Omit for all of them."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Ask from this position instead of the session's own."
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "Ignore reach; include decisions scoped elsewhere."
+                    },
+                    "as_of": {
+                        "type": ["string", "integer"],
+                        "description": "The log as the store knew it on this date (YYYY-MM-DD). Later decisions are absent. Omit for now."
+                    },
+                    "valid_at": {
+                        "type": ["string", "integer"],
+                        "description": "What held on this date (YYYY-MM-DD). A decision backdated with decided_at holds from that day. Omit for now."
                     }
                 },
                 "additionalProperties": false
@@ -219,6 +246,22 @@ fn all_definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "The decision's exact title, as `decisions` lists it. Titles are matched exactly, not approximately.",
                         "minLength": 1
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Ask from this position instead of the session's own."
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "Ignore reach; include decisions scoped elsewhere."
+                    },
+                    "as_of": {
+                        "type": ["string", "integer"],
+                        "description": "As the store knew it on this date (YYYY-MM-DD), the supersession walk included, so a later replacement does not retire it. Omit for now."
+                    },
+                    "valid_at": {
+                        "type": ["string", "integer"],
+                        "description": "What held on this date (YYYY-MM-DD). Omit for now."
                     }
                 },
                 "required": ["title"],
@@ -266,8 +309,8 @@ pub enum Call {
     About {
         entity: StableId,
         attribute: String,
-        valid_at: Timestamp,
-        as_of: Timestamp,
+        valid_at: Option<Timestamp>,
+        as_of: Option<Timestamp>,
     },
     Reviews,
     ResolveReview {
@@ -277,6 +320,7 @@ pub enum Call {
     Decide {
         title: String,
         choice: String,
+        scope: String,
         status: Option<String>,
         decided_at: Option<rm_engine::Timestamp>,
         because: Option<String>,
@@ -286,10 +330,18 @@ pub enum Call {
     },
     Decisions {
         status: Option<String>,
+        valid_at: Option<Timestamp>,
+        as_of: Option<Timestamp>,
+        scope: Option<String>,
+        all: bool,
     },
     /// Read one decision in full, by exact title.
     Decision {
         title: String,
+        valid_at: Option<Timestamp>,
+        as_of: Option<Timestamp>,
+        scope: Option<String>,
+        all: bool,
     },
 }
 
@@ -344,12 +396,14 @@ impl Call {
         })
     }
 
-    pub fn read(
-        name: &str,
-        arguments: &Value,
-        now: Timestamp,
-        client: Option<&str>,
-    ) -> Result<Call, Unreadable> {
+    /// Read a tool call from its arguments.
+    ///
+    /// Takes no clock. It used to, to default `about`'s two axes to now -- and
+    /// that default was the bug: once applied, "what held in March" and "what
+    /// holds now" are the same call, so nothing downstream could refuse a
+    /// valid-time question the attribute could not answer. The axes travel as
+    /// `Option`s and the default is applied where the refusal lives.
+    pub fn read(name: &str, arguments: &Value, client: Option<&str>) -> Result<Call, Unreadable> {
         match name {
             "remember" => Ok(Call::Remember {
                 text: string(arguments, "text")?,
@@ -378,19 +432,31 @@ impl Call {
             "about" => Ok(Call::About {
                 entity: non_negative(arguments, "entity")? as StableId,
                 attribute: string(arguments, "attribute")?,
-                valid_at: optional_integer(arguments, "valid_at")?.unwrap_or(now),
-                as_of: optional_integer(arguments, "as_of")?.unwrap_or(now),
+                // Left unresolved, so `command::about` can tell a valid-time
+                // question from its absence and refuse one the attribute's
+                // strategy cannot answer.
+                valid_at: optional_integer(arguments, "valid_at")?,
+                as_of: optional_integer(arguments, "as_of")?,
             }),
             "reviews" => Ok(Call::Reviews),
             "decisions" => Ok(Call::Decisions {
                 status: optional_string(arguments, "status")?,
+                scope: optional_string(arguments, "scope")?,
+                all: optional_bool(arguments, "all")?.unwrap_or(false),
+                valid_at: optional_instant(arguments, "valid_at")?,
+                as_of: optional_instant(arguments, "as_of")?,
             }),
             "decision" => Ok(Call::Decision {
                 title: string(arguments, "title")?,
+                scope: optional_string(arguments, "scope")?,
+                all: optional_bool(arguments, "all")?.unwrap_or(false),
+                valid_at: optional_instant(arguments, "valid_at")?,
+                as_of: optional_instant(arguments, "as_of")?,
             }),
             "decide" => Ok(Call::Decide {
                 title: string(arguments, "title")?,
                 choice: string(arguments, "choice")?,
+                scope: string(arguments, "scope")?,
                 status: optional_string(arguments, "status")?,
                 decided_at: optional_string(arguments, "decided_at")?
                     .map(|d| rm_host::time::parse_day(&d))
@@ -438,6 +504,39 @@ fn string(args: &Value, field: &str) -> Result<String, Unreadable> {
         Some(Value::String(_)) => Err(format!("{field} was empty")),
         Some(_) => Err(format!("{field} must be a string")),
         None => Err(format!("{field} is required")),
+    }
+}
+
+/// A point in time, given either way.
+///
+/// A JSON number is milliseconds, matching `about`'s `valid_at`/`as_of`. A
+/// string is `YYYY-MM-DD` read as the end of that day, matching `decide`'s
+/// `decided_at` and the CLI's flags. Both conventions already exist in this
+/// file, and accepting either means the same parameter name does not mean two
+/// different types depending on which tool it is on.
+fn optional_instant(args: &Value, field: &str) -> Result<Option<Timestamp>, Unreadable> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(_)) => optional_string(args, field)?
+            .map(|d| rm_host::time::parse_day_end(&d))
+            .transpose(),
+        Some(Value::Number(_)) => optional_integer(args, field),
+        Some(_) => Err(format!(
+            "{field} must be a date as YYYY-MM-DD or a time in milliseconds"
+        )),
+    }
+}
+
+/// A boolean argument, when the caller gave one.
+///
+/// Mirrors `optional_string`: absent and null are both "not given", and
+/// anything that is not a boolean is a caller mistake worth naming rather than
+/// coercing.
+fn optional_bool(args: &Value, field: &str) -> Result<Option<bool>, Unreadable> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(format!("{field} must be true or false")),
     }
 }
 
@@ -495,10 +594,8 @@ fn non_negative(args: &Value, field: &str) -> Result<i64, Unreadable> {
 mod tests {
     use super::*;
 
-    const NOW: Timestamp = 1_000;
-
     fn read(name: &str, args: Value) -> Result<Call, Unreadable> {
-        Call::read(name, &args, NOW, None)
+        Call::read(name, &args, None)
     }
 
     #[test]
@@ -515,7 +612,7 @@ mod tests {
             ("reviews", json!({})),
             (
                 "decide",
-                json!({"title": "Use one file", "choice": "One snapshot per store"}),
+                json!({"title": "Use one file", "choice": "One snapshot per store", "scope": "work"}),
             ),
             ("decisions", json!({})),
             ("decision", json!({"title": "Use one file"})),
@@ -561,14 +658,13 @@ mod tests {
     /// `session` argument is asking for the writes where it was forgotten.
     #[test]
     fn a_write_is_attributed_to_the_client_that_made_it() {
-        let with =
-            |client: Option<&str>, args: Value| match Call::read("decide", &args, NOW, client)
-                .unwrap()
-            {
-                Call::Decide { session, .. } => session,
-                other => panic!("{other:?}"),
-            };
-        let bare = json!({"title": "T", "choice": "C"});
+        let with = |client: Option<&str>, args: Value| match Call::read("decide", &args, client)
+            .unwrap()
+        {
+            Call::Decide { session, .. } => session,
+            other => panic!("{other:?}"),
+        };
+        let bare = json!({"title": "T", "choice": "C", "scope": "work"});
 
         // The handshake name alone.
         assert_eq!(
@@ -581,7 +677,7 @@ mod tests {
         assert_eq!(
             with(
                 Some("claude-code 2.1"),
-                json!({"title":"T","choice":"C","session":"refactor"})
+                json!({"title":"T","choice":"C","scope":"work","session":"refactor"})
             ),
             "claude-code 2.1/refactor"
         );
@@ -594,7 +690,10 @@ mod tests {
         // worked before now records less.
         assert_eq!(with(None, bare), "mcp");
         assert_eq!(
-            with(None, json!({"title":"T","choice":"C","session":"s"})),
+            with(
+                None,
+                json!({"title":"T","choice":"C","scope":"work","session":"s"})
+            ),
             "s"
         );
     }
@@ -696,8 +795,11 @@ mod tests {
             Call::About {
                 entity: 2,
                 attribute: "employer".into(),
-                valid_at: NOW,
-                as_of: NOW
+                // Absent, not defaulted to now. Applying the default here is
+                // what made "what held in May" and "what holds now" the same
+                // call, so nothing downstream could refuse the first.
+                valid_at: None,
+                as_of: None
             }
         );
     }
@@ -717,8 +819,8 @@ mod tests {
             Call::About {
                 entity: 1,
                 attribute: "employer".into(),
-                valid_at: 500,
-                as_of: 900
+                valid_at: Some(500),
+                as_of: Some(900)
             }
         );
     }
@@ -799,9 +901,12 @@ mod tests {
         assert!(!read("decision", json!({"title": "Use one file"}))
             .unwrap()
             .mutates());
-        assert!(read("decide", json!({"title": "t", "choice": "c"}))
-            .unwrap()
-            .mutates());
+        assert!(read(
+            "decide",
+            json!({"title": "t", "choice": "c", "scope": "work"})
+        )
+        .unwrap()
+        .mutates());
     }
 
     #[test]
@@ -851,5 +956,99 @@ mod tests {
             assert_eq!(schema["additionalProperties"], json!(false), "{name}");
             assert!(!tool["description"].as_str().unwrap().is_empty(), "{name}");
         }
+    }
+
+    /// Either convention, because both already exist in this file: `about`
+    /// takes these two as integers and `decide` takes its date as a string.
+    /// One parameter name meaning two types across tools is a footgun for a
+    /// model caller, so these take both.
+    #[test]
+    fn the_decision_reads_take_either_a_date_or_an_instant() {
+        let Call::Decision {
+            valid_at, as_of, ..
+        } = read(
+            "decision",
+            json!({"title": "Pin the compiler", "as_of": "2026-08-24"}),
+        )
+        .unwrap()
+        else {
+            panic!("not a decision call")
+        };
+        assert_eq!(as_of, Some(1_787_529_600_000 + 86_399_999));
+        assert_eq!(valid_at, None);
+
+        let Call::Decisions { as_of, .. } =
+            read("decisions", json!({"as_of": 1_787_529_600_000i64})).unwrap()
+        else {
+            panic!("not a decisions call")
+        };
+        assert_eq!(as_of, Some(1_787_529_600_000), "a number is milliseconds");
+
+        assert!(
+            read("decision", json!({"title": "X", "as_of": "not-a-date"})).is_err(),
+            "a date that is not one must be refused"
+        );
+        assert!(
+            read("decision", json!({"title": "X", "as_of": true})).is_err(),
+            "a boolean is neither"
+        );
+    }
+
+    #[test]
+    fn an_agent_cannot_record_a_decision_without_stating_its_reach() {
+        assert!(
+            read("decide", json!({"title": "A title", "choice": "A choice"})).is_err(),
+            "scope is required"
+        );
+
+        let Call::Decide { scope, .. } = read(
+            "decide",
+            json!({"title": "A title", "choice": "A choice", "scope": "work/goldenmatch"}),
+        )
+        .unwrap() else {
+            panic!("not a decide call")
+        };
+        assert_eq!(scope, "work/goldenmatch");
+    }
+
+    /// The schema has to say it too, or a model never learns the argument
+    /// exists and every call fails at the parse instead.
+    #[test]
+    fn the_decide_schema_marks_scope_required() {
+        let decide = all_definitions()
+            .into_iter()
+            .find(|t| t["name"] == "decide")
+            .expect("decide is defined");
+        let required = decide["inputSchema"]["required"]
+            .as_array()
+            .expect("a required list");
+        assert!(
+            required.iter().any(|v| v == "scope"),
+            "scope must be required: {required:?}"
+        );
+        assert!(decide["inputSchema"]["properties"]["scope"].is_object());
+    }
+
+    #[test]
+    fn the_reads_take_a_position_and_a_way_to_ignore_it() {
+        let Call::Decisions { scope, all, .. } =
+            read("decisions", json!({"scope": "personal"})).unwrap()
+        else {
+            panic!("not a decisions call")
+        };
+        assert_eq!(scope.as_deref(), Some("personal"));
+        assert!(!all);
+
+        let Call::Decision { all, .. } =
+            read("decision", json!({"title": "A title", "all": true})).unwrap()
+        else {
+            panic!("not a decision call")
+        };
+        assert!(all);
+
+        assert!(
+            read("decisions", json!({"all": "yes"})).is_err(),
+            "a string is not a boolean"
+        );
     }
 }

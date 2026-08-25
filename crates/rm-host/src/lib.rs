@@ -21,6 +21,7 @@
 
 pub mod command;
 pub mod config;
+pub mod scope;
 pub mod store;
 pub mod testing;
 pub mod time;

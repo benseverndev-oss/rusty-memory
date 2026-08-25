@@ -1,6 +1,6 @@
 [package]
 name = "rm-survivor"
-version = "0.0.0"
+version = "0.1.0"
 description = "Survivorship rules for agent memory: deterministic resolution of conflicting facts"
 edition.workspace = true
 rust-version.workspace = true

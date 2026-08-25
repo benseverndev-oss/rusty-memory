@@ -73,9 +73,10 @@ rmem-mcp                        # reads ./rmem.toml, serves stdin
 
 Eight tools — `remember`, `recall`, `about`, `reviews`, `resolve_review`,
 `decide`, `decisions`, `decision` — which are `rmem`'s own commands over shared
-code rather than a second implementation of them. `about` is the one that differs: it takes
-both time axes, so an agent can ask what was true in May and, separately, what
-was known last Tuesday.
+code rather than a second implementation of them. Three take both time axes, so
+an agent can ask what was true in May and, separately, what was known last
+Tuesday: `about`, and the two decision reads `decisions` and `decision`. Their
+`as_of` and `valid_at` accept a `YYYY-MM-DD` string or a millisecond instant.
 
 `decide`, `decisions` and `decision` are the decision log. A decision is an
 entity with four attributes — `status`, `choice`, `because`, `context` — written
@@ -161,11 +162,48 @@ query naming today sees what was recorded this morning.
 runs, so asking what the store knew before it knew anything answers `nothing
 known`.
 
-`--valid-at` needs an attribute whose policy keeps a timeline. Survivorship runs
-first, and most strategies collapse a history to one winner — a winner has no
-timeline, so there is nothing for a valid time to index into. Only an attribute
-under `valid_interval` can be asked, which is `employer` in the template and
-whatever else you configure.
+`--valid-at` needs an attribute whose policy keeps a timeline, and **refuses
+when it does not**. Survivorship runs first, and most strategies collapse a
+history to one winner — a winner has no timeline, so there is nothing for a
+valid time to index into. Only an attribute under `valid_interval` can be
+asked, which is `employer` in the template and whatever else you configure.
+
+The refusal names the attribute, the strategy in force, and the line that would
+change it:
+
+```
+"choice" is resolved by MostRecent, which picks one winner rather than keeping
+a timeline, so there is no moment to ask about -- every date would answer the
+same. Set `choice = "valid_interval"` under [policy.attribute] in rmem.toml to
+keep one, or drop --valid-at to read what stands.
+```
+
+It used to be accepted and ignored. The flag went in, survivorship collapsed
+the history, `held_at` was handed a time it had no use for, and the same answer
+came back for every date — on every attribute but `employer`. Nothing said so,
+and a test asserted the wrong behaviour was right. Refusing rather than warning
+is the same choice this store makes everywhere else: a warning on stderr is a
+wrong answer with a note attached.
+
+**The decision reads are the exception.** `rmem decisions` and `rmem decision`
+take the same two flags, and `--valid-at` works on them whatever `[policy]`
+says, because they do not go through survivorship at all: a decision's timeline
+is the versions of its own `choice`, so "what stood in March" is a cut over that
+list rather than a question for a strategy.
+
+```sh
+rmem decision "Pin the compiler" --as-of 2026-03-01   # what the log said then
+rmem decisions --as-of 2026-03-01                     # the whole log, then
+```
+
+A decision recorded after the date asked about is not missing, and does not read
+as one. It says so and names both days — the day it arrived and the day it holds
+from — because either clock can be the one that excluded it, and "no decision by
+that title" would send you looking for a spelling mistake instead.
+
+A decision that stood then and does not now reads as *stood as of*, not *still
+stands*. The walk to whatever replaced it is made at the same clock, so a
+supersession recorded in August does not retire anything in March.
 
 That timeline used to be cut at **observation** times rather than valid ones, so
 the case this store's design opens with — told in September that a job changed
@@ -194,8 +232,80 @@ rmem decide "Retrieval reranking" "a cross-encoder over the top 200" \
   --because "the k-curve is still 0.926 at k=200 -- there is nothing to rerank into"
 ```
 
+### How far a decision reaches
+
+`decide` requires a `--scope`, and it is the one argument with no default.
+
+A scope is not a label of where a decision was made. It is a statement of where
+it *applies*. "Never run scale benchmarks on this laptop" gets written while
+working on one project and is true of every project on the machine; tagged with
+where it was written, it would disappear the moment you started something else.
+So the question is not "what was I working on" but "where would this still be
+true".
+
+There is one rule:
+
+> A decision applies where its scope is an ancestor-or-self of the asker's
+> position.
+
+A session at `work/goldenmatch/fs` sees decisions scoped `work/goldenmatch/fs`,
+`work/goldenmatch`, `work` and `*`. It does not see `work/goldenmatch/er`, and
+it does not see `personal`. Segments are compared one at a time, so `prod` never
+matches `production`, and the store never interprets the names — depth and
+naming are yours.
+
+```sh
+rmem decide "Never benchmark on the laptop" "run heavy compute in CI" --scope '*'
+rmem decide "Route scorers by class" "dispatch on the class, not the mass"   --scope work/goldenmatch/fs
+
+RMEM_SCOPE=work/goldenmatch/fs rmem decisions   # both of the above
+RMEM_SCOPE=personal rmem decisions              # only the first
+rmem decisions --all                            # everything, reach ignored
+```
+
+`RMEM_SCOPE` says where a session stands and is **read-side only**. It is never
+a write default, because reach varies per decision and only the writer knows
+it — which is also why `decide` refuses rather than guessing.
+
+Asking for a title that exists but does not reach you is not the same as asking
+for one that does not exist, and does not read like it: you are told where it
+does apply. A decision recorded before scopes existed carries none and reaches
+everywhere, so nothing disappeared when this arrived.
+
+Reach is about relevance, not permission. `--all` shows everything; none of this
+is a boundary.
+
+### Correcting a reach without re-deciding
+
+```sh
+rmem rescope "Pin the compiler" --scope '*'
+```
+
+`decide` takes the title and the choice positionally, so attaching a scope
+through it writes a second `choice`. Nothing about the decision changed, but
+`revisions` counts choice versions, so the entry then reads *revised 2 times*
+and the log has a revision in it that never happened. Over a backfill of a few
+hundred records that is the whole log falsified.
+
+`rescope` writes the scope and nothing else. It refuses a title it cannot find
+rather than creating one, because a decision holding a reach and no choice is
+not a decision — and during a backfill an unresolved title is overwhelmingly a
+typo, which is when a silent create is least visible and most expensive.
+
+It reports what the decision reached before, and the three cases are different
+things to have done: it had none, it reached somewhere else, or it already
+reached exactly this and nothing was written.
+
+**The scope's valid time follows the decision, not the clock.** Attaching a
+reach to a decision that never had one says *this is how far it always reached*,
+so it is dated from the decision's own earliest choice — transaction time stays
+now, because the store genuinely only just learned it. Changing a reach that was
+already recorded is the other thing: the reach changed today, so that one is
+dated from today. Backfilling from now would have the store claim every
+decision's reach began the day the backfill ran.
+
 That example is not invented. `docs/seed-decision-log.sh` records this project's
-own log — thirty decisions from eleven merged pull requests, the options tried
+own log — the options tried
 and turned down with the numbers that killed them, and the three supersession
 chains that actually happened. Run it against an empty store to see what the
 thing reads like holding real history rather than a demo.
@@ -276,6 +386,7 @@ separate processes, all eight landing.
   "command": "rmem-mcp",
   "env": {
     "RMEM_CONFIG": "D:/memory/rmem.toml",
+    "RMEM_SCOPE": "work/goldenmatch",
     "RMEM_TOOLS": "decide,decisions,decision"
   }
 }
@@ -286,15 +397,29 @@ it each session reads `./rmem.toml` from its own directory, and eventually one
 of them points somewhere else -- a divergence nothing reports, because two
 stores are not an error.
 
+`RMEM_SCOPE` is what makes one shared store readable by many projects. Without
+it every session sees every decision, which is the state that made a flat log of
+219 unusable — and it says where a session *stands*, never how far its writes
+reach, which each `decide` states for itself.
+
 `RMEM_TOOLS` is what it costs. The tool table is sent on every turn of every
 session that has this configured, used or not:
 
 | exposed | tools | tokens per turn |
 |---|---|---|
-| everything | 8 | ~1,700 |
-| `decide,decisions,decision,recall` | 4 | ~1,060 |
-| `decide,decisions,decision` | 3 | ~810 |
-| `decisions,decision` | 2 | ~360 |
+| everything | 8 | ~2,010 |
+| `decide,decisions,decision,recall` | 4 | ~1,370 |
+| `decide,decisions,decision` | 3 | ~1,130 |
+| `decisions,decision` | 2 | ~610 |
+
+These figures are measured, and they have moved twice. The two clocks
+(`as_of`, `valid_at`) added about 154 tokens to every row, because `decisions`
+and `decision` appear in all of them. Scope added about 162 more to the rows
+carrying `decide`, and about 93 to the row that does not — it gains the two read
+parameters but not `decide`'s own.
+
+Both are written down rather than absorbed quietly, and both first drafts came
+in over budget and were cut back: 209 tokens for the clocks, 236 for scope.
 
 For comparison, a thirty-decision log is about 1,850 tokens to read in full. A
 project that only ever consults decisions should not pay most of that again,
@@ -376,20 +501,51 @@ reversible: `rmem reindex` rebuilds the index under whichever is configured.
 
 ## Crates
 
-| Crate | Status | Role |
+**`0.1` means the surface will not break without a version bump. `0.0` means it
+moves.** Nothing is published to crates.io — sibling dependencies are declared
+by path with no version, which cargo refuses to publish — so these are promises
+to a reader of this repository, not to a package manager. Publishing is a
+separate decision with a release cadence and a deprecation policy behind it.
+
+| Crate | Version | Role |
 |---|---|---|
-| `rm-core` | in progress | Provenance and the bi-temporal model |
-| `rm-survivor` | in progress | Survivorship strategies |
-| `rm-store` | in progress | Bi-temporal record store with attribute history |
-| `rm-graph` | in progress | Entity graph, k-hop retrieval |
-| `rm-resolve` | in progress | Probabilistic entity resolution, with a review band |
-| `rm-index` | in progress | Exact vector search: deletion, filtering, persistence |
-| `rm-extract` | in progress | Turn → mentions/edges, and whether arrival implies departure |
-| `rm-engine` | in progress | `remember()` / `recall()` / `forget()` |
-| `rm-providers` | in progress | `Completer`/`Embedder` over an OpenAI-compatible API |
-| `rm-host` | in progress | Config, store file, and the operations over them |
-| `rm-cli` | in progress | `rmem`, the command line |
-| `rm-mcp` | in progress | `rmem-mcp`, the MCP server |
+| `rm-core` | 0.1 | Provenance and the bi-temporal model |
+| `rm-survivor` | 0.1 | Survivorship strategies |
+| `rm-store` | 0.1 | Bi-temporal record store with attribute history |
+| `rm-graph` | 0.1 | Entity graph, k-hop retrieval |
+| `rm-resolve` | 0.1 | Probabilistic entity resolution, with a review band |
+| `rm-index` | 0.1 | Exact vector search: deletion, filtering, persistence |
+| `rm-embed` | 0.1 | Subword hashing, for vectors without a service |
+| `rm-providers` | 0.0 | `Completer`/`Embedder` over an OpenAI-compatible API |
+| `rm-extract` | 0.0 | Turn → mentions/edges, and whether arrival implies departure |
+| `rm-engine` | 0.0 | `remember()` / `recall()` / `forget()` |
+| `rm-host` | 0.0 | Config, store file, and the operations over them |
+| `rm-cli` | 0.0 | `rmem`, the command line |
+| `rm-mcp` | 0.0 | `rmem-mcp`, the MCP server |
+| `rm-conform` | 0.0 | The conformance suite. Internal; nothing depends on it |
+
+The split is measured rather than felt. Counting source files touched across
+the last thirty commits — a run that added two features, a command, a bug fix
+and a conformance axis:
+
+| | | | |
+|---|---|---|---|
+| `rm-embed` | 1 | `rm-extract` | 12 |
+| `rm-graph` | 1 | `rm-conform` | 17 |
+| `rm-core` | 2 | `rm-engine` | 28 |
+| `rm-survivor` | 4 | `rm-host` | 32 |
+| `rm-store`, `rm-resolve`, `rm-index` | 5 | `rm-mcp` | 50 |
+| `rm-providers` | 5 | `rm-cli` | 54 |
+
+Everything is at or below 5, or at or above 12. The gap is the line.
+`rm-survivor`'s only change in that window was a doc comment, and it is the
+crate `rm-conform` differentially verifies across 500 generated histories,
+which is the difference between calling a surface stable and having checked.
+
+`rm-providers` is the one exception to the measurement: its churn is 5, but its
+*behaviour* depends on a third-party API contract this project does not
+control, and promising stability for that is a different promise from promising
+it for a pure function. It stays 0.0 deliberately.
 
 No *library* crate touches the network, and every library crate's third-party
 dependencies come from `serde` and `serde_json` alone. The two things that need

@@ -14,7 +14,8 @@
 use serde_json::{json, Value};
 
 use rm_engine::{Believed, Provenance, Recalled, Source, Standing};
-use rm_host::command::{MentionLanding, Outcome};
+use rm_host::command::{Found, MentionLanding, Outcome};
+use rm_host::time::format_day;
 
 /// What one tool call returns.
 pub struct Rendered {
@@ -217,11 +218,51 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }
         }
 
-        Outcome::Decision(None) => Rendered {
+        // `found: true` with `applies_here: false`, never `found: false`: the
+        // title is real, and telling a model otherwise is telling it something
+        // untrue about its own store.
+        Outcome::Decision(Found::NotHere {
+            title,
+            scope,
+            asked_from,
+        }) => Rendered {
+            text: format!(
+                "{title:?} is on record, but it does not apply here. It reaches {scope:?}                  and you asked from {asked_from:?}. Pass scope={scope:?} to ask from there,                  or all=true to ignore reach."
+            ),
+            structured: json!({
+                "found": true,
+                "applies_here": false,
+                "scope": scope,
+                "asked_from": asked_from,
+            }),
+        },
+        Outcome::Decision(Found::Unknown) => Rendered {
             text: "No decision has that title. Titles are matched exactly -- call `decisions` to see them as recorded.".to_string(),
             structured: json!({"found": false}),
         },
-        Outcome::Decision(Some(d)) => {
+        // Not the same as the above, and the difference is the whole reason
+        // this variant exists: the title is real, so a model told "no such
+        // decision" would go looking for a spelling mistake instead of
+        // widening its clock.
+        Outcome::Decision(Found::NotYetRecorded {
+            title,
+            first_recorded,
+            first_held,
+        }) => Rendered {
+            text: format!(
+                "{title:?} is on record, but nothing of it stood at the time you asked.
+                 It was first recorded {} and holds from {}. Ask on or after both                  of those, or drop as_of and valid_at for what stands now.",
+                format_day(*first_recorded),
+                format_day(*first_held),
+            ),
+            structured: json!({
+                "found": true,
+                "stood_then": false,
+                "first_recorded": format_day(*first_recorded),
+                "first_held": format_day(*first_held),
+            }),
+        },
+        Outcome::Decision(Found::Decision(d)) => {
             let mut text = format!("{} [{}]\n  {}\n", d.title, d.status, d.choice);
             if let Some(why) = &d.because {
                 text.push_str(&format!("  because {why}\n"));
@@ -293,6 +334,27 @@ pub fn render(outcome: &Outcome) -> Rendered {
                 }),
             }
         }
+
+        Outcome::Rescoped {
+            entity,
+            title,
+            scope,
+            previous,
+        } => Rendered {
+            text: match previous {
+                None => format!("{title:?} now reaches {scope}. It had no scope before."),
+                Some(was) if was == scope => {
+                    format!("{title:?} already reached {scope}. Nothing changed.")
+                }
+                Some(was) => format!("{title:?} now reaches {scope}, where it reached {was}."),
+            },
+            structured: json!({
+                "entity": entity.to_string(),
+                "title": title,
+                "scope": scope,
+                "previous": previous,
+            }),
+        },
 
         Outcome::Reindexed {
             assertions,

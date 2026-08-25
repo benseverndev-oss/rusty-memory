@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use rm_engine::{Completer, Embedder, Engine, Timestamp};
 use rm_host::command::{self, Outcome};
 use rm_host::config::Config;
+use rm_host::time::At;
 use rm_host::{store, HostError};
 
 use crate::jsonrpc::{self, Request};
@@ -123,6 +124,25 @@ pub struct Handshake {
     /// `2025-06-18`, and a client that settled on something older and is
     /// answered as though it had not gets a field its parser has never seen.
     pub negotiated: Option<String>,
+}
+
+/// Where a read is asked from.
+///
+/// `all` beats an explicit scope, which beats the environment; `None` is no
+/// position, which suspends the applicability rule.
+///
+/// The environment is read here rather than threaded from startup, matching
+/// `tools::definitions`, which reads `TOOLS_ENV` the same way. This binary has
+/// no clock-style spine to hang it on, and a long-lived process's environment
+/// does not change under it.
+fn position(scope: Option<String>, all: bool) -> Option<String> {
+    if all {
+        return None;
+    }
+    // Normalised rather than taken raw: `RMEM_SCOPE=` in a shell, or an empty
+    // string in a JSON `env` block, reads as "not configured" and would
+    // otherwise be the root position, where only `*` reaches.
+    rm_host::scope::position(scope.or_else(|| std::env::var(crate::tools::SCOPE_ENV).ok()))
 }
 
 impl<P, F> Server<P, F>
@@ -329,7 +349,7 @@ where
             .cloned()
             .unwrap_or_else(|| json!({}));
 
-        let call = match Call::read(name, &arguments, now, self.client.as_deref()) {
+        let call = match Call::read(name, &arguments, self.client.as_deref()) {
             Ok(call) => call,
             Err(why) => return Ok(refused(era, &why)),
         };
@@ -481,6 +501,7 @@ where
             Call::Decide {
                 title,
                 choice,
+                scope,
                 status,
                 decided_at,
                 because,
@@ -495,6 +516,7 @@ where
                 Ok(Planned::Decide(command::plan_decide(
                     title,
                     choice,
+                    scope,
                     status.as_deref(),
                     because.as_deref(),
                     context.as_deref(),
@@ -538,10 +560,50 @@ where
                     as_of,
                 },
                 _,
-            ) => command::about(engine, entity, &attribute, valid_at, as_of),
+            ) => command::about(engine, entity, &attribute, valid_at, as_of, now),
             (Call::Reviews, _) => command::review_list(engine),
-            (Call::Decisions { status }, _) => command::decisions(engine, status.as_deref()),
-            (Call::Decision { title }, _) => command::decision(engine, &title),
+            (
+                Call::Decisions {
+                    status,
+                    valid_at,
+                    as_of,
+                    scope,
+                    all,
+                },
+                _,
+            ) => {
+                let here = position(scope, all);
+                command::decisions(
+                    engine,
+                    status.as_deref(),
+                    At {
+                        valid: valid_at.unwrap_or(Timestamp::MAX),
+                        tx: as_of.unwrap_or(Timestamp::MAX),
+                    },
+                    here.as_deref(),
+                )
+            }
+            (
+                Call::Decision {
+                    title,
+                    valid_at,
+                    as_of,
+                    scope,
+                    all,
+                },
+                _,
+            ) => {
+                let here = position(scope, all);
+                command::decision(
+                    engine,
+                    &title,
+                    At {
+                        valid: valid_at.unwrap_or(Timestamp::MAX),
+                        tx: as_of.unwrap_or(Timestamp::MAX),
+                    },
+                    here.as_deref(),
+                )
+            }
             (other, _) => unreachable!("{other:?} writes, or was not planned"),
         }
     }

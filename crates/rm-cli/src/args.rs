@@ -30,6 +30,7 @@
 //! reading a file in here needs this paragraph revisited.
 
 use rm_engine::Timestamp;
+use rm_host::scope::UNIVERSAL;
 
 use crate::CliError;
 
@@ -47,13 +48,23 @@ rmem — a memory that resolves contradictions deterministically
     rmem review                      open questions the resolver could not answer
     rmem review confirm <id>         answer one: the same thing
     rmem review reject <id>          answer one: different things
-    rmem decide \"<title>\" \"<choice>\" [--because <why>] [--context <what prompted it>]
+    rmem decide \"<title>\" \"<choice>\" --scope <s> [--because <why>]
+                                     [--context <what prompted it>]
                                      [--status proposed|accepted|rejected|deprecated]
                                      [--supersedes \"<title>\"] [--at YYYY-MM-DD]
-                                     record a decision under a stable, findable title
-    rmem decisions [--status <s>]    every decision, and whether it still stands
+                                     record a decision under a stable, findable title.
+                                     --scope says how far it reaches: * for
+                                     everywhere, or a path like work/goldenmatch
+    rmem decisions [--status <s>] [--scope <s>] [--all]
+                   [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
+                                     every decision, and whether it still stands
+    rmem rescope \"<title>\" --scope <scope>
+                                     correct how far one decision reaches,
+                                     without recording a new choice
     rmem reindex                     re-embed every assertion under the current provider
-    rmem decision \"<title>\"          one decision in full, and the chain it sits in
+    rmem decision \"<title>\" [--scope <s>] [--all]
+                   [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
+                                     one decision in full, and the chain it sits in
 
 Entity ids come from `remember` and `recall`. Review ids come from `review`.
 A decision is found again by its title, so write one you would search for.
@@ -90,6 +101,9 @@ pub enum Command {
     Decide {
         title: String,
         choice: String,
+        /// How far this decision reaches. Required: reach varies per decision,
+        /// so no session default can be right.
+        scope: String,
         /// One of `DECISION_STATUSES`. `None` means `accepted`.
         status: Option<String>,
         /// When the decision was made, as milliseconds. `None` means now.
@@ -105,13 +119,55 @@ pub enum Command {
     Decisions {
         /// Show only decisions with this status. `None` shows every one.
         status: Option<String>,
+        /// Ask from this position instead of `RMEM_SCOPE`.
+        scope: Option<String>,
+        /// Suspend the applicability rule and show everything.
+        all: bool,
+        /// What held then. `None` is what holds now.
+        valid_at: Option<Timestamp>,
+        /// What the store knew then. `None` is what it knows now.
+        as_of: Option<Timestamp>,
+    },
+    /// Correct how far one existing decision reaches, and nothing else.
+    ///
+    /// Separate from `Decide` because re-deciding to attach a scope writes a
+    /// second `choice`, and `revisions` counts those -- every backfilled
+    /// decision would read as revised when none was.
+    Rescope {
+        title: String,
+        scope: String,
     },
     /// Rebuild every vector in the store under the current provider.
     Reindex,
     /// Read one decision by its exact title.
     Decision {
         title: String,
+        /// Ask from this position instead of `RMEM_SCOPE`.
+        scope: Option<String>,
+        /// Suspend the applicability rule and show everything.
+        all: bool,
+        /// What held then. `None` is what holds now.
+        valid_at: Option<Timestamp>,
+        /// What the store knew then. `None` is what it knows now.
+        as_of: Option<Timestamp>,
     },
+}
+
+/// A `YYYY-MM-DD` flag, as the *end* of the day it names.
+///
+/// Both axes read this way, so a query naming today sees what was recorded this
+/// morning. See `rm_host::time::parse_day_end`.
+///
+/// A free function rather than a closure per command: `about`, `decisions` and
+/// `decision` all take these two flags, and three copies is three places for
+/// the end-of-day reading to stop being true in one of them.
+fn day(args: &[String], name: &str) -> Result<Option<Timestamp>, CliError> {
+    match flag(args, name)? {
+        None => Ok(None),
+        Some(d) => rm_host::time::parse_day_end(&d)
+            .map(Some)
+            .map_err(CliError::Usage),
+    }
 }
 
 /// The value after a named flag, if the flag is there.
@@ -238,22 +294,11 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                     "{entity:?} is not an entity id -- they are numbers, printed by `remember` and `recall`\n\n{USAGE}"
                 ))
             })?;
-            // Both axes read as the *end* of the day they name, so a query
-            // naming today sees what was recorded this morning. See
-            // `rm_host::time::parse_day_end`.
-            let day = |name: &str| -> Result<Option<Timestamp>, CliError> {
-                match flag(&args, name)? {
-                    None => Ok(None),
-                    Some(d) => rm_host::time::parse_day_end(&d)
-                        .map(Some)
-                        .map_err(CliError::Usage),
-                }
-            };
             Ok(Command::About {
                 entity,
                 attribute: attribute.clone(),
-                valid_at: day("--valid-at")?,
-                as_of: day("--as-of")?,
+                valid_at: day(&args, "--valid-at")?,
+                as_of: day(&args, "--as-of")?,
             })
         }
 
@@ -283,9 +328,17 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                     "decide takes the title and the choice first, before any flags\n\n{USAGE}"
                 )));
             }
+            let Some(scope) = flag(&args, "--scope")? else {
+                return Err(CliError::Usage(format!(
+                    "decide needs --scope: how far this decision reaches. {UNIVERSAL:?} for everywhere, or a path like \"work/goldenmatch\"
+
+{USAGE}"
+                )));
+            };
             Ok(Command::Decide {
                 title: title.clone(),
                 choice: choice.clone(),
+                scope,
                 status: flag(&args, "--status")?,
                 decided_at: flag(&args, "--at")?
                     .map(|d| rm_host::time::parse_day(&d).map_err(CliError::Usage))
@@ -296,10 +349,42 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
             })
         }
 
+        "rescope" => {
+            let Some(title) = args.get(1) else {
+                return Err(CliError::Usage(format!(
+                    "rescope needs the title of the decision to correct
+
+{USAGE}"
+                )));
+            };
+            if title.starts_with("--") {
+                return Err(CliError::Usage(format!(
+                    "rescope takes the title first, before any flags
+
+{USAGE}"
+                )));
+            }
+            let Some(scope) = flag(&args, "--scope")? else {
+                return Err(CliError::Usage(format!(
+                    "rescope needs --scope: how far this decision reaches. {UNIVERSAL:?} for everywhere, or a path like \"work/goldenmatch\"
+
+{USAGE}"
+                )));
+            };
+            Ok(Command::Rescope {
+                title: title.clone(),
+                scope,
+            })
+        }
+
         "reindex" => Ok(Command::Reindex),
 
         "decisions" => Ok(Command::Decisions {
             status: flag(&args, "--status")?,
+            scope: flag(&args, "--scope")?,
+            all: args.iter().any(|a| a == "--all"),
+            valid_at: day(&args, "--valid-at")?,
+            as_of: day(&args, "--as-of")?,
         }),
 
         // Singular, and a different command: `decisions` is the index and this
@@ -314,6 +399,10 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
             };
             Ok(Command::Decision {
                 title: title.clone(),
+                scope: flag(&args, "--scope")?,
+                all: args.iter().any(|a| a == "--all"),
+                valid_at: day(&args, "--valid-at")?,
+                as_of: day(&args, "--as-of")?,
             })
         }
 
@@ -341,20 +430,24 @@ mod tests {
     #[test]
     fn a_decision_can_be_dated_and_a_bad_date_is_refused() {
         let Ok(Command::Decide { decided_at, .. }) =
-            parse_args(&["decide", "T", "C", "--at", "2026-03-14"])
+            parse_args(&["decide", "T", "C", "--scope", "work", "--at", "2026-03-14"])
         else {
             panic!("a good date should parse")
         };
         // 2026-03-14T00:00:00Z
         assert_eq!(decided_at, Some(1_773_446_400_000));
 
-        let Ok(Command::Decide { decided_at, .. }) = parse_args(&["decide", "T", "C"]) else {
+        let Ok(Command::Decide { decided_at, .. }) =
+            parse_args(&["decide", "T", "C", "--scope", "work"])
+        else {
             panic!()
         };
         assert_eq!(decided_at, None, "no flag means now, decided downstream");
 
         for bad in ["14/03/2026", "March", "2026-3-14", "2026-02-30"] {
-            let Err(CliError::Usage(why)) = parse_args(&["decide", "T", "C", "--at", bad]) else {
+            let Err(CliError::Usage(why)) =
+                parse_args(&["decide", "T", "C", "--scope", "work", "--at", bad])
+            else {
                 panic!("{bad:?} should be refused")
             };
             assert!(!why.is_empty(), "for {bad:?}");
@@ -411,12 +504,22 @@ mod tests {
     fn decisions_parses_its_filter() {
         assert_eq!(
             parse_args(&["decisions"]).unwrap(),
-            Command::Decisions { status: None }
+            Command::Decisions {
+                status: None,
+                scope: None,
+                all: false,
+                valid_at: None,
+                as_of: None
+            }
         );
         assert_eq!(
             parse_args(&["decisions", "--status", "rejected"]).unwrap(),
             Command::Decisions {
-                status: Some("rejected".into())
+                status: Some("rejected".into()),
+                scope: None,
+                all: false,
+                valid_at: None,
+                as_of: None
             }
         );
     }
@@ -671,5 +774,81 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("--speaker needs a name"), "{err}");
+    }
+
+    #[test]
+    fn the_decision_reads_take_both_clocks() {
+        let Command::Decision {
+            valid_at,
+            as_of,
+            title,
+            ..
+        } = parse_args(&[
+            "decision",
+            "Pin the compiler",
+            "--valid-at",
+            "2026-03-01",
+            "--as-of",
+            "2026-08-24",
+        ])
+        .unwrap()
+        else {
+            panic!("not a decision command")
+        };
+        assert_eq!(title, "Pin the compiler");
+        // End of the named day, same as `about`.
+        assert_eq!(valid_at, Some(1_772_323_200_000 + 86_399_999));
+        assert_eq!(as_of, Some(1_787_529_600_000 + 86_399_999));
+
+        let Command::Decisions {
+            valid_at, as_of, ..
+        } = parse_args(&["decisions", "--as-of", "2026-08-24"]).unwrap()
+        else {
+            panic!("not a decisions command")
+        };
+        assert_eq!(valid_at, None, "an absent flag stays absent");
+        assert_eq!(as_of, Some(1_787_529_600_000 + 86_399_999));
+
+        assert!(
+            parse_args(&["decision", "X", "--as-of", "not-a-date"]).is_err(),
+            "a date that is not one must be refused"
+        );
+    }
+
+    #[test]
+    fn decide_requires_a_scope_and_the_reads_take_a_position() {
+        let Command::Decide { scope, .. } = parse_args(&[
+            "decide",
+            "Pin the compiler",
+            "rust-toolchain.toml names the version",
+            "--scope",
+            "work/goldenmatch",
+        ])
+        .unwrap() else {
+            panic!("not a decide command")
+        };
+        assert_eq!(scope, "work/goldenmatch");
+
+        let e = parse_args(&["decide", "A title", "A choice"]).unwrap_err();
+        assert!(
+            format!("{e}").contains("--scope"),
+            "the refusal should name the flag: {e}"
+        );
+
+        let Command::Decisions { scope, all, .. } =
+            parse_args(&["decisions", "--scope", "personal"]).unwrap()
+        else {
+            panic!("not a decisions command")
+        };
+        assert_eq!(scope.as_deref(), Some("personal"));
+        assert!(!all);
+
+        let Command::Decision { all, scope, .. } =
+            parse_args(&["decision", "A title", "--all"]).unwrap()
+        else {
+            panic!("not a decision command")
+        };
+        assert!(all, "--all suspends the rule");
+        assert_eq!(scope, None);
     }
 }

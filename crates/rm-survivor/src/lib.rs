@@ -271,10 +271,19 @@ pub enum Strategy {
     /// record. Within the winning source, ties resolve by [`Strategy::MostRecent`].
     SourcePriority(Vec<Source>),
     /// Do not pick a winner. Emit each distinct value with the validity range
-    /// over which it stood, inferred from observation order.
+    /// over which it stood.
     ///
-    /// Refuses when two different values share an observation timestamp: with
-    /// no order between them there is no way to say which superseded which.
+    /// Refuses only when two different values collide on *both* axes -- same
+    /// `valid.from` and same `observed_at` -- because then nothing orders them
+    /// and there is no way to say which superseded which.
+    ///
+    /// This sentence used to say "refuses when two different values share an
+    /// observation timestamp", which was true when a `Candidate` carried a
+    /// value and a provenance and no interval, so the timeline could only be
+    /// cut at observation. A `Candidate` carries its validity now, and two
+    /// values heard in the same instant are ordered by when they held. The
+    /// code moved and the prose did not; `rm-conform`'s differential sweep
+    /// found the gap by disagreeing on 53 generated histories.
     ValidInterval,
 }
 
@@ -288,6 +297,21 @@ impl Strategy {
             self,
             Strategy::MostRecent | Strategy::SourcePriority(_) | Strategy::ValidInterval
         )
+    }
+
+    /// Whether this strategy's outcome can be asked about a moment in time.
+    ///
+    /// Only [`Strategy::ValidInterval`] emits a timeline. Every other strategy
+    /// collapses a history to one winner, and a winner has no time dimension,
+    /// so `held_at` returns the same value whatever instant it is handed.
+    ///
+    /// Exposed for the same reason as [`Self::needs_provenance`]: so a host can
+    /// check up front rather than discovering it per read. Without it a caller
+    /// asking what held in March gets an answer that is right about now and
+    /// silent about the difference -- which is exactly what `rmem about
+    /// --valid-at` did on every attribute but one.
+    pub fn keeps_a_timeline(&self) -> bool {
+        matches!(self, Strategy::ValidInterval)
     }
 }
 
@@ -956,5 +980,28 @@ mod tests {
             None,
             "as_of reports an absence as no value"
         );
+    }
+
+    /// The mirror of `needs_provenance_flags_exactly_the_strategies_that_read_it`.
+    /// A strategy added later that emits a timeline and is not listed here
+    /// would be silently unaskable about time.
+    #[test]
+    fn keeps_a_timeline_flags_exactly_the_strategy_that_emits_one() {
+        assert!(Strategy::ValidInterval.keeps_a_timeline());
+        for s in [
+            Strategy::MostRecent,
+            Strategy::MostComplete,
+            Strategy::LongestValue,
+            Strategy::MajorityVote,
+            Strategy::ConfidenceMajority,
+            Strategy::FirstNonNull,
+            Strategy::UnanimousOrNull,
+            Strategy::SourcePriority(vec![]),
+        ] {
+            assert!(
+                !s.keeps_a_timeline(),
+                "{s:?} collapses to a winner, which has no time dimension"
+            );
+        }
     }
 }

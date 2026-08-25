@@ -1,6 +1,6 @@
 [package]
 name = "rm-graph"
-version = "0.0.0"
+version = "0.1.0"
 description = "Deterministic k-hop traversal over rusty-memory's bi-temporal edges"
 edition.workspace = true
 rust-version.workspace = true

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use rm_engine::{
     Believed, Embedder, Engine, Ingested, Interval, Metric, Observation, Prepared, Provenance,
-    Query, Recalled, Record, ReviewId, Source, StableId, Supersession, Timestamp,
+    Query, Recalled, Record, ReviewId, Source, StableId, Supersession, Timestamp, Version,
 };
 use rm_extract::{Completer, Extraction, Turn};
 
@@ -18,6 +18,7 @@ use rm_extract::{Completer, Extraction, Turn};
 pub use rm_extract::Dropped;
 
 use crate::config::TEMPLATE;
+use crate::time::At;
 use crate::HostError;
 
 /// One mention and where it ended up.
@@ -123,7 +124,18 @@ pub enum Outcome {
     /// One decision read in full. `None` when no decision has that title --
     /// reported rather than empty, because "no such decision" and "a decision
     /// with nothing in it" are different answers.
-    Decision(Option<Box<DecisionDetail>>),
+    Decision(Found),
+    /// A decision's reach was corrected, and nothing else about it changed.
+    Rescoped {
+        entity: StableId,
+        title: String,
+        scope: String,
+        /// What it reached before. `None` when it had no scope at all, which
+        /// is the backfill case -- and worth distinguishing, because
+        /// "widened from work/goldenmatch" and "had none" are different
+        /// things to have done.
+        previous: Option<String>,
+    },
 }
 
 /// One decision as a caller sees it.
@@ -159,6 +171,52 @@ pub struct DecisionLine {
     pub superseded_by: Option<(StableId, String)>,
 }
 
+/// What looking for one decision found.
+///
+/// Three answers rather than two, because the store holds the difference and
+/// collapsing it loses information a reader needs. `find_decision` matches on
+/// the identity record's `name`, which is not versioned, so a decision recorded
+/// after `at.tx` still resolves by title -- and answering "no such decision"
+/// for it would read as a spelling mistake and send the reader looking for one.
+///
+/// The same distinction `Believed` draws between `Absent` ("someone said there
+/// is none") and `Unknown` ("it has never come up").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    /// The decision, as it stood at the time asked about.
+    Decision(Box<DecisionDetail>),
+    /// The title resolves, but nothing of it stood at `at`.
+    ///
+    /// Both days are carried because either clock can be the one that excluded
+    /// it and they are not the same question. A decision backdated to March and
+    /// typed up in August is invisible before March on the valid axis and
+    /// before August on the transaction axis, and a reader told only "first
+    /// recorded August" would not understand why asking about April also came
+    /// back empty.
+    NotYetRecorded {
+        title: String,
+        /// The first moment the store heard of this decision.
+        first_recorded: Timestamp,
+        /// The first moment it claims to have held.
+        first_held: Timestamp,
+    },
+    /// The title resolves, and the decision does not reach where it was asked
+    /// from.
+    ///
+    /// Distinct from `Unknown` for the same reason `NotYetRecorded` is: the
+    /// title matched, so "no decision by that title" would read as a spelling
+    /// mistake. You named it exactly, so you are told where it lives.
+    NotHere {
+        title: String,
+        /// The reach the decision states.
+        scope: String,
+        /// The position it was asked from.
+        asked_from: String,
+    },
+    /// No decision by that title.
+    Unknown,
+}
+
 /// One decision, in full, with the chain it sits in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecisionDetail {
@@ -180,6 +238,13 @@ pub struct DecisionDetail {
     /// was made rather than the day it was typed up. One entry is a decision
     /// made once; more is a decision re-decided under the same title.
     pub history: Vec<(Timestamp, String)>,
+    /// The clock this answer was given under, or `None` for what stands now.
+    ///
+    /// A `DecisionDetail` is an answer at a time, not a timeless fact, and
+    /// renderers need to know which. `still_stands` is evaluated at this clock,
+    /// so a reader shown "this is what stands" under a past `as_of` would be
+    /// told the present tense about the past.
+    pub answered_at: Option<At>,
 }
 
 /// The attributes a decision is recorded under, and whether each admits one
@@ -196,7 +261,7 @@ pub struct DecisionDetail {
 /// stated reason at a time; re-deciding under the same title is a correction
 /// and that is precisely what `Standing::Corrected` should say about the old
 /// one.
-const DECISION_FIELDS: [&str; 4] = ["status", "choice", "because", "context"];
+const DECISION_FIELDS: [&str; 5] = ["status", "choice", "because", "context", "scope"];
 
 /// What a decision's `status` may be, and the whole of it.
 ///
@@ -458,15 +523,40 @@ pub fn commit_recall(
 }
 
 /// What the store believes an attribute held.
+///
+/// `valid_at` is an `Option` rather than a resolved timestamp because the two
+/// cases are different questions and only the caller can tell them apart.
+/// "What held in March" and "what holds now" arrive here identically once a
+/// default has been applied, and that collapse is precisely why `--valid-at`
+/// could be accepted, do nothing, and say nothing: the information needed to
+/// refuse was destroyed one layer above the check.
 pub fn about(
     engine: &Engine,
     entity: StableId,
     attribute: &str,
-    valid_t: rm_engine::Timestamp,
-    tx_t: rm_engine::Timestamp,
+    valid_at: Option<Timestamp>,
+    as_of: Option<Timestamp>,
+    now: Timestamp,
 ) -> Result<Outcome, HostError> {
+    // Asked about a moment, under a strategy that has no moments. Refused
+    // rather than warned, because a warning on stderr is a wrong answer with a
+    // note attached -- and this codebase refuses everywhere else it has faced
+    // the same choice.
+    if valid_at.is_some() {
+        let strategy = engine.policy().for_attribute(attribute);
+        if !strategy.keeps_a_timeline() {
+            return Err(HostError::Refused(format!(
+                "{attribute:?} is resolved by {strategy:?}, which picks one winner rather than keeping a timeline, so there is no moment to ask about -- every date would answer the same. Set `{attribute} = \"valid_interval\"` under [policy.attribute] in rmem.toml to keep one, or drop --valid-at to read what stands."
+            )));
+        }
+    }
     engine
-        .about(entity, attribute, valid_t, tx_t)
+        .about(
+            entity,
+            attribute,
+            valid_at.unwrap_or(now),
+            as_of.unwrap_or(now),
+        )
         .map(Outcome::About)
         .map_err(|e| HostError::Refused(e.to_string()))
 }
@@ -558,6 +648,7 @@ pub fn decide(
     engine: &mut Engine,
     title: &str,
     choice: &str,
+    scope: &str,
     status: Option<&str>,
     because: Option<&str>,
     context: Option<&str>,
@@ -570,6 +661,7 @@ pub fn decide(
     let plan = plan_decide(
         title,
         choice,
+        scope,
         status,
         because,
         context,
@@ -621,6 +713,9 @@ pub struct DecidePlan {
 pub fn plan_decide(
     title: &str,
     choice: &str,
+    // How far this decision reaches. Required, and never defaulted: reach
+    // varies per decision, so neither the session nor the store can supply it.
+    scope: &str,
     status: Option<&str>,
     because: Option<&str>,
     context: Option<&str>,
@@ -640,6 +735,10 @@ pub fn plan_decide(
             "a decision needs a title and a choice: the title is how it is found again, and the choice is what was decided".into(),
         ));
     }
+
+    // Before the embedder, so a typo costs nothing -- the same bargain the
+    // status checks below make.
+    crate::scope::validate(scope).map_err(HostError::Refused)?;
 
     let status = status.unwrap_or(DEFAULT_STATUS);
     // Refused before the embedder is called, so a typo costs nothing. Named
@@ -672,6 +771,7 @@ pub fn plan_decide(
         ("choice", Some(choice)),
         ("because", because),
         ("context", context),
+        ("scope", Some(scope)),
     ] {
         let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
             continue;
@@ -784,8 +884,186 @@ pub fn commit_decide(engine: &mut Engine, plan: DecidePlan) -> Result<Outcome, H
     })
 }
 
+/// The versions of one attribute both clocks admit, oldest first.
+///
+/// The raw version log filtered rather than `Engine::about`, deliberately. A
+/// decision's timeline is built here from the versions themselves, so a
+/// valid-time question is answered without a survivorship strategy -- and
+/// therefore without depending on `[policy]`, where the shipped default is
+/// `most_recent` and a valid time has nothing to index into.
+/// A correction to one decision's reach, embedded and ready to write.
+pub struct RescopePlan {
+    title: String,
+    scope: String,
+    observed_at: Timestamp,
+    session: String,
+    field: FieldWrite,
+}
+
+/// Embed a new reach for an existing decision. No store, no lock.
+///
+/// # Why this is not `decide` with one argument changed
+///
+/// `decide` writes every field it is given, and `choice` is one of them. Two
+/// of them, after a re-decide: `revisions` counts the visible versions of
+/// `choice`, so re-deciding a decision purely to attach a scope leaves it
+/// reading "revised 2 times" when nothing about the choice was revised. Across
+/// a backfill that is every decision in the log claiming a revision that never
+/// happened -- a decision log that lies about its own history is worse than
+/// one missing an attribute.
+///
+/// This writes `scope` and touches nothing else, so the count stays true.
+pub fn plan_rescope(
+    title: &str,
+    scope: &str,
+    observed_at: Timestamp,
+    session: &str,
+    embedder: &impl Embedder,
+) -> Result<RescopePlan, HostError> {
+    if title.trim().is_empty() {
+        return Err(HostError::Refused(
+            "rescope needs the title of the decision to correct".into(),
+        ));
+    }
+    // Before the embedder, so a typo costs nothing -- the same bargain
+    // `plan_decide` makes.
+    crate::scope::validate(scope).map_err(HostError::Refused)?;
+    Ok(RescopePlan {
+        title: title.to_string(),
+        scope: scope.to_string(),
+        observed_at,
+        session: session.to_string(),
+        field: embed_field(title, "scope", scope, embedder)?,
+    })
+}
+
+/// Write the new reach. Touches no network.
+///
+/// # An unknown title is refused, never created
+///
+/// `decide` creates a decision when the title is new. This must not: a
+/// decision holding a scope and no choice is not a decision, and the case
+/// where a title does not resolve is overwhelmingly a typo -- which, during a
+/// backfill of hundreds, is precisely when a silent create is most expensive
+/// and least visible.
+///
+/// # Backfill and correction want opposite valid times, and are told apart by
+/// whether a scope was already recorded
+///
+/// Two callers, two right answers:
+///
+/// * **Backfill** -- a reach that was always true and never written down. Its
+///   valid time is the decision's own start, because that is when it started
+///   being true.
+/// * **Correction** -- the reach genuinely changed today, because an effort was
+///   renamed or absorbed. Its valid time is now. Dating it from the decision's
+///   start would assert the decision always reached somewhere it did not, which
+///   is the rewrite-history door that putting scope on a bi-temporal attribute
+///   exists to keep shut.
+///
+/// No flag distinguishes them, because the store already knows: a decision with
+/// no scope recorded is a backfill, and one with a scope is a correction. That
+/// cannot be passed wrong during a run of hundreds.
+///
+/// Note what dating from now does NOT do. A scope invisible at some earlier
+/// clock does not hide the decision from a query at that clock -- `held`
+/// returns `None`, the applicability check does not run, and the decision is
+/// INCLUDED, because a decision with no scope recorded reaches everywhere. So
+/// the failure a backfill dated from now would cause is over-reach in history:
+/// every past query would see it as universal. That is the costly direction,
+/// which is why the backfill case takes the decision's valid time.
+pub fn commit_rescope(engine: &mut Engine, plan: RescopePlan) -> Result<Outcome, HostError> {
+    let RescopePlan {
+        title,
+        scope,
+        observed_at,
+        session,
+        field,
+    } = plan;
+
+    let Some(entity) = find_decision(engine, &title) else {
+        return Err(HostError::Refused(format!(
+            "no decision is titled {title:?}. rescope corrects the reach of a decision that already exists; it does not create one -- a scope with no choice under it is not a decision. Check the title against `rmem decisions`."
+        )));
+    };
+
+    let at = At {
+        valid: observed_at,
+        tx: observed_at,
+    };
+    let previous = held(engine, entity, "scope", at);
+
+    // Writing nothing is the honest answer to "set it to what it already is".
+    // A no-op write would land a second identical version and make the
+    // attribute's history claim a correction that never happened -- the same
+    // falsified-history problem, one attribute over, that keeps this command
+    // out of `decide`.
+    if previous.as_deref() == Some(scope.as_str()) {
+        return Ok(Outcome::Rescoped {
+            entity,
+            title,
+            scope,
+            previous,
+        });
+    }
+
+    let valid_from = match previous {
+        // Correction: the reach changed today, and only today.
+        Some(_) => observed_at,
+        // Backfill: it always reached this far. Read at the latest clock, not
+        // at `at` -- reading the decision's start through a narrower clock
+        // would make it depend on when the backfill happened to run.
+        None => visible(engine, entity, "choice", At::latest())
+            .first()
+            .map_or(observed_at, |v| v.valid.from),
+    };
+
+    write_field(
+        engine,
+        Some(entity),
+        &field,
+        valid_from,
+        observed_at,
+        &session,
+    )?;
+
+    Ok(Outcome::Rescoped {
+        entity,
+        title,
+        scope,
+        previous,
+    })
+}
+
+fn visible<'a>(engine: &'a Engine, id: StableId, attr: &str, at: At) -> Vec<&'a Version> {
+    engine
+        .store_history(id, attr)
+        .iter()
+        .filter(|v| v.provenance.observed_at <= at.tx && v.valid.from <= at.valid)
+        .collect()
+}
+
+/// The value standing at `at`, or `None` if there is none.
+///
+/// Replaces two `latest()` closures that disagreed. `decisions` read the last
+/// *non-tombstone* version and `decision` read the last version and then its
+/// value, so a tombstoned `choice` showed the old choice in the list and an
+/// empty one in the detail. This is `decision`'s reading: a tombstone asserts
+/// the attribute has no value, and stepping past it to report a superseded one
+/// would answer with something the store has been told is no longer true.
+fn held(engine: &Engine, id: StableId, attr: &str, at: At) -> Option<String> {
+    visible(engine, id, attr, at)
+        .last()
+        .and_then(|v| v.value.clone())
+}
+
 /// Every decision the store holds, most recently recorded first.
-pub fn decisions(engine: &Engine, only: Option<&str>) -> Result<Outcome, HostError> {
+pub fn decisions(
+    engine: &Engine,
+    only: Option<&str>,
+    at: At,
+    here: Option<&str>,
+) -> Result<Outcome, HostError> {
     // Checked before the scan rather than silently matching nothing. A status
     // nobody uses and a status that does not exist both return an empty list,
     // and the difference between "we have never rejected anything" and "you
@@ -806,20 +1084,23 @@ pub fn decisions(engine: &Engine, only: Option<&str>) -> Result<Outcome, HostErr
         if record.get("kind") != Some("decision") {
             continue;
         }
-        let latest = |attr: &str| {
-            engine
-                .store_history(id, attr)
-                .iter()
-                .filter_map(|v| v.value.clone())
-                .next_back()
-        };
-        let Some(choice) = latest("choice") else {
+        // A decision with no scope recorded reaches everywhere. That is not a
+        // default for new writes -- those are refused without one -- it is how
+        // records written before scopes existed read, so nothing vanishes.
+        if let (Some(here), Some(reach)) = (here, held(engine, id, "scope", at)) {
+            if !crate::scope::applies_at(&reach, here) {
+                continue;
+            }
+        }
+        // Not visible at `at` means the store had not heard of it yet, and the
+        // existing `continue` is exactly the "absent from the list" answer.
+        let Some(choice) = held(engine, id, "choice", at) else {
             continue;
         };
-        let status = latest("status").unwrap_or_else(|| DEFAULT_STATUS.into());
+        let status = held(engine, id, "status", at).unwrap_or_else(|| DEFAULT_STATUS.into());
         // Read once: it decides the mark and it is shown on the line.
         let superseded_by = engine
-            .edges_into(id, Timestamp::MAX, Timestamp::MAX)
+            .edges_into(id, at.valid, at.tx)
             .iter()
             .find(|e| e.predicate == SUPERSEDES)
             .map(|e| (e.subject, title_of(engine, e.subject)));
@@ -837,11 +1118,11 @@ pub fn decisions(engine: &Engine, only: Option<&str>) -> Result<Outcome, HostErr
             // print as standing while printing `[superseded]` beside itself,
             // which is the one combination that cannot be true.
             still_stands: superseded_by.is_none() && status == DEFAULT_STATUS,
-            revisions: engine.store_history(id, "choice").len(),
+            revisions: visible(engine, id, "choice", at).len(),
             superseded_by,
             status,
             choice,
-            because: latest("because"),
+            because: held(engine, id, "because", at),
         });
     }
     if let Some(want) = only {
@@ -965,18 +1246,52 @@ pub fn commit_reindex(engine: &mut Engine, plan: ReindexPlan) -> Result<Outcome,
 /// replaced; this says by what, and walks the chain to whatever stands now, so
 /// a reader who arrives at a retired decision is carried to the live one
 /// rather than left to guess.
-pub fn decision(engine: &Engine, title: &str) -> Result<Outcome, HostError> {
+pub fn decision(
+    engine: &Engine,
+    title: &str,
+    at: At,
+    here: Option<&str>,
+) -> Result<Outcome, HostError> {
     let Some(id) = find_decision(engine, title) else {
-        return Ok(Outcome::Decision(None));
+        return Ok(Outcome::Decision(Found::Unknown));
     };
-    let latest = |a: &str| {
-        engine
-            .store_history(id, a)
-            .last()
-            .and_then(|v| v.value.clone())
-    };
-    let history: Vec<(Timestamp, String)> = engine
-        .store_history(id, "choice")
+    // `status` is always written by `commit_decide`, so its absence at `at`
+    // means the store had not heard of this decision at all -- not that a field
+    // is missing. The same fact the `Outcome::Decided` construction relies on.
+    if held(engine, id, "status", at).is_none() {
+        let versions = engine.store_history(id, "status");
+        let first_recorded = versions
+            .iter()
+            .map(|v| v.provenance.observed_at)
+            .min()
+            .ok_or_else(|| {
+                HostError::Refused(
+                    "a decision recorded no status, which should not be reachable".into(),
+                )
+            })?;
+        let first_held = versions
+            .iter()
+            .map(|v| v.valid.from)
+            .min()
+            .unwrap_or(first_recorded);
+        return Ok(Outcome::Decision(Found::NotYetRecorded {
+            title: title.to_string(),
+            first_recorded,
+            first_held,
+        }));
+    }
+    // Existence first, reach second. A decision the store had not heard of yet
+    // is a different answer from one it has heard of and that does not apply.
+    if let (Some(here), Some(reach)) = (here, held(engine, id, "scope", at)) {
+        if !crate::scope::applies_at(&reach, here) {
+            return Ok(Outcome::Decision(Found::NotHere {
+                title: title.to_string(),
+                scope: reach,
+                asked_from: here.to_string(),
+            }));
+        }
+    }
+    let history: Vec<(Timestamp, String)> = visible(engine, id, "choice", at)
         .iter()
         // The day it was decided, not the day the store was told. They are
         // the same unless the decision was backdated, and when they differ the
@@ -984,21 +1299,24 @@ pub fn decision(engine: &Engine, title: &str) -> Result<Outcome, HostError> {
         // the entry, and "we typed it up in August" is not.
         .filter_map(|v| Some((v.valid.from, v.value.clone()?)))
         .collect();
-    let status = latest("status").unwrap_or_else(|| DEFAULT_STATUS.into());
-    let superseded_by = chain(engine, id, Direction::Forward);
+    let status = held(engine, id, "status", at).unwrap_or_else(|| DEFAULT_STATUS.into());
+    let superseded_by = chain(engine, id, Direction::Forward, at);
 
-    Ok(Outcome::Decision(Some(Box::new(DecisionDetail {
-        entity: id,
-        title: title.to_string(),
-        choice: latest("choice").unwrap_or_default(),
-        because: latest("because"),
-        context: latest("context"),
-        still_stands: superseded_by.is_empty() && status == DEFAULT_STATUS,
-        status,
-        supersedes: chain(engine, id, Direction::Back),
-        superseded_by,
-        history,
-    }))))
+    Ok(Outcome::Decision(Found::Decision(Box::new(
+        DecisionDetail {
+            entity: id,
+            title: title.to_string(),
+            choice: held(engine, id, "choice", at).unwrap_or_default(),
+            because: held(engine, id, "because", at),
+            context: held(engine, id, "context", at),
+            still_stands: superseded_by.is_empty() && status == DEFAULT_STATUS,
+            status,
+            supersedes: chain(engine, id, Direction::Back, at),
+            superseded_by,
+            history,
+            answered_at: (at != At::latest()).then_some(at),
+        },
+    ))))
 }
 
 /// Which way along the supersession edges to walk.
@@ -1017,14 +1335,14 @@ enum Direction {
 /// each looked reasonable -- is reachable, and a walk that trusted the data
 /// would hang rather than report it. The visited set costs nothing on a chain
 /// of realistic length and turns an infinite loop into a short answer.
-fn chain(engine: &Engine, start: StableId, dir: Direction) -> Vec<(StableId, String)> {
+fn chain(engine: &Engine, start: StableId, dir: Direction, at: At) -> Vec<(StableId, String)> {
     let mut out = Vec::new();
     let mut seen = vec![start];
-    let mut at = start;
+    let mut cursor = start;
     loop {
         let edges = match dir {
-            Direction::Back => engine.edges_from(at, Timestamp::MAX, Timestamp::MAX),
-            Direction::Forward => engine.edges_into(at, Timestamp::MAX, Timestamp::MAX),
+            Direction::Back => engine.edges_from(cursor, at.valid, at.tx),
+            Direction::Forward => engine.edges_into(cursor, at.valid, at.tx),
         };
         let next = edges
             .iter()
@@ -1039,7 +1357,7 @@ fn chain(engine: &Engine, start: StableId, dir: Direction) -> Vec<(StableId, Str
         }
         seen.push(next);
         out.push((next, title_of(engine, next)));
-        at = next;
+        cursor = next;
     }
 }
 
@@ -1412,6 +1730,7 @@ pub(crate) mod tests {
         let plan = plan_decide(
             "Pin the toolchain",
             "rust-toolchain.toml names the version",
+            "work",
             None,
             Some("CI and a working copy were answering different questions"),
             None,
@@ -1424,8 +1743,8 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             probe.calls.get(),
-            3,
-            "status, choice and because -- one embedding each"
+            4,
+            "status, choice, because and scope -- one embedding each"
         );
         assert!(
             probe.always_free.get(),
@@ -1453,9 +1772,482 @@ pub(crate) mod tests {
 
     // ---- decisions ---------------------------------------------------------
 
+    /// Three decisions at three reaches, asked from one position.
+    #[test]
+    fn a_read_returns_what_applies_where_it_is_asked_from() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        let mut t = 1_000;
+        for (title, scope) in [
+            ("Machine wide", "*"),
+            ("Work wide", "work"),
+            ("This project", "work/goldenmatch"),
+            ("A sibling", "work/other"),
+            ("Personal", "personal"),
+        ] {
+            decide(
+                &mut e, title, "a choice", scope, None, None, None, None, None, t, "t", &stub,
+            )
+            .unwrap();
+            t += 10;
+        }
+
+        let titles = |here: Option<&str>| {
+            let Outcome::Decisions(ds) = decisions(&e, None, At::latest(), here).unwrap() else {
+                panic!("decisions did not return decisions")
+            };
+            let mut out: Vec<String> = ds.into_iter().map(|d| d.title).collect();
+            out.sort();
+            out
+        };
+
+        assert_eq!(
+            titles(Some("work/goldenmatch")),
+            vec![
+                "Machine wide".to_string(),
+                "This project".to_string(),
+                "Work wide".to_string()
+            ],
+            "ancestor-or-self, and nothing beside it"
+        );
+        assert_eq!(
+            titles(Some("personal")),
+            vec!["Machine wide".to_string(), "Personal".to_string()]
+        );
+        // No position, no filtering. This is `--all`, and it is also every
+        // caller that never set RMEM_SCOPE.
+        assert_eq!(titles(None).len(), 5);
+    }
+
+    /// An exact title that exists but does not reach here is its own answer,
+    /// for the same reason `NotYetRecorded` is: the title resolved, so "no
+    /// decision by that title" would read as a spelling mistake.
+    #[test]
+    fn a_title_out_of_reach_says_where_it_lives() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "A sibling",
+            "a choice",
+            "work/other",
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_000,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decision(&e, "A sibling", At::latest(), Some("work/goldenmatch")).unwrap(),
+            Outcome::Decision(Found::NotHere {
+                title: "A sibling".to_string(),
+                scope: "work/other".to_string(),
+                asked_from: "work/goldenmatch".to_string(),
+            })
+        );
+
+        // Asked from where it lives, or from nowhere, it is just a decision.
+        for here in [Some("work/other"), None] {
+            assert!(matches!(
+                decision(&e, "A sibling", At::latest(), here).unwrap(),
+                Outcome::Decision(Found::Decision(_))
+            ));
+        }
+    }
+
+    /// The precondition the legacy rule rests on: an unwritten scope reads as
+    /// `None`, and `None` means the rule does not apply rather than that the
+    /// decision fails it.
+    #[test]
+    fn a_decision_with_no_scope_recorded_reaches_everywhere() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e, "Legacy", "a choice", "work", None, None, None, None, None, 1_000, "t", &stub,
+        )
+        .unwrap();
+        let id = find_decision(&e, "Legacy").expect("recorded");
+        let before = At {
+            valid: Timestamp::MAX,
+            tx: 999,
+        };
+        assert_eq!(
+            held(&e, id, "scope", before),
+            None,
+            "no scope at that clock"
+        );
+    }
+
+    /// A scope is required and validated before the embedder is called, so a
+    /// typo costs nothing -- the same bargain the status check already makes.
+    #[test]
+    fn a_decision_states_its_reach_or_is_refused() {
+        let stub = StubProvider::new(vec![]);
+        let plan = |scope: &str| {
+            plan_decide(
+                "Pin the compiler",
+                "rust-toolchain.toml names the version",
+                scope,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1_000,
+                "t",
+                &stub,
+            )
+        };
+
+        assert!(plan("work/goldenmatch").is_ok());
+        assert!(plan(crate::scope::UNIVERSAL).is_ok());
+
+        let Err(HostError::Refused(why)) = plan("") else {
+            panic!("an unscoped decision should be refused")
+        };
+        assert!(why.contains("how far"), "{why}");
+
+        let Err(HostError::Refused(why)) = plan("work/*") else {
+            panic!("a wildcard segment should be refused")
+        };
+        assert!(why.contains('*'), "{why}");
+    }
+
+    /// The scope is stored like any other field, so it is versioned, readable
+    /// at a past clock, and rebuilt by `reindex`.
+    #[test]
+    fn a_scope_is_an_attribute_like_the_others() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "a choice",
+            "work/goldenmatch",
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_000,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        let id = find_decision(&e, "Pin the compiler").expect("recorded");
+        assert_eq!(
+            held(&e, id, "scope", At::latest()),
+            Some("work/goldenmatch".to_string())
+        );
+    }
+
+    /// Three answers, not two. A title that resolves but was recorded later is
+    /// its own case: reporting "no such decision" would read as a typo.
+    #[test]
+    fn a_decision_not_yet_recorded_is_distinguished_from_one_that_does_not_exist() {
+        const MARCH: Timestamp = 1_772_236_800_000;
+        const AUGUST: Timestamp = 1_787_532_411_419;
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "a choice",
+            "work",
+            None,
+            None,
+            None,
+            None,
+            Some(MARCH),
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        // Backdated to March but recorded in August: as of March the store knew
+        // nothing, even though the decision claims to have held then.
+        let Outcome::Decision(found) = decision(
+            &e,
+            "Pin the compiler",
+            At {
+                valid: Timestamp::MAX,
+                tx: MARCH,
+            },
+            None,
+        )
+        .unwrap() else {
+            panic!("not a decision outcome")
+        };
+        assert_eq!(
+            found,
+            Found::NotYetRecorded {
+                title: "Pin the compiler".to_string(),
+                first_recorded: AUGUST,
+                first_held: MARCH,
+            },
+            "both clocks are reported: it was typed up in August and claims March"
+        );
+
+        // The other axis excludes it too, and for a different reason. Asking
+        // what held in January, with everything the store knows, still finds
+        // nothing -- and the two days above are what tell those cases apart.
+        assert!(matches!(
+            decision(
+                &e,
+                "Pin the compiler",
+                At {
+                    valid: 1,
+                    tx: Timestamp::MAX
+                },
+                None
+            )
+            .unwrap(),
+            Outcome::Decision(Found::NotYetRecorded { .. })
+        ));
+
+        // A title nobody ever used is a different answer.
+        assert_eq!(
+            decision(&e, "Never decided", At::latest(), None).unwrap(),
+            Outcome::Decision(Found::Unknown)
+        );
+
+        // And now, it is there.
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Pin the compiler", At::latest(), None).unwrap()
+        else {
+            panic!("expected a decision")
+        };
+        assert_eq!(d.choice, "a choice");
+    }
+
+    /// The chain is walked at the clock too: a supersession recorded later does
+    /// not reach back and retire a decision in the past.
+    #[test]
+    fn a_later_supersession_does_not_reach_back() {
+        const MARCH: Timestamp = 1_772_236_800_000;
+        const AUGUST: Timestamp = 1_787_532_411_419;
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "First",
+            "the old way",
+            "work",
+            None,
+            None,
+            None,
+            None,
+            None,
+            MARCH,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Second",
+            "the new way",
+            "work",
+            None,
+            None,
+            None,
+            Some("First"),
+            None,
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let stands = |at: At| {
+            let Outcome::Decision(Found::Decision(d)) = decision(&e, "First", at, None).unwrap()
+            else {
+                panic!("expected a decision")
+            };
+            (d.still_stands, d.superseded_by.len())
+        };
+
+        assert_eq!(
+            stands(At {
+                valid: Timestamp::MAX,
+                tx: MARCH
+            }),
+            (true, 0),
+            "in March nothing had replaced it"
+        );
+        assert_eq!(stands(At::latest()), (false, 1), "August replaced it");
+    }
+
+    /// A decision the store had not yet heard of is not in the list, and the
+    /// count of revisions is the count it had then.
+    #[test]
+    fn the_list_is_answered_as_of_a_transaction_time() {
+        const MARCH: Timestamp = 1_772_236_800_000;
+        const AUGUST: Timestamp = 1_787_532_411_419;
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+
+        decide(
+            &mut e,
+            "Early",
+            "chosen in March",
+            "work",
+            None,
+            None,
+            None,
+            None,
+            Some(MARCH),
+            MARCH,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Late",
+            "chosen in August",
+            "work",
+            None,
+            None,
+            None,
+            None,
+            Some(AUGUST),
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Early",
+            "revised in August",
+            "work",
+            None,
+            None,
+            None,
+            None,
+            Some(AUGUST),
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let titles = |at: At| {
+            let Outcome::Decisions(ds) = decisions(&e, None, at, None).unwrap() else {
+                panic!("decisions did not return decisions")
+            };
+            ds.into_iter()
+                .map(|d| (d.title, d.choice, d.revisions))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            titles(At {
+                valid: Timestamp::MAX,
+                tx: MARCH
+            }),
+            vec![("Early".to_string(), "chosen in March".to_string(), 1)],
+            "August had not happened yet"
+        );
+
+        let now = titles(At::latest());
+        assert_eq!(now.len(), 2, "both decisions exist now");
+        let early = now.iter().find(|(t, ..)| t == "Early").unwrap();
+        assert_eq!(early.1, "revised in August");
+        assert_eq!(early.2, 2, "revised once, so two choices");
+    }
+
+    /// Both axes bite, and a tombstone is an answer rather than something to
+    /// skip past.
+    #[test]
+    fn a_visible_version_is_one_both_clocks_admit() {
+        const MARCH: Timestamp = 1_772_236_800_000; // 2026-02-28
+        const AUGUST: Timestamp = 1_787_532_411_419; // 2026-08-24
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+
+        // Decided in March, recorded in March.
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "first choice",
+            "work",
+            None,
+            None,
+            None,
+            None,
+            Some(MARCH),
+            MARCH,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        // Re-decided in August under the same title.
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "second choice",
+            "work",
+            None,
+            None,
+            None,
+            None,
+            Some(AUGUST),
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let id = find_decision(&e, "Pin the compiler").expect("recorded");
+
+        // As of March the store had heard only the first.
+        assert_eq!(
+            held(
+                &e,
+                id,
+                "choice",
+                At {
+                    valid: Timestamp::MAX,
+                    tx: MARCH
+                }
+            ),
+            Some("first choice".to_string())
+        );
+        // As of now it has both, and the later one is the answer.
+        assert_eq!(
+            held(&e, id, "choice", At::latest()),
+            Some("second choice".to_string())
+        );
+        // Valid time alone: in March the second had not begun to hold.
+        assert_eq!(
+            held(
+                &e,
+                id,
+                "choice",
+                At {
+                    valid: MARCH,
+                    tx: Timestamp::MAX
+                }
+            ),
+            Some("first choice".to_string())
+        );
+        // Before either clock, nothing at all.
+        assert_eq!(held(&e, id, "choice", At { valid: 1, tx: 1 }), None);
+        assert!(visible(&e, id, "choice", At { valid: 1, tx: 1 }).is_empty());
+        assert_eq!(visible(&e, id, "choice", At::latest()).len(), 2);
+    }
+
     /// Every decision in the store, as (title, entity, still standing).
     fn recorded(e: &mut Engine) -> Vec<(String, StableId, bool)> {
-        let Outcome::Decisions(ds) = decisions(e, None).unwrap() else {
+        let Outcome::Decisions(ds) = decisions(e, None, At::latest(), None).unwrap() else {
             panic!("decisions did not return decisions")
         };
         ds.iter()
@@ -1483,6 +2275,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "yes",
+            "work",
             None,
             None,
             None,
@@ -1497,6 +2290,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite WAL",
             "also yes",
+            "work",
             None,
             None,
             None,
@@ -1525,6 +2319,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "yes",
+            "work",
             None,
             None,
             None,
@@ -1539,6 +2334,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "on reflection, no",
+            "work",
             None,
             None,
             None,
@@ -1552,9 +2348,15 @@ pub(crate) mod tests {
 
         let all = recorded(&mut e);
         assert_eq!(all.len(), 1, "one title is one decision: {all:?}");
-        let Outcome::About(Believed::Value(choice)) =
-            about(&e, all[0].1, "choice", Timestamp::MAX, Timestamp::MAX).unwrap()
-        else {
+        let Outcome::About(Believed::Value(choice)) = about(
+            &e,
+            all[0].1,
+            "choice",
+            None,
+            Some(Timestamp::MAX),
+            Timestamp::MAX,
+        )
+        .unwrap() else {
             panic!("no choice on the re-decided entity")
         };
         assert_eq!(choice, "on reflection, no");
@@ -1577,6 +2379,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "yes",
+            "work",
             None,
             None,
             None,
@@ -1591,6 +2394,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite WAL",
             "also yes",
+            "work",
             None,
             None,
             None,
@@ -1636,6 +2440,7 @@ pub(crate) mod tests {
             &mut e,
             "Use bi-temporal storage",
             "Keep valid time and transaction time on every attribute value",
+            "work",
             None,
             Some("A single axis makes a stale answer indistinguishable from a bug"),
             Some("Choosing a storage model for the memory store"),
@@ -1679,6 +2484,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "RabbitMQ",
+            "work",
             None,
             Some("we know it"),
             None,
@@ -1710,6 +2516,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "RabbitMQ",
+            "work",
             None,
             None,
             None,
@@ -1724,6 +2531,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "NATS",
+            "work",
             None,
             Some("simpler ops"),
             None,
@@ -1735,7 +2543,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decisions(lines) = decisions(&e, None).unwrap() else {
+        let Outcome::Decisions(lines) = decisions(&e, None, At::latest(), None).unwrap() else {
             panic!()
         };
         let queue: Vec<_> = lines.iter().filter(|l| l.title == "Pick a queue").collect();
@@ -1772,6 +2580,7 @@ pub(crate) mod tests {
             &mut e,
             "Pin the compiler",
             "rust-toolchain.toml names the version",
+            "work",
             None,
             Some("CI took whatever stable had become"),
             None,
@@ -1832,7 +2641,7 @@ pub(crate) mod tests {
         let stub = StubProvider::new(vec![]);
         // A decision, which is reachable...
         decide(
-            &mut e, "Kept", "a choice", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "Kept", "a choice", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         // ...and something that is not, written the way `ingest` writes.
@@ -1865,11 +2674,11 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "One", "a", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "One", "a", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         decide(
-            &mut e, "Two", "b", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "Two", "b", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         let before = e.index_len();
@@ -1906,6 +2715,7 @@ pub(crate) mod tests {
             &mut e,
             "Pin the compiler",
             "rust-toolchain.toml names the version",
+            "work",
             None,
             None,
             None,
@@ -1917,7 +2727,9 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decision(Some(d)) = decision(&e, "Pin the compiler").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Pin the compiler", At::latest(), None).unwrap()
+        else {
             panic!()
         };
         // The history reads back the day it was decided, not the day it was
@@ -1928,18 +2740,24 @@ pub(crate) mod tests {
             "the log should show when it was decided"
         );
 
-        // Valid time: it held in March.
+        // Valid time is refused here, and this assertion used to be its
+        // opposite. It read "Valid time: it held in March" and asserted the
+        // value came back -- which it did, because `choice` resolves under
+        // `most_recent`, whose outcome is a single winner with no time
+        // dimension, so `held_at` returned the same value for every instant.
+        // The test passed because the flag was ignored: a test endorsing the
+        // defect rather than catching it.
+        let Err(HostError::Refused(why)) = about(&e, d.entity, "choice", Some(MARCH), None, AUGUST)
+        else {
+            panic!("a valid-time question under most_recent should be refused")
+        };
+        assert!(why.contains("valid_interval"), "{why}");
+
+        // Transaction time still bites, and works under any strategy: the
+        // store did not know this in March, so asking what it believed then
+        // gives the answer it would have given then, which is nothing.
         assert_eq!(
-            about(&e, d.entity, "choice", MARCH, AUGUST).unwrap(),
-            Outcome::About(Believed::Value(
-                "rust-toolchain.toml names the version".into()
-            ))
-        );
-        // Transaction time: the store did not know it in March. Asking what it
-        // believed then gives the answer it would have given then, which is
-        // nothing.
-        assert_eq!(
-            about(&e, d.entity, "choice", MARCH, MARCH).unwrap(),
+            about(&e, d.entity, "choice", None, Some(MARCH), MARCH).unwrap(),
             Outcome::About(Believed::Unknown),
             "backdating must not rewrite what the store knew when"
         );
@@ -1953,15 +2771,17 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "Plain", "a choice", None, None, None, None, None, NOW, "t", &stub,
+            &mut e, "Plain", "a choice", "work", None, None, None, None, None, NOW, "t", &stub,
         )
         .unwrap();
-        let Outcome::Decision(Some(d)) = decision(&e, "Plain").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Plain", At::latest(), None).unwrap()
+        else {
             panic!()
         };
         assert_eq!(d.history[0].0, NOW);
         assert_eq!(
-            about(&e, d.entity, "choice", NOW, NOW).unwrap(),
+            about(&e, d.entity, "choice", None, Some(NOW), NOW).unwrap(),
             Outcome::About(Believed::Value("a choice".into()))
         );
     }
@@ -1978,13 +2798,13 @@ pub(crate) mod tests {
             ("Also turned down", Some("rejected")),
         ] {
             decide(
-                &mut e, title, "a choice", status, None, None, None, None, 100, "t", &stub,
+                &mut e, title, "a choice", "work", status, None, None, None, None, 100, "t", &stub,
             )
             .unwrap();
         }
 
         let titles = |only: Option<&str>| {
-            let Outcome::Decisions(l) = decisions(&e, only).unwrap() else {
+            let Outcome::Decisions(l) = decisions(&e, only, At::latest(), None).unwrap() else {
                 panic!()
             };
             let mut t: Vec<String> = l.iter().map(|d| d.title.clone()).collect();
@@ -2009,7 +2829,8 @@ pub(crate) mod tests {
     #[test]
     fn filtering_by_a_status_that_does_not_exist_is_refused() {
         let e = engine();
-        let Err(HostError::Refused(why)) = decisions(&e, Some("declined")) else {
+        let Err(HostError::Refused(why)) = decisions(&e, Some("declined"), At::latest(), None)
+        else {
             panic!("a bad status should be refused")
         };
         assert!(
@@ -2018,7 +2839,7 @@ pub(crate) mod tests {
         );
         // `superseded` is not settable by `decide`, but it is a real status a
         // decision can hold, so filtering by it has to work.
-        assert!(decisions(&e, Some("superseded")).is_ok());
+        assert!(decisions(&e, Some("superseded"), At::latest(), None).is_ok());
     }
 
     /// An option considered and turned down is recordable as one.
@@ -2036,6 +2857,7 @@ pub(crate) mod tests {
             &mut e,
             "Rerank the recall results",
             "a cross-encoder over the top 200",
+            "work",
             Some("rejected"),
             Some("the k-curve is still 0.926 at k=200, so there is nothing to rerank into"),
             None,
@@ -2047,7 +2869,9 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decision(Some(d)) = decision(&e, "Rerank the recall results").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Rerank the recall results", At::latest(), None).unwrap()
+        else {
             panic!()
         };
         assert_eq!(d.status, "rejected");
@@ -2073,6 +2897,7 @@ pub(crate) mod tests {
                 &mut e,
                 "Some title",
                 "some choice",
+                "work",
                 Some(status),
                 None,
                 None,
@@ -2091,7 +2916,10 @@ pub(crate) mod tests {
             );
         }
         // And nothing was written on the way through.
-        assert_eq!(decision(&e, "Some title").unwrap(), Outcome::Decision(None));
+        assert_eq!(
+            decision(&e, "Some title", At::latest(), None).unwrap(),
+            Outcome::Decision(Found::Unknown)
+        );
     }
 
     /// `superseded` is not a status a caller sets.
@@ -2107,6 +2935,7 @@ pub(crate) mod tests {
             &mut e,
             "Store as one file",
             "whole-file rewrite",
+            "work",
             Some("superseded"),
             None,
             None,
@@ -2131,10 +2960,12 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "Plain", "a choice", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "Plain", "a choice", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
-        let Outcome::Decision(Some(d)) = decision(&e, "Plain").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Plain", At::latest(), None).unwrap()
+        else {
             panic!()
         };
         assert_eq!(d.status, "accepted");
@@ -2163,12 +2994,14 @@ pub(crate) mod tests {
             ("Store in Postgres", "a server", Some("Store in SQLite")),
         ] {
             decide(
-                &mut e, title, choice, None, None, None, replaces, None, 100, "t", &stub,
+                &mut e, title, choice, "work", None, None, None, replaces, None, 100, "t", &stub,
             )
             .unwrap();
         }
 
-        let Outcome::Decision(Some(d)) = decision(&e, "Store as one JSON file").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Store as one JSON file", At::latest(), None).unwrap()
+        else {
             panic!("the oldest decision should be readable")
         };
         assert!(!d.still_stands);
@@ -2182,7 +3015,9 @@ pub(crate) mod tests {
         );
 
         // And back the other way, from the live one.
-        let Outcome::Decision(Some(d)) = decision(&e, "Store in Postgres").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Store in Postgres", At::latest(), None).unwrap()
+        else {
             panic!()
         };
         assert!(d.still_stands);
@@ -2207,13 +3042,14 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "A", "first", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "A", "first", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         decide(
             &mut e,
             "B",
             "second",
+            "work",
             None,
             None,
             None,
@@ -2229,6 +3065,7 @@ pub(crate) mod tests {
             &mut e,
             "A",
             "third",
+            "work",
             None,
             None,
             None,
@@ -2240,7 +3077,8 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decision(Some(d)) = decision(&e, "A").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) = decision(&e, "A", At::latest(), None).unwrap()
+        else {
             panic!()
         };
         // Exactly one hop each way, then the revisit stops it. Asserted
@@ -2275,13 +3113,14 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "Only one", "first", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "Only one", "first", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         decide(
             &mut e,
             "Only one",
             "second",
+            "work",
             None,
             None,
             None,
@@ -2293,7 +3132,9 @@ pub(crate) mod tests {
         )
         .expect("naming itself must not fail the write");
 
-        let Outcome::Decision(Some(d)) = decision(&e, "Only one").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Only one", At::latest(), None).unwrap()
+        else {
             panic!()
         };
         assert_eq!(d.choice, "second");
@@ -2305,8 +3146,8 @@ pub(crate) mod tests {
     fn reading_a_decision_that_does_not_exist_says_so() {
         let e = engine();
         assert_eq!(
-            decision(&e, "never recorded").unwrap(),
-            Outcome::Decision(None)
+            decision(&e, "never recorded", At::latest(), None).unwrap(),
+            Outcome::Decision(Found::Unknown)
         );
     }
 
@@ -2318,6 +3159,7 @@ pub(crate) mod tests {
             &mut e,
             "Store as JSON",
             "One file per store",
+            "work",
             None,
             None,
             None,
@@ -2332,6 +3174,7 @@ pub(crate) mod tests {
             &mut e,
             "Store as SQLite",
             "One database per store",
+            "work",
             None,
             Some("whole-file rewrites do not survive a real corpus"),
             None,
@@ -2372,6 +3215,7 @@ pub(crate) mod tests {
             &mut e,
             "New way",
             "Do it differently",
+            "work",
             None,
             None,
             None,
@@ -2399,8 +3243,10 @@ pub(crate) mod tests {
         let stub = StubProvider::new(vec![]);
         for (title, choice) in [("", "something"), ("something", ""), ("  ", "x")] {
             assert!(
-                decide(&mut e, title, choice, None, None, None, None, None, 100, "cli", &stub)
-                    .is_err(),
+                decide(
+                    &mut e, title, choice, "work", None, None, None, None, None, 100, "cli", &stub
+                )
+                .is_err(),
                 "{title:?}/{choice:?}"
             );
         }
@@ -2417,6 +3263,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "NATS",
+            "work",
             None,
             None,
             None,
@@ -2428,7 +3275,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decisions(lines) = decisions(&e, None).unwrap() else {
+        let Outcome::Decisions(lines) = decisions(&e, None, At::latest(), None).unwrap() else {
             panic!()
         };
         assert_eq!(lines.len(), 1);
@@ -2550,7 +3397,7 @@ pub(crate) mod tests {
             panic!()
         };
 
-        let out = about(&e, ingested.entities[0], "spouse", 1000, 1000).unwrap();
+        let out = about(&e, ingested.entities[0], "spouse", None, Some(1000), 1000).unwrap();
         assert_eq!(out, Outcome::About(rm_engine::Believed::Unknown));
     }
 
@@ -2650,5 +3497,174 @@ pub(crate) mod tests {
             (line.a_kind.as_str(), line.b_kind.as_str()),
             ("person", "person")
         );
+    }
+}
+
+#[cfg(test)]
+mod rescope_tests {
+    use super::tests::engine;
+    use super::*;
+    use crate::testing::StubProvider;
+
+    const MARCH: Timestamp = 1_772_236_800_000;
+    const AUGUST: Timestamp = 1_787_532_411_419;
+
+    fn rescope(
+        e: &mut Engine,
+        title: &str,
+        scope: &str,
+        observed_at: Timestamp,
+        stub: &StubProvider,
+    ) -> Result<Outcome, HostError> {
+        let plan = plan_rescope(title, scope, observed_at, "t", stub)?;
+        commit_rescope(e, plan)
+    }
+
+    fn decided(e: &mut Engine, title: &str, scope: &str, at: Timestamp, stub: &StubProvider) {
+        decide(
+            e,
+            title,
+            "the choice",
+            scope,
+            None,
+            None,
+            None,
+            None,
+            Some(at),
+            at,
+            "t",
+            stub,
+        )
+        .unwrap();
+    }
+
+    /// The reason this command exists rather than being `decide` with one
+    /// argument changed.
+    #[test]
+    fn rescoping_does_not_count_as_revising_the_choice() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decided(&mut e, "D", "work", MARCH, &stub);
+
+        let before = visible(&e, find_decision(&e, "D").unwrap(), "choice", At::latest()).len();
+        rescope(&mut e, "D", "work/goldenmatch", AUGUST, &stub).unwrap();
+        let after = visible(&e, find_decision(&e, "D").unwrap(), "choice", At::latest()).len();
+
+        assert_eq!(before, 1);
+        assert_eq!(
+            after, 1,
+            "a scope-only write must leave the choice history alone -- \
+             `revisions` counts choice versions, so a second one here would make \
+             every backfilled decision read as revised when none was"
+        );
+    }
+
+    /// A record written before scopes existed: status and choice, no scope.
+    /// This is the shape the 219-decision backfill actually operates on, and
+    /// `decide` cannot produce it -- it refuses without a scope.
+    fn decided_without_a_scope(e: &mut Engine, title: &str, at: Timestamp, stub: &StubProvider) {
+        for (attr, value) in [("status", "accepted"), ("choice", "the choice")] {
+            let w = embed_field(title, attr, value, stub).unwrap();
+            let entity = find_decision(e, title);
+            write_field(e, entity, &w, at, at, "t").unwrap();
+        }
+    }
+
+    /// Backfill: the reach was always true, so it takes the decision's own
+    /// valid time -- not the day the backfill happened to run.
+    #[test]
+    fn a_backfilled_scope_is_valid_from_when_the_decision_was() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decided_without_a_scope(&mut e, "D", MARCH, &stub);
+        let id = find_decision(&e, "D").unwrap();
+        assert!(
+            held(&e, id, "scope", At::latest()).is_none(),
+            "precondition: this is a pre-scope record"
+        );
+
+        rescope(&mut e, "D", "work/goldenmatch", AUGUST, &stub).unwrap();
+
+        // March, long before the backfill ran, already reads the new reach.
+        let march = At {
+            valid: MARCH,
+            tx: Timestamp::MAX,
+        };
+        assert_eq!(
+            held(&e, id, "scope", march).as_deref(),
+            Some("work/goldenmatch"),
+            "a backfilled scope dated from now would leave every historical              query reading the decision as unscoped -- and an unscoped decision              reaches EVERYWHERE, so the failure is over-reach in history"
+        );
+    }
+
+    /// Correction: the reach changed today, so today is when it changed. The
+    /// old reach must still stand in the past, or the store has been made to
+    /// claim the decision always reached somewhere it did not.
+    #[test]
+    fn a_corrected_scope_starts_today_and_leaves_the_past_alone() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decided(&mut e, "D", "*", MARCH, &stub);
+        let id = find_decision(&e, "D").unwrap();
+
+        rescope(&mut e, "D", "work/goldenmatch", AUGUST, &stub).unwrap();
+
+        let march = At {
+            valid: MARCH,
+            tx: Timestamp::MAX,
+        };
+        assert_eq!(
+            held(&e, id, "scope", march).as_deref(),
+            Some("*"),
+            "March still reached everywhere; only August narrowed it"
+        );
+        assert_eq!(
+            held(&e, id, "scope", At::latest()).as_deref(),
+            Some("work/goldenmatch")
+        );
+    }
+
+    /// Setting a scope to what it already is writes nothing: a second
+    /// identical version would make the attribute's own history claim a
+    /// correction that never happened.
+    #[test]
+    fn rescoping_to_the_same_scope_writes_nothing() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decided(&mut e, "D", "work", MARCH, &stub);
+        let id = find_decision(&e, "D").unwrap();
+        let before = visible(&e, id, "scope", At::latest()).len();
+
+        let out = rescope(&mut e, "D", "work", AUGUST, &stub).unwrap();
+
+        assert_eq!(visible(&e, id, "scope", At::latest()).len(), before);
+        let Outcome::Rescoped { previous, .. } = out else {
+            panic!("not a rescope")
+        };
+        assert_eq!(previous.as_deref(), Some("work"));
+    }
+
+    /// An unknown title is a typo, and during a backfill of hundreds a silent
+    /// create is the most expensive and least visible thing that could happen.
+    #[test]
+    fn an_unknown_title_is_refused_and_creates_nothing() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        let before = e.entity_ids().len();
+
+        let err = rescope(&mut e, "never decided", "work", AUGUST, &stub).unwrap_err();
+
+        assert!(matches!(err, HostError::Refused(_)), "{err:?}");
+        assert_eq!(e.entity_ids().len(), before, "nothing was created");
+    }
+
+    /// A typo costs no embedding, the same bargain `plan_decide` makes.
+    #[test]
+    fn an_invalid_scope_is_refused_before_the_embedder() {
+        let stub = StubProvider::new(vec![]);
+        assert!(matches!(
+            plan_rescope("D", "", AUGUST, "t", &stub),
+            Err(HostError::Refused(_))
+        ));
     }
 }

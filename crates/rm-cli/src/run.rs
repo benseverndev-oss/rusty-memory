@@ -15,6 +15,7 @@ use crate::args::{parse, Command};
 use rm_host::command::{self, Outcome};
 use rm_host::config::{Config, InitConfig};
 use rm_host::store;
+use rm_host::time::At;
 
 use crate::CliError;
 use rm_host::HostError;
@@ -46,6 +47,9 @@ pub fn run(
     args: impl Iterator<Item = String>,
     config_path: &Path,
     now: Timestamp,
+    // Where this session stands, from `RMEM_SCOPE`. `None` is no position,
+    // which suspends the applicability rule entirely.
+    session_scope: Option<String>,
 ) -> Result<Outcome, CliError> {
     let command = parse(args)?;
 
@@ -128,6 +132,7 @@ pub fn run(
     enum Planned {
         Remember(command::RememberPlan),
         Decide(command::DecidePlan),
+        Rescope(command::RescopePlan),
     }
 
     let mutates = matches!(
@@ -136,6 +141,7 @@ pub fn run(
             | Command::ReviewConfirm(_)
             | Command::ReviewReject(_)
             | Command::Decide { .. }
+            | Command::Rescope { .. }
             | Command::Reindex
     );
 
@@ -218,6 +224,7 @@ pub fn run(
             Command::Decide {
                 title,
                 choice,
+                scope,
                 status,
                 decided_at,
                 because,
@@ -231,6 +238,7 @@ pub fn run(
                 Some(Planned::Decide(command::plan_decide(
                     title,
                     choice,
+                    scope,
                     status.as_deref(),
                     because.as_deref(),
                     context.as_deref(),
@@ -239,6 +247,14 @@ pub fn run(
                     now,
                     "cli",
                     &embedder,
+                )?))
+            }
+            Command::Rescope { title, scope } => {
+                // One field, so one embedding. Same bargain as `decide`: the
+                // embedder, never a completion provider.
+                let embedder = config.embedder()?;
+                Some(Planned::Rescope(command::plan_rescope(
+                    title, scope, now, "cli", &embedder,
                 )?))
             }
             // The review answers write, but they answer a question the
@@ -250,6 +266,9 @@ pub fn run(
             match (command, planned) {
                 (Command::Remember { .. }, Some(Planned::Remember(plan))) => {
                     command::commit_remember(engine, plan)
+                }
+                (Command::Rescope { .. }, Some(Planned::Rescope(plan))) => {
+                    command::commit_rescope(engine, plan)
                 }
                 (Command::Decide { .. }, Some(Planned::Decide(plan))) => {
                     command::commit_decide(engine, plan)
@@ -291,16 +310,75 @@ pub fn run(
                         as_of,
                     },
                     _,
-                ) => command::about(
-                    engine,
-                    entity,
-                    &attribute,
-                    valid_at.unwrap_or(now),
-                    as_of.unwrap_or(now),
-                ),
+                    // The `Option`s go through unresolved: `about` refuses a
+                    // valid-time question the attribute's strategy cannot
+                    // answer, and it can only tell it was asked if the default
+                    // has not already been applied here.
+                ) => command::about(engine, entity, &attribute, valid_at, as_of, now),
                 (Command::ReviewList, _) => command::review_list(engine),
-                (Command::Decisions { status }, _) => command::decisions(engine, status.as_deref()),
-                (Command::Decision { title }, _) => command::decision(engine, &title),
+                // `Timestamp::MAX` rather than `now` for an absent flag, so
+                // dropping the flag reads exactly as it did before these
+                // commands took a clock. See `At::latest`.
+                (
+                    Command::Decisions {
+                        status,
+                        valid_at,
+                        as_of,
+                        scope,
+                        all,
+                    },
+                    _,
+                ) => {
+                    // `--all` beats `--scope`, which beats the environment.
+                    // `None` is no position, which suspends the rule.
+                    // `position` rather than the raw value: an empty
+                    // `--scope ""` or `RMEM_SCOPE=` reads as "not configured"
+                    // to whoever wrote it and would otherwise be the root
+                    // position, where only `*` reaches.
+                    let here = rm_host::scope::position(if all {
+                        None
+                    } else {
+                        scope.or_else(|| session_scope.clone())
+                    });
+                    command::decisions(
+                        engine,
+                        status.as_deref(),
+                        At {
+                            valid: valid_at.unwrap_or(Timestamp::MAX),
+                            tx: as_of.unwrap_or(Timestamp::MAX),
+                        },
+                        here.as_deref(),
+                    )
+                }
+                (
+                    Command::Decision {
+                        title,
+                        valid_at,
+                        as_of,
+                        scope,
+                        all,
+                    },
+                    _,
+                ) => {
+                    // `position` rather than the raw value: an empty
+                    // `--scope ""` or `RMEM_SCOPE=` reads as "not configured"
+                    // to whoever wrote it and would otherwise be the root
+                    // position, where only `*` reaches.
+                    let here = rm_host::scope::position(if all {
+                        None
+                    } else {
+                        scope.or_else(|| session_scope.clone())
+                    });
+                    command::decision(
+                        engine,
+                        &title,
+                        At {
+                            valid: valid_at.unwrap_or(Timestamp::MAX),
+                            tx: as_of.unwrap_or(Timestamp::MAX),
+                        },
+                        here.as_deref(),
+                    )
+                }
                 (Command::Init { .. }, _) => unreachable!("handled above"),
                 (other, _) => unreachable!("{other:?} writes, or was not planned"),
             }
@@ -342,8 +420,21 @@ mod tests {
         path
     }
 
+    fn go_at(
+        config: &std::path::Path,
+        args: &[&str],
+        session_scope: Option<&str>,
+    ) -> Result<Outcome, CliError> {
+        run(
+            args.iter().map(|s| s.to_string()),
+            config,
+            1_000,
+            session_scope.map(str::to_string),
+        )
+    }
+
     fn go(config: &std::path::Path, args: &[&str]) -> Result<Outcome, CliError> {
-        run(args.iter().map(|s| s.to_string()), config, 1_000)
+        run(args.iter().map(|s| s.to_string()), config, 1_000, None)
     }
 
     #[test]
@@ -547,5 +638,49 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("rmem init"), "{err}");
+    }
+
+    /// An `RMEM_SCOPE` that is set but empty must read as "not configured",
+    /// because that is what it looks like to whoever wrote it.
+    ///
+    /// It used to be a position, and an empty one splits into a single empty
+    /// segment -- the root, where only `*` reaches. On the real 219-decision
+    /// store `RMEM_SCOPE=` returned 32 records where unset returned all 219,
+    /// and nothing said so. The unit tests on `scope::position` pin the rule;
+    /// this pins that dispatch actually calls it.
+    #[test]
+    fn a_session_scope_that_is_set_but_empty_filters_nothing() {
+        let dir = TempDir::new();
+        let config = config_in(&dir);
+        // Subword hashing, so `decide` opens no socket and needs no key.
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            text.contains("embedder = \"http\""),
+            "the template's embedder line moved; this rewrite is now silently a no-op"
+        );
+        std::fs::write(
+            &config,
+            text.replace("embedder = \"http\"", "embedder = \"local\""),
+        )
+        .unwrap();
+
+        for (title, scope) in [("Everywhere", "*"), ("Just here", "work/one")] {
+            go(&config, &["decide", title, "a choice", "--scope", scope])
+                .unwrap_or_else(|e| panic!("recording {title:?}: {e}"));
+        }
+
+        let seen = |session: Option<&str>| {
+            let Ok(Outcome::Decisions(ds)) = go_at(&config, &["decisions"], session) else {
+                panic!("decisions did not return decisions")
+            };
+            ds.len()
+        };
+
+        assert_eq!(seen(None), 2, "no position, no filtering");
+        assert_eq!(seen(Some("")), 2, "an empty position is not the root");
+        assert_eq!(seen(Some("   ")), 2, "nor is whitespace");
+        assert_eq!(seen(Some("work/one")), 2, "both reach work/one");
+        // And the rule still bites where a position is genuinely given.
+        assert_eq!(seen(Some("elsewhere")), 1, "only the universal one");
     }
 }
