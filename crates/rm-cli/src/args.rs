@@ -40,7 +40,10 @@ rmem — a memory that resolves contradictions deterministically
     rmem init [--force]              write rmem.toml, asking the model its embedding size
     rmem remember \"<turn>\" [--speaker <name>]
                                      extract a turn and record what it said
-    rmem recall \"<query>\" [-k N]     find assertions near a query (default 5)
+    rmem recall \"<query>\" [-k N] [--scope <s>] [--all]
+                                     find assertions near a query (default 5).
+                                     --scope asks from a position, --all
+                                     searches regardless of reach
     rmem about <entity> <attribute> [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
                                      what the store believes an attribute holds;
                                      --valid-at asks what was true then, --as-of
@@ -83,6 +86,10 @@ pub enum Command {
     Recall {
         query: String,
         k: usize,
+        /// Ask from this position instead of `RMEM_SCOPE`.
+        scope: Option<String>,
+        /// Suspend the applicability rule and search everything.
+        all: bool,
     },
     About {
         entity: u64,
@@ -279,6 +286,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
             };
             Ok(Command::Recall {
                 query: query.clone(),
+                scope: flag(&args, "--scope")?,
+                all: args.iter().any(|a| a == "--all"),
                 k,
             })
         }
@@ -545,14 +554,18 @@ mod tests {
             parse_args(&["recall", "jobs"]).unwrap(),
             Command::Recall {
                 query: "jobs".into(),
-                k: 5
+                k: 5,
+                scope: None,
+                all: false
             }
         );
         assert_eq!(
             parse_args(&["recall", "jobs", "-k", "20"]).unwrap(),
             Command::Recall {
                 query: "jobs".into(),
-                k: 20
+                k: 20,
+                scope: None,
+                all: false
             }
         );
         assert_eq!(
@@ -616,7 +629,9 @@ mod tests {
             parse_args(&["recall", "jobs", "-k", "20"]).unwrap(),
             Command::Recall {
                 query: "jobs".into(),
-                k: 20
+                k: 20,
+                scope: None,
+                all: false
             }
         );
     }
@@ -847,6 +862,25 @@ mod tests {
             parse_args(&["decision", "A title", "--all"]).unwrap()
         else {
             panic!("not a decision command")
+        };
+        assert!(all, "--all suspends the rule");
+        assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn recall_takes_a_position_and_a_way_to_ignore_it() {
+        let Command::Recall { scope, all, .. } =
+            parse_args(&["recall", "a question", "--scope", "personal"]).unwrap()
+        else {
+            panic!("not a recall command")
+        };
+        assert_eq!(scope.as_deref(), Some("personal"));
+        assert!(!all);
+
+        let Command::Recall { all, scope, .. } =
+            parse_args(&["recall", "a question", "--all"]).unwrap()
+        else {
+            panic!("not a recall command")
         };
         assert!(all, "--all suspends the rule");
         assert_eq!(scope, None);

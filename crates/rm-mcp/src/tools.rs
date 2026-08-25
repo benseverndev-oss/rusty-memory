@@ -117,6 +117,14 @@ fn all_definitions() -> Vec<Value> {
                         "type": "integer",
                         "description": "How many hits to return. Defaults to 5.",
                         "minimum": 1
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Search from this position instead of the session's own."
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "Ignore reach; search memories scoped elsewhere too."
                     }
                 },
                 "required": ["query"],
@@ -305,6 +313,8 @@ pub enum Call {
     Recall {
         query: String,
         k: usize,
+        scope: Option<String>,
+        all: bool,
     },
     About {
         entity: StableId,
@@ -418,6 +428,8 @@ impl Call {
             }),
             "recall" => Ok(Call::Recall {
                 query: string(arguments, "query")?,
+                scope: optional_string(arguments, "scope")?,
+                all: optional_bool(arguments, "all")?.unwrap_or(false),
                 k: match optional_integer(arguments, "k")? {
                     None => 5,
                     // Refused rather than clamped to 1. A caller asking for
@@ -787,7 +799,9 @@ mod tests {
             read("recall", json!({"query": "x"})).unwrap(),
             Call::Recall {
                 query: "x".into(),
-                k: 5
+                k: 5,
+                scope: None,
+                all: false
             }
         );
         assert_eq!(
@@ -1050,5 +1064,22 @@ mod tests {
             read("decisions", json!({"all": "yes"})).is_err(),
             "a string is not a boolean"
         );
+    }
+
+    #[test]
+    fn recall_takes_a_position_and_a_way_to_ignore_it() {
+        let Call::Recall { scope, all, .. } =
+            read("recall", json!({"query": "x", "scope": "personal"})).unwrap()
+        else {
+            panic!("not a recall call")
+        };
+        assert_eq!(scope.as_deref(), Some("personal"));
+        assert!(!all);
+
+        let Call::Recall { all, .. } = read("recall", json!({"query": "x", "all": true})).unwrap()
+        else {
+            panic!("not a recall call")
+        };
+        assert!(all);
     }
 }
