@@ -138,7 +138,7 @@ fn decide(id: u32, title: &str, choice: &str) -> String {
         "jsonrpc": "2.0",
         "id": id,
         "method": "tools/call",
-        "params": {"name": "decide", "arguments": {"title": title, "choice": choice}}
+        "params": {"name": "decide", "arguments": {"title": title, "choice": choice, "scope": "*"}}
     })
     .to_string()
 }
