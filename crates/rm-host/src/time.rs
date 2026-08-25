@@ -106,6 +106,39 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// The two clocks a read is answered under: what held at `valid`, as known by
+/// `tx`.
+///
+/// One value rather than two parameters because both are `Timestamp` and they
+/// pass through three layers -- `decisions` to `chain` to `edges_into` -- where
+/// swapping them compiles and returns a plausible wrong answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct At {
+    /// When in the world. Filters on `Version::valid.from`.
+    pub valid: Timestamp,
+    /// When the store learned it. Filters on `provenance.observed_at`.
+    pub tx: Timestamp,
+}
+
+impl At {
+    /// Everything the store holds.
+    ///
+    /// Deliberately not a `Default` impl. `Engine::edges_from` makes the
+    /// argument: an edge read without a `tx_t` is a claim about now that
+    /// quietly stops being reproducible -- so every call site names what it is
+    /// asking rather than inheriting it.
+    ///
+    /// `MAX` rather than the current time, because that is what the decision
+    /// reads did before they took an `At`. `now` would silently drop a decision
+    /// recorded with a future `--at`.
+    pub fn latest() -> Self {
+        At {
+            valid: Timestamp::MAX,
+            tx: Timestamp::MAX,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +230,12 @@ mod tests {
         }
         assert!(parse_day("2000-02-29").is_ok());
         assert!(parse_day("2024-02-29").is_ok());
+    }
+
+    #[test]
+    fn latest_is_the_end_of_both_axes_and_not_the_current_time() {
+        let at = At::latest();
+        assert_eq!(at.valid, Timestamp::MAX);
+        assert_eq!(at.tx, Timestamp::MAX);
     }
 }

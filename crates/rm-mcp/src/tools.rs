@@ -203,6 +203,14 @@ fn all_definitions() -> Vec<Value> {
                         "type": "string",
                         "enum": ["proposed", "accepted", "rejected", "deprecated", "superseded"],
                         "description": "Show only decisions with this status. Omit for all of them."
+                    },
+                    "as_of": {
+                        "type": ["string", "integer"],
+                        "description": "The log as the store knew it on this date (YYYY-MM-DD). Later decisions are absent. Omit for now."
+                    },
+                    "valid_at": {
+                        "type": ["string", "integer"],
+                        "description": "What held on this date (YYYY-MM-DD). A decision backdated with decided_at holds from that day. Omit for now."
                     }
                 },
                 "additionalProperties": false
@@ -219,6 +227,14 @@ fn all_definitions() -> Vec<Value> {
                         "type": "string",
                         "description": "The decision's exact title, as `decisions` lists it. Titles are matched exactly, not approximately.",
                         "minLength": 1
+                    },
+                    "as_of": {
+                        "type": ["string", "integer"],
+                        "description": "As the store knew it on this date (YYYY-MM-DD), the supersession walk included, so a later replacement does not retire it. Omit for now."
+                    },
+                    "valid_at": {
+                        "type": ["string", "integer"],
+                        "description": "What held on this date (YYYY-MM-DD). Omit for now."
                     }
                 },
                 "required": ["title"],
@@ -286,10 +302,14 @@ pub enum Call {
     },
     Decisions {
         status: Option<String>,
+        valid_at: Option<Timestamp>,
+        as_of: Option<Timestamp>,
     },
     /// Read one decision in full, by exact title.
     Decision {
         title: String,
+        valid_at: Option<Timestamp>,
+        as_of: Option<Timestamp>,
     },
 }
 
@@ -384,9 +404,13 @@ impl Call {
             "reviews" => Ok(Call::Reviews),
             "decisions" => Ok(Call::Decisions {
                 status: optional_string(arguments, "status")?,
+                valid_at: optional_instant(arguments, "valid_at")?,
+                as_of: optional_instant(arguments, "as_of")?,
             }),
             "decision" => Ok(Call::Decision {
                 title: string(arguments, "title")?,
+                valid_at: optional_instant(arguments, "valid_at")?,
+                as_of: optional_instant(arguments, "as_of")?,
             }),
             "decide" => Ok(Call::Decide {
                 title: string(arguments, "title")?,
@@ -438,6 +462,26 @@ fn string(args: &Value, field: &str) -> Result<String, Unreadable> {
         Some(Value::String(_)) => Err(format!("{field} was empty")),
         Some(_) => Err(format!("{field} must be a string")),
         None => Err(format!("{field} is required")),
+    }
+}
+
+/// A point in time, given either way.
+///
+/// A JSON number is milliseconds, matching `about`'s `valid_at`/`as_of`. A
+/// string is `YYYY-MM-DD` read as the end of that day, matching `decide`'s
+/// `decided_at` and the CLI's flags. Both conventions already exist in this
+/// file, and accepting either means the same parameter name does not mean two
+/// different types depending on which tool it is on.
+fn optional_instant(args: &Value, field: &str) -> Result<Option<Timestamp>, Unreadable> {
+    match args.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(_)) => optional_string(args, field)?
+            .map(|d| rm_host::time::parse_day_end(&d))
+            .transpose(),
+        Some(Value::Number(_)) => optional_integer(args, field),
+        Some(_) => Err(format!(
+            "{field} must be a date as YYYY-MM-DD or a time in milliseconds"
+        )),
     }
 }
 
@@ -851,5 +895,41 @@ mod tests {
             assert_eq!(schema["additionalProperties"], json!(false), "{name}");
             assert!(!tool["description"].as_str().unwrap().is_empty(), "{name}");
         }
+    }
+
+    /// Either convention, because both already exist in this file: `about`
+    /// takes these two as integers and `decide` takes its date as a string.
+    /// One parameter name meaning two types across tools is a footgun for a
+    /// model caller, so these take both.
+    #[test]
+    fn the_decision_reads_take_either_a_date_or_an_instant() {
+        let Call::Decision {
+            valid_at, as_of, ..
+        } = read(
+            "decision",
+            json!({"title": "Pin the compiler", "as_of": "2026-08-24"}),
+        )
+        .unwrap()
+        else {
+            panic!("not a decision call")
+        };
+        assert_eq!(as_of, Some(1_787_529_600_000 + 86_399_999));
+        assert_eq!(valid_at, None);
+
+        let Call::Decisions { as_of, .. } =
+            read("decisions", json!({"as_of": 1_787_529_600_000i64})).unwrap()
+        else {
+            panic!("not a decisions call")
+        };
+        assert_eq!(as_of, Some(1_787_529_600_000), "a number is milliseconds");
+
+        assert!(
+            read("decision", json!({"title": "X", "as_of": "not-a-date"})).is_err(),
+            "a date that is not one must be refused"
+        );
+        assert!(
+            read("decision", json!({"title": "X", "as_of": true})).is_err(),
+            "a boolean is neither"
+        );
     }
 }

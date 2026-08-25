@@ -15,6 +15,7 @@ use crate::args::{parse, Command};
 use rm_host::command::{self, Outcome};
 use rm_host::config::{Config, InitConfig};
 use rm_host::store;
+use rm_host::time::At;
 
 use crate::CliError;
 use rm_host::HostError;
@@ -299,8 +300,39 @@ pub fn run(
                     as_of.unwrap_or(now),
                 ),
                 (Command::ReviewList, _) => command::review_list(engine),
-                (Command::Decisions { status }, _) => command::decisions(engine, status.as_deref()),
-                (Command::Decision { title }, _) => command::decision(engine, &title),
+                // `Timestamp::MAX` rather than `now` for an absent flag, so
+                // dropping the flag reads exactly as it did before these
+                // commands took a clock. See `At::latest`.
+                (
+                    Command::Decisions {
+                        status,
+                        valid_at,
+                        as_of,
+                    },
+                    _,
+                ) => command::decisions(
+                    engine,
+                    status.as_deref(),
+                    At {
+                        valid: valid_at.unwrap_or(Timestamp::MAX),
+                        tx: as_of.unwrap_or(Timestamp::MAX),
+                    },
+                ),
+                (
+                    Command::Decision {
+                        title,
+                        valid_at,
+                        as_of,
+                    },
+                    _,
+                ) => command::decision(
+                    engine,
+                    &title,
+                    At {
+                        valid: valid_at.unwrap_or(Timestamp::MAX),
+                        tx: as_of.unwrap_or(Timestamp::MAX),
+                    },
+                ),
                 (Command::Init { .. }, _) => unreachable!("handled above"),
                 (other, _) => unreachable!("{other:?} writes, or was not planned"),
             }
