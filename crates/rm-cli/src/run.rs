@@ -132,6 +132,7 @@ pub fn run(
     enum Planned {
         Remember(command::RememberPlan),
         Decide(command::DecidePlan),
+        Rescope(command::RescopePlan),
     }
 
     let mutates = matches!(
@@ -140,6 +141,7 @@ pub fn run(
             | Command::ReviewConfirm(_)
             | Command::ReviewReject(_)
             | Command::Decide { .. }
+            | Command::Rescope { .. }
             | Command::Reindex
     );
 
@@ -247,6 +249,14 @@ pub fn run(
                     &embedder,
                 )?))
             }
+            Command::Rescope { title, scope } => {
+                // One field, so one embedding. Same bargain as `decide`: the
+                // embedder, never a completion provider.
+                let embedder = config.embedder()?;
+                Some(Planned::Rescope(command::plan_rescope(
+                    title, scope, now, "cli", &embedder,
+                )?))
+            }
             // The review answers write, but they answer a question the
             // resolver already asked. No model is involved either way.
             _ => None,
@@ -256,6 +266,9 @@ pub fn run(
             match (command, planned) {
                 (Command::Remember { .. }, Some(Planned::Remember(plan))) => {
                     command::commit_remember(engine, plan)
+                }
+                (Command::Rescope { .. }, Some(Planned::Rescope(plan))) => {
+                    command::commit_rescope(engine, plan)
                 }
                 (Command::Decide { .. }, Some(Planned::Decide(plan))) => {
                     command::commit_decide(engine, plan)
