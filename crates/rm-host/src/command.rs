@@ -124,7 +124,7 @@ pub enum Outcome {
     /// One decision read in full. `None` when no decision has that title --
     /// reported rather than empty, because "no such decision" and "a decision
     /// with nothing in it" are different answers.
-    Decision(Option<Box<DecisionDetail>>),
+    Decision(Found),
 }
 
 /// One decision as a caller sees it.
@@ -158,6 +158,39 @@ pub struct DecisionLine {
     /// right one. `None` on a decision that stands, and also on one retired
     /// before supersession was recorded as an edge.
     pub superseded_by: Option<(StableId, String)>,
+}
+
+/// What looking for one decision found.
+///
+/// Three answers rather than two, because the store holds the difference and
+/// collapsing it loses information a reader needs. `find_decision` matches on
+/// the identity record's `name`, which is not versioned, so a decision recorded
+/// after `at.tx` still resolves by title -- and answering "no such decision"
+/// for it would read as a spelling mistake and send the reader looking for one.
+///
+/// The same distinction `Believed` draws between `Absent` ("someone said there
+/// is none") and `Unknown` ("it has never come up").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    /// The decision, as it stood at the time asked about.
+    Decision(Box<DecisionDetail>),
+    /// The title resolves, but nothing of it stood at `at`.
+    ///
+    /// Both days are carried because either clock can be the one that excluded
+    /// it and they are not the same question. A decision backdated to March and
+    /// typed up in August is invisible before March on the valid axis and
+    /// before August on the transaction axis, and a reader told only "first
+    /// recorded August" would not understand why asking about April also came
+    /// back empty.
+    NotYetRecorded {
+        title: String,
+        /// The first moment the store heard of this decision.
+        first_recorded: Timestamp,
+        /// The first moment it claims to have held.
+        first_held: Timestamp,
+    },
+    /// No decision by that title.
+    Unknown,
 }
 
 /// One decision, in full, with the chain it sits in.
@@ -990,18 +1023,36 @@ pub fn commit_reindex(engine: &mut Engine, plan: ReindexPlan) -> Result<Outcome,
 /// replaced; this says by what, and walks the chain to whatever stands now, so
 /// a reader who arrives at a retired decision is carried to the live one
 /// rather than left to guess.
-pub fn decision(engine: &Engine, title: &str) -> Result<Outcome, HostError> {
+pub fn decision(engine: &Engine, title: &str, at: At) -> Result<Outcome, HostError> {
     let Some(id) = find_decision(engine, title) else {
-        return Ok(Outcome::Decision(None));
+        return Ok(Outcome::Decision(Found::Unknown));
     };
-    let latest = |a: &str| {
-        engine
-            .store_history(id, a)
-            .last()
-            .and_then(|v| v.value.clone())
-    };
-    let history: Vec<(Timestamp, String)> = engine
-        .store_history(id, "choice")
+    // `status` is always written by `commit_decide`, so its absence at `at`
+    // means the store had not heard of this decision at all -- not that a field
+    // is missing. The same fact the `Outcome::Decided` construction relies on.
+    if held(engine, id, "status", at).is_none() {
+        let versions = engine.store_history(id, "status");
+        let first_recorded = versions
+            .iter()
+            .map(|v| v.provenance.observed_at)
+            .min()
+            .ok_or_else(|| {
+                HostError::Refused(
+                    "a decision recorded no status, which should not be reachable".into(),
+                )
+            })?;
+        let first_held = versions
+            .iter()
+            .map(|v| v.valid.from)
+            .min()
+            .unwrap_or(first_recorded);
+        return Ok(Outcome::Decision(Found::NotYetRecorded {
+            title: title.to_string(),
+            first_recorded,
+            first_held,
+        }));
+    }
+    let history: Vec<(Timestamp, String)> = visible(engine, id, "choice", at)
         .iter()
         // The day it was decided, not the day the store was told. They are
         // the same unless the decision was backdated, and when they differ the
@@ -1009,21 +1060,23 @@ pub fn decision(engine: &Engine, title: &str) -> Result<Outcome, HostError> {
         // the entry, and "we typed it up in August" is not.
         .filter_map(|v| Some((v.valid.from, v.value.clone()?)))
         .collect();
-    let status = latest("status").unwrap_or_else(|| DEFAULT_STATUS.into());
-    let superseded_by = chain(engine, id, Direction::Forward);
+    let status = held(engine, id, "status", at).unwrap_or_else(|| DEFAULT_STATUS.into());
+    let superseded_by = chain(engine, id, Direction::Forward, at);
 
-    Ok(Outcome::Decision(Some(Box::new(DecisionDetail {
-        entity: id,
-        title: title.to_string(),
-        choice: latest("choice").unwrap_or_default(),
-        because: latest("because"),
-        context: latest("context"),
-        still_stands: superseded_by.is_empty() && status == DEFAULT_STATUS,
-        status,
-        supersedes: chain(engine, id, Direction::Back),
-        superseded_by,
-        history,
-    }))))
+    Ok(Outcome::Decision(Found::Decision(Box::new(
+        DecisionDetail {
+            entity: id,
+            title: title.to_string(),
+            choice: held(engine, id, "choice", at).unwrap_or_default(),
+            because: held(engine, id, "because", at),
+            context: held(engine, id, "context", at),
+            still_stands: superseded_by.is_empty() && status == DEFAULT_STATUS,
+            status,
+            supersedes: chain(engine, id, Direction::Back, at),
+            superseded_by,
+            history,
+        },
+    ))))
 }
 
 /// Which way along the supersession edges to walk.
@@ -1042,14 +1095,14 @@ enum Direction {
 /// each looked reasonable -- is reachable, and a walk that trusted the data
 /// would hang rather than report it. The visited set costs nothing on a chain
 /// of realistic length and turns an infinite loop into a short answer.
-fn chain(engine: &Engine, start: StableId, dir: Direction) -> Vec<(StableId, String)> {
+fn chain(engine: &Engine, start: StableId, dir: Direction, at: At) -> Vec<(StableId, String)> {
     let mut out = Vec::new();
     let mut seen = vec![start];
-    let mut at = start;
+    let mut cursor = start;
     loop {
         let edges = match dir {
-            Direction::Back => engine.edges_from(at, Timestamp::MAX, Timestamp::MAX),
-            Direction::Forward => engine.edges_into(at, Timestamp::MAX, Timestamp::MAX),
+            Direction::Back => engine.edges_from(cursor, at.valid, at.tx),
+            Direction::Forward => engine.edges_into(cursor, at.valid, at.tx),
         };
         let next = edges
             .iter()
@@ -1064,7 +1117,7 @@ fn chain(engine: &Engine, start: StableId, dir: Direction) -> Vec<(StableId, Str
         }
         seen.push(next);
         out.push((next, title_of(engine, next)));
-        at = next;
+        cursor = next;
     }
 }
 
@@ -1477,6 +1530,138 @@ pub(crate) mod tests {
     }
 
     // ---- decisions ---------------------------------------------------------
+
+    /// Three answers, not two. A title that resolves but was recorded later is
+    /// its own case: reporting "no such decision" would read as a typo.
+    #[test]
+    fn a_decision_not_yet_recorded_is_distinguished_from_one_that_does_not_exist() {
+        const MARCH: Timestamp = 1_772_236_800_000;
+        const AUGUST: Timestamp = 1_787_532_411_419;
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "a choice",
+            None,
+            None,
+            None,
+            None,
+            Some(MARCH),
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        // Backdated to March but recorded in August: as of March the store knew
+        // nothing, even though the decision claims to have held then.
+        let Outcome::Decision(found) = decision(
+            &e,
+            "Pin the compiler",
+            At {
+                valid: Timestamp::MAX,
+                tx: MARCH,
+            },
+        )
+        .unwrap() else {
+            panic!("not a decision outcome")
+        };
+        assert_eq!(
+            found,
+            Found::NotYetRecorded {
+                title: "Pin the compiler".to_string(),
+                first_recorded: AUGUST,
+                first_held: MARCH,
+            },
+            "both clocks are reported: it was typed up in August and claims March"
+        );
+
+        // The other axis excludes it too, and for a different reason. Asking
+        // what held in January, with everything the store knows, still finds
+        // nothing -- and the two days above are what tell those cases apart.
+        assert!(matches!(
+            decision(
+                &e,
+                "Pin the compiler",
+                At {
+                    valid: 1,
+                    tx: Timestamp::MAX
+                }
+            )
+            .unwrap(),
+            Outcome::Decision(Found::NotYetRecorded { .. })
+        ));
+
+        // A title nobody ever used is a different answer.
+        assert_eq!(
+            decision(&e, "Never decided", At::latest()).unwrap(),
+            Outcome::Decision(Found::Unknown)
+        );
+
+        // And now, it is there.
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Pin the compiler", At::latest()).unwrap()
+        else {
+            panic!("expected a decision")
+        };
+        assert_eq!(d.choice, "a choice");
+    }
+
+    /// The chain is walked at the clock too: a supersession recorded later does
+    /// not reach back and retire a decision in the past.
+    #[test]
+    fn a_later_supersession_does_not_reach_back() {
+        const MARCH: Timestamp = 1_772_236_800_000;
+        const AUGUST: Timestamp = 1_787_532_411_419;
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "First",
+            "the old way",
+            None,
+            None,
+            None,
+            None,
+            None,
+            MARCH,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        decide(
+            &mut e,
+            "Second",
+            "the new way",
+            None,
+            None,
+            None,
+            Some("First"),
+            None,
+            AUGUST,
+            "t",
+            &stub,
+        )
+        .unwrap();
+
+        let stands = |at: At| {
+            let Outcome::Decision(Found::Decision(d)) = decision(&e, "First", at).unwrap() else {
+                panic!("expected a decision")
+            };
+            (d.still_stands, d.superseded_by.len())
+        };
+
+        assert_eq!(
+            stands(At {
+                valid: Timestamp::MAX,
+                tx: MARCH
+            }),
+            (true, 0),
+            "in March nothing had replaced it"
+        );
+        assert_eq!(stands(At::latest()), (false, 1), "August replaced it");
+    }
 
     /// A decision the store had not yet heard of is not in the list, and the
     /// count of revisions is the count it had then.
@@ -2098,7 +2283,9 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decision(Some(d)) = decision(&e, "Pin the compiler").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Pin the compiler", At::latest()).unwrap()
+        else {
             panic!()
         };
         // The history reads back the day it was decided, not the day it was
@@ -2137,7 +2324,8 @@ pub(crate) mod tests {
             &mut e, "Plain", "a choice", None, None, None, None, None, NOW, "t", &stub,
         )
         .unwrap();
-        let Outcome::Decision(Some(d)) = decision(&e, "Plain").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) = decision(&e, "Plain", At::latest()).unwrap()
+        else {
             panic!()
         };
         assert_eq!(d.history[0].0, NOW);
@@ -2228,7 +2416,9 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decision(Some(d)) = decision(&e, "Rerank the recall results").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Rerank the recall results", At::latest()).unwrap()
+        else {
             panic!()
         };
         assert_eq!(d.status, "rejected");
@@ -2272,7 +2462,10 @@ pub(crate) mod tests {
             );
         }
         // And nothing was written on the way through.
-        assert_eq!(decision(&e, "Some title").unwrap(), Outcome::Decision(None));
+        assert_eq!(
+            decision(&e, "Some title", At::latest()).unwrap(),
+            Outcome::Decision(Found::Unknown)
+        );
     }
 
     /// `superseded` is not a status a caller sets.
@@ -2315,7 +2508,8 @@ pub(crate) mod tests {
             &mut e, "Plain", "a choice", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
-        let Outcome::Decision(Some(d)) = decision(&e, "Plain").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) = decision(&e, "Plain", At::latest()).unwrap()
+        else {
             panic!()
         };
         assert_eq!(d.status, "accepted");
@@ -2349,7 +2543,9 @@ pub(crate) mod tests {
             .unwrap();
         }
 
-        let Outcome::Decision(Some(d)) = decision(&e, "Store as one JSON file").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Store as one JSON file", At::latest()).unwrap()
+        else {
             panic!("the oldest decision should be readable")
         };
         assert!(!d.still_stands);
@@ -2363,7 +2559,9 @@ pub(crate) mod tests {
         );
 
         // And back the other way, from the live one.
-        let Outcome::Decision(Some(d)) = decision(&e, "Store in Postgres").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) =
+            decision(&e, "Store in Postgres", At::latest()).unwrap()
+        else {
             panic!()
         };
         assert!(d.still_stands);
@@ -2421,7 +2619,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        let Outcome::Decision(Some(d)) = decision(&e, "A").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) = decision(&e, "A", At::latest()).unwrap() else {
             panic!()
         };
         // Exactly one hop each way, then the revisit stops it. Asserted
@@ -2474,7 +2672,8 @@ pub(crate) mod tests {
         )
         .expect("naming itself must not fail the write");
 
-        let Outcome::Decision(Some(d)) = decision(&e, "Only one").unwrap() else {
+        let Outcome::Decision(Found::Decision(d)) = decision(&e, "Only one", At::latest()).unwrap()
+        else {
             panic!()
         };
         assert_eq!(d.choice, "second");
@@ -2486,8 +2685,8 @@ pub(crate) mod tests {
     fn reading_a_decision_that_does_not_exist_says_so() {
         let e = engine();
         assert_eq!(
-            decision(&e, "never recorded").unwrap(),
-            Outcome::Decision(None)
+            decision(&e, "never recorded", At::latest()).unwrap(),
+            Outcome::Decision(Found::Unknown)
         );
     }
 

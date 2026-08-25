@@ -543,7 +543,9 @@ where
             (Call::Decisions { status }, _) => {
                 command::decisions(engine, status.as_deref(), rm_host::time::At::latest())
             }
-            (Call::Decision { title }, _) => command::decision(engine, &title),
+            (Call::Decision { title }, _) => {
+                command::decision(engine, &title, rm_host::time::At::latest())
+            }
             (other, _) => unreachable!("{other:?} writes, or was not planned"),
         }
     }

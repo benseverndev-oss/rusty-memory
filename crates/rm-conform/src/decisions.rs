@@ -12,7 +12,8 @@
 
 use rm_embed::Hashed;
 use rm_engine::{Engine, Policy, Strategy};
-use rm_host::command::{self, DecisionDetail, Outcome};
+use rm_host::command::{self, DecisionDetail, Found, Outcome};
+use rm_host::time::At;
 use rm_index::{Metric, VectorIndex};
 use rm_resolve::{BlockingKey, Comparator, FieldRule, Ruleset};
 
@@ -63,8 +64,8 @@ pub fn build_chain(titles: &[&str]) -> Engine {
 
 /// One decision in full, or a panic naming the title that did not resolve.
 pub fn detail(e: &Engine, title: &str) -> DecisionDetail {
-    match command::decision(e, title).expect("a recorded title resolves") {
-        Outcome::Decision(Some(d)) => *d,
+    match command::decision(e, title, At::latest()).expect("a recorded title resolves") {
+        Outcome::Decision(Found::Decision(d)) => *d,
         _ => panic!("expected a decision for {title:?}"),
     }
 }

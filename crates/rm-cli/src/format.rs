@@ -5,7 +5,7 @@
 
 use rm_engine::{Believed, Standing};
 
-use rm_host::command::{MentionLanding, Outcome};
+use rm_host::command::{Found, MentionLanding, Outcome};
 
 pub fn render(outcome: &Outcome) -> String {
     match outcome {
@@ -194,10 +194,13 @@ pub fn render(outcome: &Outcome) -> String {
             out
         }
 
-        Outcome::Decision(None) => {
+        // Replaced in Task 4 with a real message; here only so the crate
+        // compiles while `decision` grows its third answer.
+        Outcome::Decision(Found::NotYetRecorded { .. }) => String::new(),
+        Outcome::Decision(Found::Unknown) => {
             "no decision by that title — `rmem decisions` lists them, and the title has to match exactly".to_string()
         }
-        Outcome::Decision(Some(d)) => {
+        Outcome::Decision(Found::Decision(d)) => {
             let mut out = format!("{}  [{}]\n", d.title, d.status);
             out.push_str(&format!("  entity {}\n\n", d.entity));
             out.push_str(&format!("  choice   {}\n", d.choice));

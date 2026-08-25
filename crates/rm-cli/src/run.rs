@@ -302,7 +302,9 @@ pub fn run(
                 (Command::Decisions { status }, _) => {
                     command::decisions(engine, status.as_deref(), rm_host::time::At::latest())
                 }
-                (Command::Decision { title }, _) => command::decision(engine, &title),
+                (Command::Decision { title }, _) => {
+                    command::decision(engine, &title, rm_host::time::At::latest())
+                }
                 (Command::Init { .. }, _) => unreachable!("handled above"),
                 (other, _) => unreachable!("{other:?} writes, or was not planned"),
             }
