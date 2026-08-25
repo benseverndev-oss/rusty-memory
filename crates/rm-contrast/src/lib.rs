@@ -20,3 +20,4 @@
 //! asserts it does. See [`surface::calibration`].
 
 pub mod flat;
+pub mod workload;
