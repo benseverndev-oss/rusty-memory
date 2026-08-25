@@ -751,4 +751,19 @@ mod tests {
             "must not read as a typo: {out}"
         );
     }
+
+    #[test]
+    fn a_decision_out_of_reach_names_both_places() {
+        let out = render(&Outcome::Decision(Found::NotHere {
+            title: "A sibling".into(),
+            scope: "work/other".into(),
+            asked_from: "work/goldenmatch".into(),
+        }));
+        assert!(out.contains("work/other"), "{out}");
+        assert!(out.contains("work/goldenmatch"), "{out}");
+        assert!(
+            !out.contains("no decision by that title"),
+            "must not read as a typo: {out}"
+        );
+    }
 }

@@ -30,6 +30,7 @@
 //! reading a file in here needs this paragraph revisited.
 
 use rm_engine::Timestamp;
+use rm_host::scope::UNIVERSAL;
 
 use crate::CliError;
 
@@ -47,14 +48,19 @@ rmem — a memory that resolves contradictions deterministically
     rmem review                      open questions the resolver could not answer
     rmem review confirm <id>         answer one: the same thing
     rmem review reject <id>          answer one: different things
-    rmem decide \"<title>\" \"<choice>\" [--because <why>] [--context <what prompted it>]
+    rmem decide \"<title>\" \"<choice>\" --scope <s> [--because <why>]
+                                     [--context <what prompted it>]
                                      [--status proposed|accepted|rejected|deprecated]
                                      [--supersedes \"<title>\"] [--at YYYY-MM-DD]
-                                     record a decision under a stable, findable title
-    rmem decisions [--status <s>] [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
+                                     record a decision under a stable, findable title.
+                                     --scope says how far it reaches: * for
+                                     everywhere, or a path like work/goldenmatch
+    rmem decisions [--status <s>] [--scope <s>] [--all]
+                   [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
                                      every decision, and whether it still stands
     rmem reindex                     re-embed every assertion under the current provider
-    rmem decision \"<title>\" [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
+    rmem decision \"<title>\" [--scope <s>] [--all]
+                   [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
                                      one decision in full, and the chain it sits in
 
 Entity ids come from `remember` and `recall`. Review ids come from `review`.
@@ -92,6 +98,9 @@ pub enum Command {
     Decide {
         title: String,
         choice: String,
+        /// How far this decision reaches. Required: reach varies per decision,
+        /// so no session default can be right.
+        scope: String,
         /// One of `DECISION_STATUSES`. `None` means `accepted`.
         status: Option<String>,
         /// When the decision was made, as milliseconds. `None` means now.
@@ -107,6 +116,10 @@ pub enum Command {
     Decisions {
         /// Show only decisions with this status. `None` shows every one.
         status: Option<String>,
+        /// Ask from this position instead of `RMEM_SCOPE`.
+        scope: Option<String>,
+        /// Suspend the applicability rule and show everything.
+        all: bool,
         /// What held then. `None` is what holds now.
         valid_at: Option<Timestamp>,
         /// What the store knew then. `None` is what it knows now.
@@ -117,6 +130,10 @@ pub enum Command {
     /// Read one decision by its exact title.
     Decision {
         title: String,
+        /// Ask from this position instead of `RMEM_SCOPE`.
+        scope: Option<String>,
+        /// Suspend the applicability rule and show everything.
+        all: bool,
         /// What held then. `None` is what holds now.
         valid_at: Option<Timestamp>,
         /// What the store knew then. `None` is what it knows now.
@@ -299,9 +316,17 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                     "decide takes the title and the choice first, before any flags\n\n{USAGE}"
                 )));
             }
+            let Some(scope) = flag(&args, "--scope")? else {
+                return Err(CliError::Usage(format!(
+                    "decide needs --scope: how far this decision reaches. {UNIVERSAL:?} for everywhere, or a path like \"work/goldenmatch\"
+
+{USAGE}"
+                )));
+            };
             Ok(Command::Decide {
                 title: title.clone(),
                 choice: choice.clone(),
+                scope,
                 status: flag(&args, "--status")?,
                 decided_at: flag(&args, "--at")?
                     .map(|d| rm_host::time::parse_day(&d).map_err(CliError::Usage))
@@ -316,6 +341,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
 
         "decisions" => Ok(Command::Decisions {
             status: flag(&args, "--status")?,
+            scope: flag(&args, "--scope")?,
+            all: args.iter().any(|a| a == "--all"),
             valid_at: day(&args, "--valid-at")?,
             as_of: day(&args, "--as-of")?,
         }),
@@ -332,6 +359,8 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
             };
             Ok(Command::Decision {
                 title: title.clone(),
+                scope: flag(&args, "--scope")?,
+                all: args.iter().any(|a| a == "--all"),
                 valid_at: day(&args, "--valid-at")?,
                 as_of: day(&args, "--as-of")?,
             })
@@ -361,20 +390,24 @@ mod tests {
     #[test]
     fn a_decision_can_be_dated_and_a_bad_date_is_refused() {
         let Ok(Command::Decide { decided_at, .. }) =
-            parse_args(&["decide", "T", "C", "--at", "2026-03-14"])
+            parse_args(&["decide", "T", "C", "--scope", "work", "--at", "2026-03-14"])
         else {
             panic!("a good date should parse")
         };
         // 2026-03-14T00:00:00Z
         assert_eq!(decided_at, Some(1_773_446_400_000));
 
-        let Ok(Command::Decide { decided_at, .. }) = parse_args(&["decide", "T", "C"]) else {
+        let Ok(Command::Decide { decided_at, .. }) =
+            parse_args(&["decide", "T", "C", "--scope", "work"])
+        else {
             panic!()
         };
         assert_eq!(decided_at, None, "no flag means now, decided downstream");
 
         for bad in ["14/03/2026", "March", "2026-3-14", "2026-02-30"] {
-            let Err(CliError::Usage(why)) = parse_args(&["decide", "T", "C", "--at", bad]) else {
+            let Err(CliError::Usage(why)) =
+                parse_args(&["decide", "T", "C", "--scope", "work", "--at", bad])
+            else {
                 panic!("{bad:?} should be refused")
             };
             assert!(!why.is_empty(), "for {bad:?}");
@@ -433,6 +466,8 @@ mod tests {
             parse_args(&["decisions"]).unwrap(),
             Command::Decisions {
                 status: None,
+                scope: None,
+                all: false,
                 valid_at: None,
                 as_of: None
             }
@@ -441,6 +476,8 @@ mod tests {
             parse_args(&["decisions", "--status", "rejected"]).unwrap(),
             Command::Decisions {
                 status: Some("rejected".into()),
+                scope: None,
+                all: false,
                 valid_at: None,
                 as_of: None
             }
@@ -705,6 +742,7 @@ mod tests {
             valid_at,
             as_of,
             title,
+            ..
         } = parse_args(&[
             "decision",
             "Pin the compiler",
@@ -735,5 +773,42 @@ mod tests {
             parse_args(&["decision", "X", "--as-of", "not-a-date"]).is_err(),
             "a date that is not one must be refused"
         );
+    }
+
+    #[test]
+    fn decide_requires_a_scope_and_the_reads_take_a_position() {
+        let Command::Decide { scope, .. } = parse_args(&[
+            "decide",
+            "Pin the compiler",
+            "rust-toolchain.toml names the version",
+            "--scope",
+            "work/goldenmatch",
+        ])
+        .unwrap() else {
+            panic!("not a decide command")
+        };
+        assert_eq!(scope, "work/goldenmatch");
+
+        let e = parse_args(&["decide", "A title", "A choice"]).unwrap_err();
+        assert!(
+            format!("{e}").contains("--scope"),
+            "the refusal should name the flag: {e}"
+        );
+
+        let Command::Decisions { scope, all, .. } =
+            parse_args(&["decisions", "--scope", "personal"]).unwrap()
+        else {
+            panic!("not a decisions command")
+        };
+        assert_eq!(scope.as_deref(), Some("personal"));
+        assert!(!all);
+
+        let Command::Decision { all, scope, .. } =
+            parse_args(&["decision", "A title", "--all"]).unwrap()
+        else {
+            panic!("not a decision command")
+        };
+        assert!(all, "--all suspends the rule");
+        assert_eq!(scope, None);
     }
 }
