@@ -307,7 +307,7 @@ impl Engine {
         // a memory chosen by a rule the caller did not ask for is exactly the
         // plausible-looking wrong answer the refusals exist to prevent.
         let outcome = merge(&candidates, policy.for_attribute(attribute))?;
-        Ok(match outcome.held_at(valid_t) {
+        Ok(match outcome.held_at(valid_t)? {
             // `held_at`, not `as_of`: `as_of` collapses an asserted absence
             // into `None`, the same shape as no coverage at all. `Believed`
             // exists to keep exactly that distinction, so the precise

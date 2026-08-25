@@ -12,7 +12,7 @@
 //! either implementation.
 
 use rm_core::Interval;
-use rm_survivor::{Asserted, Candidate, Fact, Held, Outcome, Refused, Strategy};
+use rm_survivor::{Asserted, Candidate, Fact, Held, Outcome, Refused, Span, Strategy};
 
 /// What `rm_survivor::merge` should have returned.
 pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcome, Refused> {
@@ -36,14 +36,22 @@ pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcom
 /// Note what this means for a `Survivor`: it has no time dimension, so it holds
 /// at every `t` and valid time does not bite at all. Only a `Timeline` -- that
 /// is, only `Strategy::ValidInterval` -- answers "what was true when".
-pub fn held_at(outcome: &Outcome, t: rm_core::Timestamp) -> Option<&Held> {
+pub fn held_at(outcome: &Outcome, t: rm_core::Timestamp) -> Result<Option<&Held>, Refused> {
     match outcome {
-        Outcome::Survivor(v) => v.as_ref(),
-        Outcome::Timeline(facts) => facts
+        Outcome::Survivor(v) => Ok(v.as_ref()),
+        // Half-open `[from, to)`, per `Interval`'s own docs.
+        Outcome::Timeline(facts) => match facts
             .iter()
-            // Half-open `[from, to)`, per `Interval`'s own docs.
             .find(|f| f.valid.from <= t && f.valid.to.is_none_or(|to| t < to))
-            .map(|f| &f.value),
+        {
+            None => Ok(None),
+            Some(f) => match &f.span {
+                Span::Held(v) => Ok(Some(v)),
+                Span::Contested { .. } => Err(Refused(
+                    "nothing orders the values that opened here".to_string(),
+                )),
+            },
+        },
     }
 }
 
@@ -153,7 +161,7 @@ fn valid_interval(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
         let value = held(c);
         // A repeat of the value already standing extends it rather than
         // opening a second span: the timeline holds *distinct* values.
-        if facts.last().map(|f| &f.value) == Some(&value) {
+        if facts.last().map(|f| &f.span) == Some(&Span::Held(value.clone())) {
             continue;
         }
         // Close the previous span where this one opens.
@@ -161,7 +169,7 @@ fn valid_interval(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
             prev.valid = Interval::between(prev.valid.from, c.valid.from);
         }
         facts.push(Fact {
-            value,
+            span: Span::Held(value),
             valid: Interval::since(c.valid.from),
         });
     }
@@ -351,11 +359,11 @@ mod tests {
             out,
             Outcome::Timeline(vec![
                 Fact {
-                    value: Held::Value("fly.io".into()),
+                    span: Span::Held(Held::Value("fly.io".into())),
                     valid: Interval::between(100, 300)
                 },
                 Fact {
-                    value: Held::Value("render".into()),
+                    span: Span::Held(Held::Value("render".into())),
                     valid: Interval::since(300)
                 },
             ])
@@ -377,11 +385,11 @@ mod tests {
             out,
             Outcome::Timeline(vec![
                 Fact {
-                    value: Held::Value("fly.io".into()),
+                    span: Span::Held(Held::Value("fly.io".into())),
                     valid: Interval::between(100, 200)
                 },
                 Fact {
-                    value: Held::Value("render".into()),
+                    span: Span::Held(Held::Value("render".into())),
                     valid: Interval::since(200)
                 },
             ])
@@ -418,11 +426,11 @@ mod tests {
             merge(&cs, &Strategy::ValidInterval).unwrap(),
             Outcome::Timeline(vec![
                 Fact {
-                    value: Held::Value("fly.io".into()),
+                    span: Span::Held(Held::Value("fly.io".into())),
                     valid: Interval::between(100, 300)
                 },
                 Fact {
-                    value: Held::Value("render".into()),
+                    span: Span::Held(Held::Value("render".into())),
                     valid: Interval::since(300)
                 },
             ])

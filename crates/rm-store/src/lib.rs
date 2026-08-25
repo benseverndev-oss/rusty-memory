@@ -48,7 +48,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rm_core::{Interval, Provenance, Supersession, Timestamp};
-use rm_survivor::{merge, Candidate, Held, Outcome, Refused, Strategy};
+use rm_survivor::{merge, Candidate, Held, Outcome, Refused, Span, Strategy};
 use serde::{Deserialize, Serialize};
 
 /// A durable entity id: assigned once, monotonic, never reused.
@@ -481,10 +481,13 @@ impl MemoryStore {
             ),
             Outcome::Timeline(facts) => {
                 for fact in facts {
+                    let Span::Held(value) = fact.span else {
+                        unreachable!("merge still refuses a collision whole")
+                    };
                     self.assert(
                         id,
                         attribute.clone(),
-                        held_to_value(fact.value),
+                        held_to_value(value),
                         fact.valid,
                         latest.clone(),
                         Supersession::Corrects,

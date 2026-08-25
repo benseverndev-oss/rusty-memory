@@ -175,10 +175,32 @@ impl<'a> Candidate<'a> {
     }
 }
 
-/// A value paired with the span of valid time over which it held.
+/// What a span of valid time holds.
+///
+/// Two shapes, because a timeline over contradictory writes has regions where
+/// no single value can be said to have stood. Naming those regions is what
+/// lets a read refuse the instant it was asked about rather than the whole
+/// history: a timeline with an unnamed hole cannot be indexed into, and one
+/// whose holes are named can.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Span {
+    /// One value stood here.
+    Held(Held),
+    /// Two or more values opened here sharing an `observed_at`, so nothing
+    /// orders them and none of them can be said to have held.
+    ///
+    /// `observed_at` is carried because it is what a refusal hands back to
+    /// whoever has to fix it: the timestamp naming which writes to separate.
+    Contested {
+        values: Vec<Held>,
+        observed_at: Timestamp,
+    },
+}
+
+/// A span of valid time and what stood over it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fact {
-    pub value: Held,
+    pub span: Span,
     pub valid: Interval,
 }
 
@@ -213,7 +235,10 @@ impl Outcome {
         match self {
             Outcome::Survivor(v) => v.as_ref().and_then(Held::value),
             Outcome::Timeline(facts) => match facts.as_slice() {
-                [only] => only.value.value(),
+                [Fact {
+                    span: Span::Held(v),
+                    ..
+                }] => v.value(),
                 _ => None,
             },
         }
@@ -224,17 +249,40 @@ impl Outcome {
     /// Reports an asserted absence as `None`, the same as no coverage at all.
     /// Use [`Outcome::held_at`] where the difference matters — it does to a
     /// memory store, and this method is the convenience, not the precise answer.
-    pub fn as_of(&self, t: Timestamp) -> Option<&str> {
-        self.held_at(t).and_then(Held::value)
+    ///
+    /// Fallible along with `held_at` rather than collapsing a contested span
+    /// into `None`: `None` here already means *no coverage*, and flattening
+    /// "two values and nothing orders them" into it is the same collapse the
+    /// `Absent`/`Unknown` distinction exists to prevent.
+    pub fn as_of(&self, t: Timestamp) -> Result<Option<&str>, Refused> {
+        Ok(self.held_at(t)?.and_then(Held::value))
     }
 
     /// What held at `t`, distinguishing an asserted absence from no coverage.
-    pub fn held_at(&self, t: Timestamp) -> Option<&Held> {
+    ///
+    /// Refuses only when `t` lands in a contested span. A [`Outcome::Survivor`]
+    /// never refuses: it has no time dimension -- that is what
+    /// [`Strategy::keeps_a_timeline`] reports -- so it is `Ok` at every instant,
+    /// and the `Result` is a shape the timeline arm needs rather than a
+    /// behaviour every strategy acquires.
+    pub fn held_at(&self, t: Timestamp) -> Result<Option<&Held>, Refused> {
         match self {
-            Outcome::Survivor(v) => v.as_ref(),
-            Outcome::Timeline(facts) => {
-                facts.iter().find(|f| f.valid.contains(t)).map(|f| &f.value)
-            }
+            Outcome::Survivor(v) => Ok(v.as_ref()),
+            Outcome::Timeline(facts) => match facts.iter().find(|f| f.valid.contains(t)) {
+                None => Ok(None),
+                Some(Fact {
+                    span: Span::Held(v),
+                    ..
+                }) => Ok(Some(v)),
+                Some(Fact {
+                    span:
+                        Span::Contested {
+                            values,
+                            observed_at,
+                        },
+                    valid,
+                }) => Err(Refused(contested(values, *observed_at, t, valid))),
+            },
         }
     }
 }
@@ -375,6 +423,31 @@ pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcom
     };
 
     Ok(Outcome::Survivor(winner))
+}
+
+/// The refusal for a question that landed in a contested span.
+///
+/// Names the interval so the answer is actionable rather than a dead end: a
+/// caller learns both that this instant is contested and where the history
+/// resumes being answerable. That is the whole difference between a refusal
+/// that fits the question and one that does not.
+fn contested(values: &[Held], observed_at: Timestamp, t: Timestamp, valid: &Interval) -> String {
+    let named: Vec<String> = values
+        .iter()
+        .map(|v| match v {
+            Held::Value(s) => format!("{s:?}"),
+            Held::Absent => "an asserted absence".to_string(),
+        })
+        .collect();
+    let resumes = match valid.to {
+        Some(to) => format!("outside [{}, {to})", valid.from),
+        None => format!("before {}", valid.from),
+    };
+    format!(
+        "{} opened at {} and were all observed at {observed_at}, so none supersedes          the others and none can be said to have held at {t}. Distinguish their          observation times, or ask about an instant {resumes}.",
+        named.join(" and "),
+        valid.from
+    )
 }
 
 /// An assertion as the owned result it would be if it won.
@@ -561,11 +634,14 @@ fn timeline(candidates: &[Candidate<'_>]) -> Result<Vec<Fact>, Refused> {
     let mut facts: Vec<Fact> = Vec::new();
     for c in &asserted {
         let value = held(c.value);
-        if facts.last().is_some_and(|f| f.value == value) {
+        if facts
+            .last()
+            .is_some_and(|f| f.span == Span::Held(value.clone()))
+        {
             continue; // same value restated: extends the open span, no new fact
         }
         facts.push(Fact {
-            value,
+            span: Span::Held(value),
             valid: Interval::since(c.valid.from),
         });
     }
@@ -808,26 +884,26 @@ mod tests {
             out,
             Outcome::Timeline(vec![
                 Fact {
-                    value: Held::Value("acme".to_string()),
+                    span: Span::Held(Held::Value("acme".to_string())),
                     valid: Interval::between(100, 200)
                 },
                 Fact {
-                    value: Held::Value("globex".to_string()),
+                    span: Span::Held(Held::Value("globex".to_string())),
                     valid: Interval::since(200)
                 },
             ])
         );
         // And the store can answer "as of when".
-        assert_eq!(out.as_of(150), Some("acme"));
-        assert_eq!(out.as_of(200), Some("globex"));
-        assert_eq!(out.as_of(99), None); // nothing known before the first observation
+        assert_eq!(out.as_of(150).unwrap(), Some("acme"));
+        assert_eq!(out.as_of(200).unwrap(), Some("globex"));
+        assert_eq!(out.as_of(99).unwrap(), None); // nothing known before the first observation
     }
 
     #[test]
     fn valid_interval_orders_by_observation_not_input_order() {
         let (p, v) = cands![Some("globex"), Source::UserAssertion, 200; Some("acme"), Source::UserAssertion, 100];
         let out = merge(&build(&p, &v), &Strategy::ValidInterval).unwrap();
-        assert_eq!(out.as_of(150), Some("acme"));
+        assert_eq!(out.as_of(150).unwrap(), Some("acme"));
     }
 
     #[test]
@@ -858,7 +934,8 @@ mod tests {
         assert_eq!(
             merge(&build(&p, &v), &Strategy::ValidInterval)
                 .unwrap()
-                .as_of(250),
+                .as_of(250)
+                .unwrap(),
             Some("globex")
         );
     }
@@ -899,7 +976,7 @@ mod tests {
         assert_eq!(
             out,
             Outcome::Timeline(vec![Fact {
-                value: Held::Value("acme".to_string()),
+                span: Span::Held(Held::Value("acme".to_string())),
                 valid: Interval::since(100)
             }])
         );
@@ -960,7 +1037,7 @@ mod tests {
             Candidate::absent(&late),
         ];
         let outcome = merge(&candidates, &Strategy::MostRecent).unwrap();
-        assert_eq!(outcome.held_at(0), Some(&Held::Absent));
+        assert_eq!(outcome.held_at(0).unwrap(), Some(&Held::Absent));
     }
 
     #[test]
@@ -974,7 +1051,7 @@ mod tests {
             Candidate::new(None, &late),
         ];
         let outcome = merge(&candidates, &Strategy::MostRecent).unwrap();
-        assert_eq!(outcome.as_of(0), Some("Acme"));
+        assert_eq!(outcome.as_of(0).unwrap(), Some("Acme"));
     }
 
     #[test]
@@ -989,14 +1066,17 @@ mod tests {
             Candidate::new(Some("Globex"), &p3),
         ];
         let outcome = merge(&candidates, &Strategy::ValidInterval).unwrap();
-        assert_eq!(outcome.held_at(15), Some(&Held::Value("Acme".to_string())));
-        assert_eq!(outcome.held_at(25), Some(&Held::Absent));
         assert_eq!(
-            outcome.held_at(35),
+            outcome.held_at(15).unwrap(),
+            Some(&Held::Value("Acme".to_string()))
+        );
+        assert_eq!(outcome.held_at(25).unwrap(), Some(&Held::Absent));
+        assert_eq!(
+            outcome.held_at(35).unwrap(),
             Some(&Held::Value("Globex".to_string()))
         );
         assert_eq!(
-            outcome.as_of(25),
+            outcome.as_of(25).unwrap(),
             None,
             "as_of reports an absence as no value"
         );
