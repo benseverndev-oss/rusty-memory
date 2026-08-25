@@ -152,6 +152,96 @@ pub fn world(seed: u64, params: &Params) -> World {
     }
 }
 
+use rm_embed::Hashed;
+use rm_engine::{Engine, Policy, Strategy};
+use rm_host::command::{self, Outcome};
+use rm_host::time::At;
+use rm_index::{Metric, VectorIndex};
+use rm_resolve::{BlockingKey, Comparator, FieldRule, Ruleset};
+
+/// Its own fixture rather than sharing `decisions.rs`'s.
+///
+/// A fixture two measurements share is one either can silently reconfigure,
+/// which is the coupling this crate exists to avoid rather than introduce.
+fn engine() -> Engine {
+    let ruleset = Ruleset::new(
+        vec![FieldRule::new("name", Comparator::JaroWinkler, 0.9, 0.01)],
+        vec![BlockingKey::Prefix("name".to_string(), 3)],
+        4.0,
+        8.0,
+    )
+    .expect("a one-field ruleset is valid");
+    Engine::new(
+        VectorIndex::new(3, Metric::Cosine),
+        ruleset,
+        Policy::new(Strategy::MostRecent),
+    )
+}
+
+/// Record every decision in `world`, each with its stated reach.
+pub fn build(world: &World) -> Engine {
+    let mut e = engine();
+    let embedder = Hashed::new(3);
+    let mut observed_at = 1_000;
+    for (title, scope) in &world.decisions {
+        command::decide(
+            &mut e,
+            title,
+            "the chosen option",
+            scope,
+            None, // status: accepted
+            Some("a stated reason"),
+            None, // context
+            None, // supersedes
+            None, // decided_at: defaults to observed_at
+            observed_at,
+            "conform",
+            &embedder,
+        )
+        .expect("a decision with a fresh title and a valid scope is recorded");
+        observed_at += 10;
+    }
+    e
+}
+
+/// The titles the read path returns from `position`, sorted.
+pub fn visible(engine: &Engine, position: &str) -> Vec<String> {
+    let Outcome::Decisions(ds) = command::decisions(engine, None, At::latest(), Some(position))
+        .expect("listing decisions cannot fail on a store this builds")
+    else {
+        panic!("decisions did not return decisions")
+    };
+    let mut out: Vec<String> = ds.into_iter().map(|d| d.title).collect();
+    out.sort();
+    out
+}
+
+/// The titles that *should* be visible from `position`, sorted.
+///
+/// Computed from what the generator wrote, through [`reaches`] -- never by
+/// asking the store.
+pub fn expected(world: &World, position: &str) -> Vec<String> {
+    let mut out: Vec<String> = world
+        .decisions
+        .iter()
+        .filter(|(_, scope)| reaches(scope, position))
+        .map(|(title, _)| title.clone())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Whether the read path and the oracle agree on every generated world.
+pub fn agreement(seeds: std::ops::Range<u64>, params: &Params) -> bool {
+    seeds.into_iter().all(|seed| {
+        let w = world(seed, params);
+        let e = build(&w);
+        w.positions
+            .iter()
+            .all(|p| visible(&e, p) == expected(&w, p))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +371,57 @@ mod tests {
         }
         assert!(universal > 0, "nothing was scoped everywhere");
         assert!(narrow > 0, "everything was scoped everywhere");
+    }
+
+    #[test]
+    fn the_read_path_returns_exactly_what_the_oracle_expects() {
+        assert!(
+            agreement(0..60, &Params::default()),
+            "the read path disagreed with the oracle on some (world, position)"
+        );
+    }
+
+    /// A sweep where every position saw everything, or nothing, would report
+    /// perfect agreement having measured neither filtering nor inclusion.
+    #[test]
+    fn the_sweep_both_includes_and_excludes() {
+        let params = Params::default();
+        let (mut saw_some, mut saw_none) = (0, 0);
+        for seed in 0..40 {
+            let w = world(seed, &params);
+            for p in &w.positions {
+                let n = expected(&w, p).len();
+                if n == 0 {
+                    saw_none += 1;
+                } else if n < w.decisions.len() {
+                    saw_some += 1;
+                }
+            }
+        }
+        assert!(saw_some > 0, "no position ever saw a strict subset");
+        assert!(saw_none > 0, "no position ever excluded everything");
+    }
+
+    /// The guard that makes the agreement row mean something: the oracle must
+    /// be capable of disagreeing. A string-prefix rule differs from a segment
+    /// rule on exactly the colliding names the generator plants.
+    #[test]
+    fn a_string_prefix_oracle_would_disagree_with_this_one() {
+        fn naive(scope: &str, position: &str) -> bool {
+            scope == "*" || position.starts_with(scope)
+        }
+        let params = Params::default();
+        let differ = (0..40).any(|seed| {
+            let w = world(seed, &params);
+            w.positions.iter().any(|p| {
+                w.decisions
+                    .iter()
+                    .any(|(_, s)| naive(s, p) != reaches(s, p))
+            })
+        });
+        assert!(
+            differ,
+            "a bare starts_with agreed with the oracle everywhere, so the              sweep cannot tell a segment rule from a string one"
+        );
     }
 }
