@@ -237,7 +237,7 @@ pub struct DecisionDetail {
 /// stated reason at a time; re-deciding under the same title is a correction
 /// and that is precisely what `Standing::Corrected` should say about the old
 /// one.
-const DECISION_FIELDS: [&str; 4] = ["status", "choice", "because", "context"];
+const DECISION_FIELDS: [&str; 5] = ["status", "choice", "because", "context", "scope"];
 
 /// What a decision's `status` may be, and the whole of it.
 ///
@@ -599,6 +599,7 @@ pub fn decide(
     engine: &mut Engine,
     title: &str,
     choice: &str,
+    scope: &str,
     status: Option<&str>,
     because: Option<&str>,
     context: Option<&str>,
@@ -611,6 +612,7 @@ pub fn decide(
     let plan = plan_decide(
         title,
         choice,
+        scope,
         status,
         because,
         context,
@@ -662,6 +664,9 @@ pub struct DecidePlan {
 pub fn plan_decide(
     title: &str,
     choice: &str,
+    // How far this decision reaches. Required, and never defaulted: reach
+    // varies per decision, so neither the session nor the store can supply it.
+    scope: &str,
     status: Option<&str>,
     because: Option<&str>,
     context: Option<&str>,
@@ -681,6 +686,10 @@ pub fn plan_decide(
             "a decision needs a title and a choice: the title is how it is found again, and the choice is what was decided".into(),
         ));
     }
+
+    // Before the embedder, so a typo costs nothing -- the same bargain the
+    // status checks below make.
+    crate::scope::validate(scope).map_err(HostError::Refused)?;
 
     let status = status.unwrap_or(DEFAULT_STATUS);
     // Refused before the embedder is called, so a typo costs nothing. Named
@@ -713,6 +722,7 @@ pub fn plan_decide(
         ("choice", Some(choice)),
         ("because", because),
         ("context", context),
+        ("scope", Some(scope)),
     ] {
         let Some(value) = value.filter(|v| !v.trim().is_empty()) else {
             continue;
@@ -1498,6 +1508,7 @@ pub(crate) mod tests {
         let plan = plan_decide(
             "Pin the toolchain",
             "rust-toolchain.toml names the version",
+            "work",
             None,
             Some("CI and a working copy were answering different questions"),
             None,
@@ -1510,8 +1521,8 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(
             probe.calls.get(),
-            3,
-            "status, choice and because -- one embedding each"
+            4,
+            "status, choice, because and scope -- one embedding each"
         );
         assert!(
             probe.always_free.get(),
@@ -1539,6 +1550,69 @@ pub(crate) mod tests {
 
     // ---- decisions ---------------------------------------------------------
 
+    /// A scope is required and validated before the embedder is called, so a
+    /// typo costs nothing -- the same bargain the status check already makes.
+    #[test]
+    fn a_decision_states_its_reach_or_is_refused() {
+        let stub = StubProvider::new(vec![]);
+        let plan = |scope: &str| {
+            plan_decide(
+                "Pin the compiler",
+                "rust-toolchain.toml names the version",
+                scope,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1_000,
+                "t",
+                &stub,
+            )
+        };
+
+        assert!(plan("work/goldenmatch").is_ok());
+        assert!(plan(crate::scope::UNIVERSAL).is_ok());
+
+        let Err(HostError::Refused(why)) = plan("") else {
+            panic!("an unscoped decision should be refused")
+        };
+        assert!(why.contains("how far"), "{why}");
+
+        let Err(HostError::Refused(why)) = plan("work/*") else {
+            panic!("a wildcard segment should be refused")
+        };
+        assert!(why.contains('*'), "{why}");
+    }
+
+    /// The scope is stored like any other field, so it is versioned, readable
+    /// at a past clock, and rebuilt by `reindex`.
+    #[test]
+    fn a_scope_is_an_attribute_like_the_others() {
+        let mut e = engine();
+        let stub = StubProvider::new(vec![]);
+        decide(
+            &mut e,
+            "Pin the compiler",
+            "a choice",
+            "work/goldenmatch",
+            None,
+            None,
+            None,
+            None,
+            None,
+            1_000,
+            "t",
+            &stub,
+        )
+        .unwrap();
+        let id = find_decision(&e, "Pin the compiler").expect("recorded");
+        assert_eq!(
+            held(&e, id, "scope", At::latest()),
+            Some("work/goldenmatch".to_string())
+        );
+    }
+
     /// Three answers, not two. A title that resolves but was recorded later is
     /// its own case: reporting "no such decision" would read as a typo.
     #[test]
@@ -1551,6 +1625,7 @@ pub(crate) mod tests {
             &mut e,
             "Pin the compiler",
             "a choice",
+            "work",
             None,
             None,
             None,
@@ -1628,6 +1703,7 @@ pub(crate) mod tests {
             &mut e,
             "First",
             "the old way",
+            "work",
             None,
             None,
             None,
@@ -1642,6 +1718,7 @@ pub(crate) mod tests {
             &mut e,
             "Second",
             "the new way",
+            "work",
             None,
             None,
             None,
@@ -1684,6 +1761,7 @@ pub(crate) mod tests {
             &mut e,
             "Early",
             "chosen in March",
+            "work",
             None,
             None,
             None,
@@ -1698,6 +1776,7 @@ pub(crate) mod tests {
             &mut e,
             "Late",
             "chosen in August",
+            "work",
             None,
             None,
             None,
@@ -1712,6 +1791,7 @@ pub(crate) mod tests {
             &mut e,
             "Early",
             "revised in August",
+            "work",
             None,
             None,
             None,
@@ -1762,6 +1842,7 @@ pub(crate) mod tests {
             &mut e,
             "Pin the compiler",
             "first choice",
+            "work",
             None,
             None,
             None,
@@ -1777,6 +1858,7 @@ pub(crate) mod tests {
             &mut e,
             "Pin the compiler",
             "second choice",
+            "work",
             None,
             None,
             None,
@@ -1857,6 +1939,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "yes",
+            "work",
             None,
             None,
             None,
@@ -1871,6 +1954,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite WAL",
             "also yes",
+            "work",
             None,
             None,
             None,
@@ -1899,6 +1983,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "yes",
+            "work",
             None,
             None,
             None,
@@ -1913,6 +1998,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "on reflection, no",
+            "work",
             None,
             None,
             None,
@@ -1951,6 +2037,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite",
             "yes",
+            "work",
             None,
             None,
             None,
@@ -1965,6 +2052,7 @@ pub(crate) mod tests {
             &mut e,
             "Adopt SQLite WAL",
             "also yes",
+            "work",
             None,
             None,
             None,
@@ -2010,6 +2098,7 @@ pub(crate) mod tests {
             &mut e,
             "Use bi-temporal storage",
             "Keep valid time and transaction time on every attribute value",
+            "work",
             None,
             Some("A single axis makes a stale answer indistinguishable from a bug"),
             Some("Choosing a storage model for the memory store"),
@@ -2053,6 +2142,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "RabbitMQ",
+            "work",
             None,
             Some("we know it"),
             None,
@@ -2084,6 +2174,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "RabbitMQ",
+            "work",
             None,
             None,
             None,
@@ -2098,6 +2189,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "NATS",
+            "work",
             None,
             Some("simpler ops"),
             None,
@@ -2146,6 +2238,7 @@ pub(crate) mod tests {
             &mut e,
             "Pin the compiler",
             "rust-toolchain.toml names the version",
+            "work",
             None,
             Some("CI took whatever stable had become"),
             None,
@@ -2206,7 +2299,7 @@ pub(crate) mod tests {
         let stub = StubProvider::new(vec![]);
         // A decision, which is reachable...
         decide(
-            &mut e, "Kept", "a choice", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "Kept", "a choice", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         // ...and something that is not, written the way `ingest` writes.
@@ -2239,11 +2332,11 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "One", "a", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "One", "a", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         decide(
-            &mut e, "Two", "b", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "Two", "b", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         let before = e.index_len();
@@ -2280,6 +2373,7 @@ pub(crate) mod tests {
             &mut e,
             "Pin the compiler",
             "rust-toolchain.toml names the version",
+            "work",
             None,
             None,
             None,
@@ -2329,7 +2423,7 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "Plain", "a choice", None, None, None, None, None, NOW, "t", &stub,
+            &mut e, "Plain", "a choice", "work", None, None, None, None, None, NOW, "t", &stub,
         )
         .unwrap();
         let Outcome::Decision(Found::Decision(d)) = decision(&e, "Plain", At::latest()).unwrap()
@@ -2355,7 +2449,7 @@ pub(crate) mod tests {
             ("Also turned down", Some("rejected")),
         ] {
             decide(
-                &mut e, title, "a choice", status, None, None, None, None, 100, "t", &stub,
+                &mut e, title, "a choice", "work", status, None, None, None, None, 100, "t", &stub,
             )
             .unwrap();
         }
@@ -2413,6 +2507,7 @@ pub(crate) mod tests {
             &mut e,
             "Rerank the recall results",
             "a cross-encoder over the top 200",
+            "work",
             Some("rejected"),
             Some("the k-curve is still 0.926 at k=200, so there is nothing to rerank into"),
             None,
@@ -2452,6 +2547,7 @@ pub(crate) mod tests {
                 &mut e,
                 "Some title",
                 "some choice",
+                "work",
                 Some(status),
                 None,
                 None,
@@ -2489,6 +2585,7 @@ pub(crate) mod tests {
             &mut e,
             "Store as one file",
             "whole-file rewrite",
+            "work",
             Some("superseded"),
             None,
             None,
@@ -2513,7 +2610,7 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "Plain", "a choice", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "Plain", "a choice", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         let Outcome::Decision(Found::Decision(d)) = decision(&e, "Plain", At::latest()).unwrap()
@@ -2546,7 +2643,7 @@ pub(crate) mod tests {
             ("Store in Postgres", "a server", Some("Store in SQLite")),
         ] {
             decide(
-                &mut e, title, choice, None, None, None, replaces, None, 100, "t", &stub,
+                &mut e, title, choice, "work", None, None, None, replaces, None, 100, "t", &stub,
             )
             .unwrap();
         }
@@ -2594,13 +2691,14 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "A", "first", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "A", "first", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         decide(
             &mut e,
             "B",
             "second",
+            "work",
             None,
             None,
             None,
@@ -2616,6 +2714,7 @@ pub(crate) mod tests {
             &mut e,
             "A",
             "third",
+            "work",
             None,
             None,
             None,
@@ -2662,13 +2761,14 @@ pub(crate) mod tests {
         let mut e = engine();
         let stub = StubProvider::new(vec![]);
         decide(
-            &mut e, "Only one", "first", None, None, None, None, None, 100, "t", &stub,
+            &mut e, "Only one", "first", "work", None, None, None, None, None, 100, "t", &stub,
         )
         .unwrap();
         decide(
             &mut e,
             "Only one",
             "second",
+            "work",
             None,
             None,
             None,
@@ -2706,6 +2806,7 @@ pub(crate) mod tests {
             &mut e,
             "Store as JSON",
             "One file per store",
+            "work",
             None,
             None,
             None,
@@ -2720,6 +2821,7 @@ pub(crate) mod tests {
             &mut e,
             "Store as SQLite",
             "One database per store",
+            "work",
             None,
             Some("whole-file rewrites do not survive a real corpus"),
             None,
@@ -2760,6 +2862,7 @@ pub(crate) mod tests {
             &mut e,
             "New way",
             "Do it differently",
+            "work",
             None,
             None,
             None,
@@ -2787,8 +2890,10 @@ pub(crate) mod tests {
         let stub = StubProvider::new(vec![]);
         for (title, choice) in [("", "something"), ("something", ""), ("  ", "x")] {
             assert!(
-                decide(&mut e, title, choice, None, None, None, None, None, 100, "cli", &stub)
-                    .is_err(),
+                decide(
+                    &mut e, title, choice, "work", None, None, None, None, None, 100, "cli", &stub
+                )
+                .is_err(),
                 "{title:?}/{choice:?}"
             );
         }
@@ -2805,6 +2910,7 @@ pub(crate) mod tests {
             &mut e,
             "Pick a queue",
             "NATS",
+            "work",
             None,
             None,
             None,

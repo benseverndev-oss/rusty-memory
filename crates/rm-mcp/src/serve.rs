@@ -496,6 +496,9 @@ where
                 Ok(Planned::Decide(command::plan_decide(
                     title,
                     choice,
+                    // Temporary: the real argument arrives in Task 5. A
+                    // universal reach keeps behaviour identical meanwhile.
+                    "*",
                     status.as_deref(),
                     because.as_deref(),
                     context.as_deref(),

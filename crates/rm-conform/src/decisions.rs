@@ -47,6 +47,7 @@ pub fn build_chain(titles: &[&str]) -> Engine {
             &mut e,
             title,
             "the chosen option",
+            "conform",
             None, // status: defaults to accepted
             Some("a stated reason"),
             None, // context
