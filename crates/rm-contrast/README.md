@@ -183,13 +183,32 @@ slots, every one of them at depth 1** — nothing has been revised — and at de
 1 there is no history to scan and no timeline to sort. The whole difference
 between the two strategies there is about 140 nanoseconds.
 
-Two caveats on that anchor, because it is doing a lot of work. That store is
-two days old and was seeded once, so depth 1 says where it sits and not that
-revisions are rare. And a `rescope` pass ran across all 219 records: if
-`rescope` appends a version those `scope` slots should be at depth 2, and they
-are not. Either the store was rebuilt rather than amended or `rescope`
-overwrites, and nobody should read depth 1 as a fact about `rescope` until that
-is settled.
+One caveat on that anchor, because it is doing a lot of work: the store is two
+days old and was seeded once, so depth 1 says where it sits and not that
+revisions are rare.
+
+An earlier version of this section carried a second caveat suggesting `rescope`
+might be overwriting rather than appending, on the grounds that a `rescope` pass
+ran across all 219 records and left every `scope` slot at depth 1. That was the
+wrong inference, and the session that ran the pass supplied the third case the
+framing did not have.
+
+`commit_rescope` branches on whether a scope is already held: `Some(_)` is a
+correction and dates from today, `None` is a backfill and dates from the
+decision's own start. **All 219 took the backfill branch**, because the
+pre-run backup has 219 entities and zero with a `scope` attribute — the store
+already existed, fully populated and scope-less, and the scopes arrived a day
+later in a separate pass. A backfill writes the first version of an attribute,
+and a first version is depth 1 by definition.
+
+So the depth figure is **not evidence about `rescope` in either direction**.
+This store contains only first writes, so the correction branch has never run
+here — which makes depth 1 a fact about this store's history rather than about
+the command. `rescope` does append: `commit_rescope` calls `write_field`, which
+calls `remember_as` with `Supersession::Corrects`, and there is no overwrite
+path in it. The correction branch is un-lived rather than untested —
+`rm-conform`'s *rescope keeps its history* row rescopes an already-scoped
+decision across 60 seeds and reports 1.000.
 
 The measurement deliberately does not decide the shipped default. That is a
 separate argument with a correctness half, and letting a benchmark author settle

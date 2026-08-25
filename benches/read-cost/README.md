@@ -89,13 +89,48 @@ worth confirming rather than assuming.
 **Depth 1, across all 1,086 attribute slots** -- 219 decisions, five attributes
 each, and nothing revised. Measured from `decisions.json` on 2026-08-25.
 
-Two caveats, because that anchor is doing a lot of work. The store is two days
+One caveat, because that anchor is doing a lot of work: the store is two days
 old and was seeded once, so depth 1 says where it sits and not that revisions
-are rare in general. And a `rescope` pass ran across all 219 records: if
-`rescope` appends a version those `scope` slots should be at depth 2, and they
-are not. Either the store was rebuilt rather than amended or `rescope`
-overwrites, and nobody should read depth 1 as a fact about `rescope` until that
-is settled.
+are rare in general.
+
+### What depth 1 does not tell you about `rescope`
+
+An earlier version of this README suggested `rescope` might be overwriting
+rather than appending, since a `rescope` pass ran across all 219 records and
+left every `scope` slot at depth 1. That inference was wrong, and correcting it
+is worth more than deleting it.
+
+`commit_rescope` branches on whether a scope is already held:
+
+```rust
+let valid_from = match previous {
+    // Correction: the reach changed today, and only today.
+    Some(_) => observed_at,
+    // Backfill: it always reached this far.
+    None => visible(engine, entity, "choice", At::latest())
+        .first()
+        .map_or(observed_at, |v| v.valid.from),
+};
+```
+
+All 219 took the **backfill** branch. The pre-run backup
+(`decisions.json.bak-20260825-090622`) holds 219 entities and **zero** with a
+`scope` attribute, so the store already existed fully populated and scope-less;
+`choice` carries an `observed_at` about sixteen hours earlier than `scope`, so
+the scopes arrived in a separate later pass. A backfill writes the first version
+of an attribute, and a first version is depth 1 by definition.
+
+So **the depth figure is not evidence about `rescope` in either direction.**
+This store holds only first writes, so the correction branch has never executed
+against it. Depth 1 is a fact about this store's history, not about the command.
+
+For the record, since the original caveat raised the possibility: `rescope` does
+append. `commit_rescope` calls `write_field`, which calls `remember_as` with
+`Supersession::Corrects`; there is no overwrite path, and the only early return
+is a no-op guard that declines to write a second identical version. The
+correction branch is **un-lived rather than untested** — `rm-conform`'s
+*rescope keeps its history* row rescopes an already-scoped decision across 60
+seeds and reports 1.000.
 
 ## The generator would lie if it were allowed to
 
