@@ -226,14 +226,30 @@ engine and the sweep is a tautology. This is the same loop that caught the
 stale `ValidInterval` sentence by disagreeing on 53 generated histories, and it
 only worked because the two were written apart.
 
-**`rm-contrast`'s grid can carry ties.** It is tie-free today *because* of this
-refusal — `score.rs:150` maps a refusal on an ambiguous question to
-`Ungradeable`, and the README says the grid excludes ties so the temporal axes
-are not confounded with the refusal behaviour. With the fix, ties can enter the
-grid: genuinely ambiguous questions still refuse and stay `Ungradeable`, while
-the 4,067 that had answers become answers. That turns this change into a
-measured number rather than a claim, and it is the number the pull request
-reports.
+**`rm-contrast` already has the measurement, and already has the assertion that
+pins it.** `score.rs:148` splits a refusal two ways: on a question that had no
+answer it is `Ungradeable`, and on one that did it is `Declined`. `Declined` is
+the whole cost of the history-wide refusal, and `surface.rs`'s
+`questions_with_no_right_answer_occur_and_only_one_store_declines` asserts
+
+```rust
+assert!(store.declined > 0, "... if that stopped happening, this
+        measurement has gone quiet rather than clean");
+```
+
+That assertion currently pins the defect. **It inverts to `assert_eq!(store.declined, 0)`**,
+and that inversion is the evidence this change exists to produce: every refusal
+the store issues afterwards is a refusal of a question the oracle also calls
+ambiguous. Exactly zero rather than a threshold, because "instant the engine
+contests" and "instant the oracle calls ambiguous" are meant to be the same
+set — a residue is a disagreement to investigate, not a number to relax.
+
+**The grid stays tie-free.** An earlier draft of this spec said ties could now
+enter it. They could, but it would measure something else — how the two stores
+degrade under ambiguity, a finding in its own right and not evidence about this
+change — while perturbing a published surface and making the before/after
+harder to read. Out of scope, and the `declined` count is the number the pull
+request reports.
 
 **Grading does not move.** `Truth::Ambiguous` stays `Ungradeable`, so the store
 scores no points for detecting its own ambiguity. The whole measured effect is
