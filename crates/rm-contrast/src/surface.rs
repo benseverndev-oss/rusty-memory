@@ -87,14 +87,15 @@ pub const TIE_PCT: u64 = 25;
 /// What each store does with a question that has no right answer.
 ///
 /// Measured apart from the surface because it is a different phenomenon and
-/// mixing it in would confound the temporal axes with the refusal behaviour:
-/// `ValidInterval` cannot build a timeline when two segments collide, so it
-/// refuses the *whole read* even for an instant where nothing is ambiguous.
+/// mixing it in would confound the temporal axes with the refusal behaviour.
 ///
-/// Returns `(store, flat)`. The interesting figures are the store's `declined`
-/// -- questions it refused that did have an answer, a cost of the history-wide
-/// refusal -- and the fact that the control's is always zero, because it
-/// answers everything it is asked whether or not an answer exists.
+/// Returns `(store, flat)`. The figures that matter are `ungradeable` -- the
+/// questions that genuinely had no answer, which both stores meet equally --
+/// and the store's `declined`, which is questions it refused that *did* have
+/// an answer. That number was 4,067 when `ValidInterval` refused a whole read
+/// over one collision. It is 0 now, and the test below pins it there. The
+/// control's `declined` is always zero, because it answers everything it is
+/// asked whether or not an answer exists.
 pub fn unanswerable(seeds: u64) -> (Score, Score) {
     let params = Params {
         tie_pct: TIE_PCT,
@@ -196,9 +197,9 @@ mod tests {
             flat.declined, 0,
             "the control declined something, which it has no way to do"
         );
-        assert!(
-            store.declined > 0,
-            "ValidInterval refuses a read whose history contains a collision,              even at an instant where nothing is ambiguous -- if that stopped              happening, this measurement has gone quiet rather than clean"
+        assert_eq!(
+            store.declined, 0,
+            "the store refused a question that had an answer. Its refusals are meant to be exactly the instants the oracle in workload.rs calls ambiguous, so a residue here is the two rules disagreeing -- a finding to chase, not a threshold to relax"
         );
     }
 

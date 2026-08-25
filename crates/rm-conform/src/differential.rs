@@ -200,7 +200,9 @@ mod tests {
         let score = refusal_agreement(0..300, &default_strategies());
         // A floor rather than `> 0`: a single refusal in 2,400 comparisons
         // would satisfy "> 0" while leaving the paths effectively unreached.
-        // The measured figure is 450 refused / 1,950 answered.
+        // The measured figure is 158 refused / 2,242 answered. It was 450 /
+        // 1,950 until ValidInterval's refusal moved off the merge and onto the
+        // read, where `instant_agreement` measures it instead.
         let total = score.both_refused + score.both_answered;
         assert!(
             score.both_refused * 20 > total,
