@@ -19,6 +19,6 @@ fn readme_example_holds() {
     )
     .unwrap();
 
-    assert_eq!(outcome.as_of(1_715_000_000_000), Some("Acme"));
-    assert_eq!(outcome.as_of(1_725_000_000_000), Some("Globex"));
+    assert_eq!(outcome.as_of(1_715_000_000_000).unwrap(), Some("Acme"));
+    assert_eq!(outcome.as_of(1_725_000_000_000).unwrap(), Some("Globex"));
 }

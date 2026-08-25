@@ -175,10 +175,32 @@ impl<'a> Candidate<'a> {
     }
 }
 
-/// A value paired with the span of valid time over which it held.
+/// What a span of valid time holds.
+///
+/// Two shapes, because a timeline over contradictory writes has regions where
+/// no single value can be said to have stood. Naming those regions is what
+/// lets a read refuse the instant it was asked about rather than the whole
+/// history: a timeline with an unnamed hole cannot be indexed into, and one
+/// whose holes are named can.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Span {
+    /// One value stood here.
+    Held(Held),
+    /// Two or more values opened here sharing an `observed_at`, so nothing
+    /// orders them and none of them can be said to have held.
+    ///
+    /// `observed_at` is carried because it is what a refusal hands back to
+    /// whoever has to fix it: the timestamp naming which writes to separate.
+    Contested {
+        values: Vec<Held>,
+        observed_at: Timestamp,
+    },
+}
+
+/// A span of valid time and what stood over it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fact {
-    pub value: Held,
+    pub span: Span,
     pub valid: Interval,
 }
 
@@ -213,7 +235,10 @@ impl Outcome {
         match self {
             Outcome::Survivor(v) => v.as_ref().and_then(Held::value),
             Outcome::Timeline(facts) => match facts.as_slice() {
-                [only] => only.value.value(),
+                [Fact {
+                    span: Span::Held(v),
+                    ..
+                }] => v.value(),
                 _ => None,
             },
         }
@@ -224,17 +249,40 @@ impl Outcome {
     /// Reports an asserted absence as `None`, the same as no coverage at all.
     /// Use [`Outcome::held_at`] where the difference matters — it does to a
     /// memory store, and this method is the convenience, not the precise answer.
-    pub fn as_of(&self, t: Timestamp) -> Option<&str> {
-        self.held_at(t).and_then(Held::value)
+    ///
+    /// Fallible along with `held_at` rather than collapsing a contested span
+    /// into `None`: `None` here already means *no coverage*, and flattening
+    /// "two values and nothing orders them" into it is the same collapse the
+    /// `Absent`/`Unknown` distinction exists to prevent.
+    pub fn as_of(&self, t: Timestamp) -> Result<Option<&str>, Refused> {
+        Ok(self.held_at(t)?.and_then(Held::value))
     }
 
     /// What held at `t`, distinguishing an asserted absence from no coverage.
-    pub fn held_at(&self, t: Timestamp) -> Option<&Held> {
+    ///
+    /// Refuses only when `t` lands in a contested span. A [`Outcome::Survivor`]
+    /// never refuses: it has no time dimension -- that is what
+    /// [`Strategy::keeps_a_timeline`] reports -- so it is `Ok` at every instant,
+    /// and the `Result` is a shape the timeline arm needs rather than a
+    /// behaviour every strategy acquires.
+    pub fn held_at(&self, t: Timestamp) -> Result<Option<&Held>, Refused> {
         match self {
-            Outcome::Survivor(v) => v.as_ref(),
-            Outcome::Timeline(facts) => {
-                facts.iter().find(|f| f.valid.contains(t)).map(|f| &f.value)
-            }
+            Outcome::Survivor(v) => Ok(v.as_ref()),
+            Outcome::Timeline(facts) => match facts.iter().find(|f| f.valid.contains(t)) {
+                None => Ok(None),
+                Some(Fact {
+                    span: Span::Held(v),
+                    ..
+                }) => Ok(Some(v)),
+                Some(Fact {
+                    span:
+                        Span::Contested {
+                            values,
+                            observed_at,
+                        },
+                    valid,
+                }) => Err(Refused(contested(values, *observed_at, t, valid))),
+            },
         }
     }
 }
@@ -273,37 +321,55 @@ pub enum Strategy {
     /// Do not pick a winner. Emit each distinct value with the validity range
     /// over which it stood.
     ///
-    /// Refuses only when two different values collide on *both* axes -- same
-    /// `valid.from` and same `observed_at` -- because then nothing orders them
-    /// and there is no way to say which superseded which.
+    /// # What opens a span
     ///
-    /// # The refusal is history-wide, not instant-local
+    /// Sort the asserting candidates by `(valid.from, observed_at)`. Each
+    /// distinct `valid.from` opens a span, closing where the next one opens;
+    /// the last is open-ended. What opens there is decided by the **greatest
+    /// `observed_at` heard for that moment** -- anything said earlier about the
+    /// same moment was superseded before any question could be asked.
     ///
-    /// A collision anywhere in the visible history refuses the whole read,
-    /// including a question about an instant nowhere near it. The outcome of
-    /// this strategy is a timeline, and a timeline with a hole in it is not one
-    /// that can be indexed into.
+    /// A restatement of the value already standing extends it rather than
+    /// opening a second span: re-hearing a fact is not a change. A value that
+    /// returns after being superseded yields three spans, because those spans
+    /// are not adjacent.
     ///
-    /// `rm-contrast` measures what that costs where collisions are common: at a
-    /// 25% tie rate the store refuses 4,067 of 6,353 questions that did have
-    /// answers, against a flat control that refuses none because it has no way
-    /// to. Making the refusal instant-local was considered and turned down --
-    /// see the rejected decision "Make ValidInterval's refusal instant-local"
-    /// in `docs/seed-decision-log.sh` -- because it has never fired on real
-    /// data: zero collisions across 1,086 attribute slots in a live store,
-    /// `observed_at` being millisecond-resolution and handed out per write.
+    /// # The refusal is instant-local
     ///
-    /// The condition that would reverse that: a bulk import carrying
-    /// day-resolution timestamps on *both* axes, where `observed_at` collides
-    /// routinely and ties stop being freak events.
+    /// A span is *contested* when the greatest-`observed_at` group at its
+    /// `valid.from` holds two or more distinct values: they share both clocks,
+    /// so nothing orders them and none of them can be said to have held. The
+    /// timeline still gets built, with that span named as [`Span::Contested`],
+    /// and [`Outcome::held_at`] refuses only for an instant that lands inside
+    /// one. Every other instant answers.
     ///
-    /// This sentence used to say "refuses when two different values share an
-    /// observation timestamp", which was true when a `Candidate` carried a
-    /// value and a provenance and no interval, so the timeline could only be
-    /// cut at observation. A `Candidate` carries its validity now, and two
-    /// values heard in the same instant are ordered by when they held. The
-    /// code moved and the prose did not; `rm-conform`'s differential sweep
-    /// found the gap by disagreeing on 53 generated histories.
+    /// A tombstone competes as a value, so [`Held::Absent`] colliding with a
+    /// value contests the span. Silence never competes and never contests.
+    ///
+    /// Note what this excludes. Given `A@(F,1)`, `B@(F,1)`, `C@(F,2)`, the
+    /// greatest `observed_at` at `F` is 2 and `C` stands alone: **no instant is
+    /// ambiguous**, and the whole history answers. An earlier rule refused it,
+    /// which was not merely a refusal that was too wide but one that fired on a
+    /// history containing nothing ambiguous at all.
+    ///
+    /// # The write path still refuses whole
+    ///
+    /// `rm_store` materializes a merge result into stored versions, and
+    /// `Version.value` is an `Option<String>` with no representation for a
+    /// contested span. So a resolution containing one is refused entirely. One
+    /// rule, two policies about what to do with a hole: a question can be asked
+    /// about a single instant, and a materialized resolution cannot.
+    ///
+    /// # This has been wrong twice
+    ///
+    /// It once said "refuses when two different values share an observation
+    /// timestamp", which was true when a `Candidate` carried no interval and
+    /// the timeline could only be cut at observation. `rm-conform`'s
+    /// differential sweep found the gap by disagreeing on 53 generated
+    /// histories. It then said the refusal was history-wide, which was true of
+    /// the code and disagreed with the oracle `rm-contrast` grades against --
+    /// 4,067 of 6,353 answerable questions refused at a 25% tie rate. The
+    /// second correction is this one.
     ValidInterval,
 }
 
@@ -344,7 +410,7 @@ pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcom
     // ValidInterval answers a different question and has its own early-outs
     // (one distinct value still yields a timeline, not a bare survivor).
     if matches!(strategy, Strategy::ValidInterval) {
-        return timeline(candidates).map(Outcome::Timeline);
+        return Ok(Outcome::Timeline(timeline(candidates)));
     }
 
     let asserted: Vec<&Candidate<'_>> = candidates
@@ -375,6 +441,31 @@ pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcom
     };
 
     Ok(Outcome::Survivor(winner))
+}
+
+/// The refusal for a question that landed in a contested span.
+///
+/// Names the interval so the answer is actionable rather than a dead end: a
+/// caller learns both that this instant is contested and where the history
+/// resumes being answerable. That is the whole difference between a refusal
+/// that fits the question and one that does not.
+fn contested(values: &[Held], observed_at: Timestamp, t: Timestamp, valid: &Interval) -> String {
+    let named: Vec<String> = values
+        .iter()
+        .map(|v| match v {
+            Held::Value(s) => format!("{s:?}"),
+            Held::Absent => "an asserted absence".to_string(),
+        })
+        .collect();
+    let names = named.join(" and ");
+    let resumes = match valid.to {
+        Some(to) => format!("outside [{}, {to})", valid.from),
+        None => format!("before {}", valid.from),
+    };
+    format!(
+        "{names} opened at {}, and were all observed at {observed_at}, so none supersedes the others and none can be said to have held at {t}. Distinguish their observation times, or ask about an instant {resumes}.",
+        valid.from
+    )
 }
 
 /// An assertion as the owned result it would be if it won.
@@ -519,64 +610,88 @@ fn by_source_priority(asserted: &[&Candidate<'_>], order: &[Source]) -> Result<H
     ))
 }
 
-/// Build a timeline of values from observation order.
+/// Build a timeline of values, naming the spans nothing orders.
 ///
-/// Each distinct value holds from when it was observed until the next *different*
-/// value was observed; the last holds open-ended. Repeated assertions of the same
-/// value extend its span rather than starting a new one — re-hearing a fact is
-/// not a change. A value that returns after being superseded (Acme, Globex, Acme)
-/// correctly yields three spans: it was true, then not, then true again.
-fn timeline(candidates: &[Candidate<'_>]) -> Result<Vec<Fact>, Refused> {
+/// One span per distinct `valid.from`, decided by the greatest `observed_at`
+/// heard for that moment; contested when that group holds more than one
+/// distinct value. See [`Strategy::ValidInterval`] for the rule and why it is
+/// instant-local.
+fn timeline(candidates: &[Candidate<'_>]) -> Vec<Fact> {
     let mut asserted: Vec<&Candidate<'_>> = candidates
         .iter()
         .filter(|c| c.value.is_assertion())
         .collect();
     if asserted.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
 
-    // Stable sort: candidates sharing a timestamp keep their input order, which
-    // matters for the conflict check below reporting the caller's own ordering.
     // By when each held, with the observation breaking ties. Valid time is the
     // axis this strategy is named for; observation is what orders two things
     // said to have begun at the same moment, and is a total order because the
     // store stamps every write.
     asserted.sort_by_key(|c| (c.valid.from, c.provenance.observed_at));
 
-    for pair in asserted.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        if a.valid.from == b.valid.from
-            && a.provenance.observed_at == b.provenance.observed_at
-            && a.value != b.value
-        {
-            return Err(Refused(format!(
-                "{:?} and {:?} were both observed at {}, so neither supersedes the other \
-                 and no validity range can be assigned. Distinguish their observation \
-                 times, or resolve with SourcePriority.",
-                a.value, b.value, a.provenance.observed_at
-            )));
-        }
-    }
-
     let mut facts: Vec<Fact> = Vec::new();
-    for c in &asserted {
-        let value = held(c.value);
-        if facts.last().is_some_and(|f| f.value == value) {
-            continue; // same value restated: extends the open span, no new fact
+    let mut i = 0;
+    while i < asserted.len() {
+        let from = asserted[i].valid.from;
+        let mut j = i;
+        while j < asserted.len() && asserted[j].valid.from == from {
+            j += 1;
+        }
+        // Sorted by `observed_at` within the moment, so the last one's is the
+        // greatest. Everything heard earlier about this moment was superseded
+        // before any question could be asked about it.
+        let group = &asserted[i..j];
+        let observed_at = group[group.len() - 1].provenance.observed_at;
+        let mut values: Vec<Held> = Vec::new();
+        for c in group
+            .iter()
+            .filter(|c| c.provenance.observed_at == observed_at)
+        {
+            let v = held(c.value);
+            if !values.contains(&v) {
+                values.push(v);
+            }
+        }
+        let span = if values.len() == 1 {
+            Span::Held(values.remove(0))
+        } else {
+            Span::Contested {
+                values,
+                observed_at,
+            }
+        };
+        i = j;
+
+        // A restatement of the value already standing extends it rather than
+        // opening a second span. Contested spans never coalesce: each records
+        // the `observed_at` its own collision happened at, which is what the
+        // refusal hands back, and two collisions are two things to fix.
+        let restatement = match (&span, facts.last()) {
+            (
+                Span::Held(opening),
+                Some(Fact {
+                    span: Span::Held(standing),
+                    ..
+                }),
+            ) => opening == standing,
+            _ => false,
+        };
+        if restatement {
+            continue;
         }
         facts.push(Fact {
-            value,
-            valid: Interval::since(c.valid.from),
+            span,
+            valid: Interval::since(from),
         });
     }
 
     // Close each span where the next one opens, leaving the last open-ended.
     for i in 0..facts.len().saturating_sub(1) {
-        let next_start = facts[i + 1].valid.from;
-        facts[i].valid.to = Some(next_start);
+        facts[i].valid.to = Some(facts[i + 1].valid.from);
     }
-
-    Ok(facts)
+    facts
 }
 
 #[cfg(test)]
@@ -808,26 +923,26 @@ mod tests {
             out,
             Outcome::Timeline(vec![
                 Fact {
-                    value: Held::Value("acme".to_string()),
+                    span: Span::Held(Held::Value("acme".to_string())),
                     valid: Interval::between(100, 200)
                 },
                 Fact {
-                    value: Held::Value("globex".to_string()),
+                    span: Span::Held(Held::Value("globex".to_string())),
                     valid: Interval::since(200)
                 },
             ])
         );
         // And the store can answer "as of when".
-        assert_eq!(out.as_of(150), Some("acme"));
-        assert_eq!(out.as_of(200), Some("globex"));
-        assert_eq!(out.as_of(99), None); // nothing known before the first observation
+        assert_eq!(out.as_of(150).unwrap(), Some("acme"));
+        assert_eq!(out.as_of(200).unwrap(), Some("globex"));
+        assert_eq!(out.as_of(99).unwrap(), None); // nothing known before the first observation
     }
 
     #[test]
     fn valid_interval_orders_by_observation_not_input_order() {
         let (p, v) = cands![Some("globex"), Source::UserAssertion, 200; Some("acme"), Source::UserAssertion, 100];
         let out = merge(&build(&p, &v), &Strategy::ValidInterval).unwrap();
-        assert_eq!(out.as_of(150), Some("acme"));
+        assert_eq!(out.as_of(150).unwrap(), Some("acme"));
     }
 
     #[test]
@@ -858,7 +973,8 @@ mod tests {
         assert_eq!(
             merge(&build(&p, &v), &Strategy::ValidInterval)
                 .unwrap()
-                .as_of(250),
+                .as_of(250)
+                .unwrap(),
             Some("globex")
         );
     }
@@ -876,11 +992,21 @@ mod tests {
         }
     }
 
+    /// The refusal is still here; it is at the read now rather than the merge.
+    /// Both open at 100 and were heard at 100, so the whole timeline from 100
+    /// onward is one contested span -- there is no answerable instant after it
+    /// to find, and the instant before it was never covered.
     #[test]
-    fn valid_interval_refuses_simultaneous_contradictions() {
+    fn valid_interval_refuses_the_instant_a_simultaneous_contradiction_covers() {
         let (p, v) = cands![Some("acme"), Source::UserAssertion, 100; Some("globex"), Source::ToolOutput, 100];
-        let err = merge(&build(&p, &v), &Strategy::ValidInterval).unwrap_err();
-        assert!(err.0.contains("neither supersedes the other"), "{}", err.0);
+        let out = merge(&build(&p, &v), &Strategy::ValidInterval)
+            .expect("the merge builds the timeline and names the hole");
+        let err = out.held_at(100).unwrap_err();
+        assert!(err.0.contains("none supersedes the others"), "{}", err.0);
+        assert!(
+            out.held_at(99).unwrap().is_none(),
+            "before anything opened, this is no coverage rather than a refusal"
+        );
     }
 
     #[test]
@@ -899,7 +1025,7 @@ mod tests {
         assert_eq!(
             out,
             Outcome::Timeline(vec![Fact {
-                value: Held::Value("acme".to_string()),
+                span: Span::Held(Held::Value("acme".to_string())),
                 valid: Interval::since(100)
             }])
         );
@@ -915,19 +1041,21 @@ mod tests {
         let (p, v) = cands![Some("acme"), Source::UserAssertion, 100; Some("globex"), Source::ToolOutput, 100];
         let c = build(&p, &v);
         assert!(merge(&c, &Strategy::MostRecent).is_err());
-        assert!(merge(&c, &Strategy::ValidInterval).is_err());
         assert!(merge(&c, &Strategy::SourcePriority(vec![])).is_err());
+        // ValidInterval refuses at the read rather than the merge -- the
+        // property is that no value comes back, and this is where a value
+        // would have come back.
+        assert!(merge(&c, &Strategy::ValidInterval)
+            .expect("the timeline builds")
+            .held_at(100)
+            .is_err());
     }
 
     #[test]
     fn every_refusal_explains_what_was_missing() {
         let (p, v) = cands![Some("a"), Source::UserAssertion, 5; Some("b"), Source::ToolOutput, 5];
         let c = build(&p, &v);
-        for s in [
-            Strategy::MostRecent,
-            Strategy::ValidInterval,
-            Strategy::SourcePriority(vec![]),
-        ] {
+        for s in [Strategy::MostRecent, Strategy::SourcePriority(vec![])] {
             let err = merge(&c, &s).unwrap_err();
             assert!(
                 err.0.len() > 40,
@@ -935,6 +1063,17 @@ mod tests {
                 err.0
             );
         }
+        // Listed apart rather than dropped from the loop: ValidInterval owes
+        // the same explanation, and owes it from a different place.
+        let err = merge(&c, &Strategy::ValidInterval)
+            .expect("the timeline builds")
+            .held_at(5)
+            .unwrap_err();
+        assert!(
+            err.0.len() > 40,
+            "ValidInterval refused without a reason: {}",
+            err.0
+        );
     }
 
     #[test]
@@ -960,7 +1099,7 @@ mod tests {
             Candidate::absent(&late),
         ];
         let outcome = merge(&candidates, &Strategy::MostRecent).unwrap();
-        assert_eq!(outcome.held_at(0), Some(&Held::Absent));
+        assert_eq!(outcome.held_at(0).unwrap(), Some(&Held::Absent));
     }
 
     #[test]
@@ -974,7 +1113,7 @@ mod tests {
             Candidate::new(None, &late),
         ];
         let outcome = merge(&candidates, &Strategy::MostRecent).unwrap();
-        assert_eq!(outcome.as_of(0), Some("Acme"));
+        assert_eq!(outcome.as_of(0).unwrap(), Some("Acme"));
     }
 
     #[test]
@@ -989,14 +1128,17 @@ mod tests {
             Candidate::new(Some("Globex"), &p3),
         ];
         let outcome = merge(&candidates, &Strategy::ValidInterval).unwrap();
-        assert_eq!(outcome.held_at(15), Some(&Held::Value("Acme".to_string())));
-        assert_eq!(outcome.held_at(25), Some(&Held::Absent));
         assert_eq!(
-            outcome.held_at(35),
+            outcome.held_at(15).unwrap(),
+            Some(&Held::Value("Acme".to_string()))
+        );
+        assert_eq!(outcome.held_at(25).unwrap(), Some(&Held::Absent));
+        assert_eq!(
+            outcome.held_at(35).unwrap(),
             Some(&Held::Value("Globex".to_string()))
         );
         assert_eq!(
-            outcome.as_of(25),
+            outcome.as_of(25).unwrap(),
             None,
             "as_of reports an absence as no value"
         );
@@ -1023,5 +1165,90 @@ mod tests {
                 "{s:?} collapses to a winner, which has no time dimension"
             );
         }
+    }
+    // ---- the refusal that fits the question -------------------------------
+
+    /// The property this change exists for: one timeline, one instant
+    /// refused, another answered.
+    #[test]
+    fn a_collision_refuses_its_own_span_and_nothing_else() {
+        // "Acme" and "Globex" both open at 10, both heard at 100.
+        // "Initech" opens at 20 and settles it from there on.
+        let provs = [
+            prov(Source::UserAssertion, 100),
+            prov(Source::UserAssertion, 100),
+            prov(Source::UserAssertion, 200),
+        ];
+        let cs = vec![
+            Candidate::new(Some("Acme"), &provs[0]).over(Interval::since(10)),
+            Candidate::new(Some("Globex"), &provs[1]).over(Interval::since(10)),
+            Candidate::new(Some("Initech"), &provs[2]).over(Interval::since(20)),
+        ];
+        let out = merge(&cs, &Strategy::ValidInterval).expect("the merge answers now");
+
+        assert!(out.held_at(5).unwrap().is_none(), "nothing had opened yet");
+        assert!(out.held_at(10).is_err(), "the contested span must refuse");
+        assert!(out.held_at(19).is_err(), "still inside it");
+        assert_eq!(
+            out.held_at(20).unwrap(),
+            Some(&Held::Value("Initech".into())),
+            "past the collision, and answerable -- this is the whole change"
+        );
+
+        let message = out.held_at(10).unwrap_err().to_string();
+        assert!(
+            message.contains("[10, 20)"),
+            "the refusal must name where the history resumes: {message}"
+        );
+        assert!(
+            message.contains("100"),
+            "and the observation time to separate: {message}"
+        );
+    }
+
+    /// A later hearing about the same moment settles what an earlier
+    /// disagreement about it could not. No instant here is ambiguous, and the
+    /// history-wide rule refused the whole read anyway.
+    #[test]
+    fn a_later_observation_about_the_same_moment_settles_it() {
+        let provs = [
+            prov(Source::UserAssertion, 100),
+            prov(Source::UserAssertion, 100),
+            prov(Source::UserAssertion, 200),
+        ];
+        let cs = vec![
+            Candidate::new(Some("Acme"), &provs[0]).over(Interval::since(10)),
+            Candidate::new(Some("Globex"), &provs[1]).over(Interval::since(10)),
+            Candidate::new(Some("Initech"), &provs[2]).over(Interval::since(10)),
+        ];
+        let out = merge(&cs, &Strategy::ValidInterval).expect("nothing is ambiguous here");
+        assert_eq!(
+            out.held_at(10).unwrap(),
+            Some(&Held::Value("Initech".into())),
+            "the greatest observed_at at a moment decides it"
+        );
+        assert_eq!(
+            out.held_at(9_999).unwrap(),
+            Some(&Held::Value("Initech".into()))
+        );
+    }
+
+    /// A tombstone is a claim and competes as one, so it can contest a span.
+    #[test]
+    fn an_absence_can_contest_a_span() {
+        let provs = [
+            prov(Source::UserAssertion, 100),
+            prov(Source::UserAssertion, 100),
+        ];
+        let cs = vec![
+            Candidate::new(Some("Acme"), &provs[0]).over(Interval::since(10)),
+            Candidate::absent(&provs[1]).over(Interval::since(10)),
+        ];
+        let out = merge(&cs, &Strategy::ValidInterval).expect("the merge answers");
+        let message = out.held_at(10).unwrap_err().to_string();
+        assert!(
+            message.contains("an asserted absence"),
+            "a tombstone must be named as a claim, not omitted: {message}"
+        );
     }
 }

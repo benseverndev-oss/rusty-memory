@@ -51,6 +51,7 @@ command path, where the merge sweep compares two pure functions.
 | depth monotonicity | 1.000 |
 | rescope keeps its history | 1.000 |
 | recall applicability | 1.000 |
+| instant-local refusal agreement | 1.000 |
 
 750 of 4,000 comparisons reached a refusal; 3,250 answered.
 
@@ -58,6 +59,13 @@ That second number matters as much as the first. A suite in which nothing ever
 refuses reports perfect refusal correctness having measured none of it, so the
 proportion is asserted rather than hoped for — as is its mirror, since one in
 which everything refused would be equally empty.
+
+The last row is measured elsewhere, because `ValidInterval` refuses at the
+read now rather than at the merge. Of its 4,754 instant probes, 1,632 landed
+in a contested span and 3,122 answered, across **292 of 300 histories that did
+both**. That last figure is the one that matters: a refusal is instant-local
+only if a single timeline can refuse one moment and answer another, and a
+suite where no history did both would report 1.000 having measured nothing.
 
 ## How ground truth is computed
 
@@ -156,8 +164,11 @@ stopped going through the second.
   it is closed: `rmem decisions` and `rmem decision` take both clocks. The
   sidestep is deliberate and narrow — those reads build their own timeline from
   the versions of a decision's `choice` rather than going through survivorship,
-  so `--valid-at` works on them whatever `[policy]` says. **`rmem about
-  --valid-at` is still inert under `most_recent`.**
+  so `--valid-at` works on them whatever `[policy]` says. **`rmem about --valid-at`
+  refuses under `most_recent`** rather than answering about the wrong
+  moment — it names the strategy and the `rmem.toml` line that would keep a
+  timeline. This sentence read "is still inert" until #50; it stopped being
+  true at #45 and nobody re-read it.
 
 ## What a green table does not prove
 

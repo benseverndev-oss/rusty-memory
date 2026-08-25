@@ -129,10 +129,13 @@ d "Retire recall@10 as the headline metric" "measure what the store is for -- co
   --because "a twenty-line control beats the pipeline on it, and none of the distinctive machinery serves it; but LoCoMo labels no ground truth for the alternative"
 echo
 echo; echo -n "re-decided "
-# The one decision here that changed its mind, and the only worked example in
-# this log of a title decided twice. `decisions` shows the latest choice and
-# `decision` shows both, with the reason each was taken.
+# The two decisions here that changed their minds, and the only worked examples
+# in this log of a title decided twice. `decisions` shows the latest choice and
+# `decision` shows both, with the reason each was taken. Note that the rejected
+# entries above stay exactly where they are: the point of the log is that it
+# shows what was decided and then re-decided, not the last answer only.
 d "Retire recall@10 as the headline metric" "a reference model written from the docs, swept differentially against the engine, with the table computed rather than typed"   --because "the blocker was not the metric, it was the assumption that ground truth has to be labelled: a generated history has it by construction, so the reference model became possible and the sweep found two real divergences on its first green run"
+d "Make ValidInterval refusal instant-local" "build the timeline either way, name the contested spans, and refuse only an instant that lands in one"   --because "the reversal condition named when this was rejected -- a bulk import at day resolution on both axes -- has still not fired. What changed is the argument, which rested on the collision never having occurred in a live store, while rm-conform README says correctness properties are universally quantified and an unrealistic input is still a valid one. The rule was also already in the repo as ground truth: rm-contrast oracle finds the winner for the instant asked about. Measured at 4,067 wrongly-refused questions to 0"
 
 echo; echo -n "scope "
 d "A scope says how far a memory reaches, not where it was written" "one opaque string, and a memory applies where its scope is an ancestor-or-self of the asker"   --because "\"never run scale benchmarks on this laptop\" was written during one project and is true of every project on the machine; labelled by origin it disappears the moment the next session is about something else, and 155 of 219 real decisions had the project name smuggled into the title"

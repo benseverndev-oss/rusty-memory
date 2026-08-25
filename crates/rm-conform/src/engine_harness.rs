@@ -90,7 +90,9 @@ pub fn probe_agreement(history: &[Assertion], valid_t: Timestamp, tx_t: Timestam
     let believed = engine
         .about(id, "attr", valid_t, tx_t)
         .expect("just checked it answers");
-    let expected = match crate::reference::held_at(&outcome, valid_t) {
+    let expected = match crate::reference::held_at(&outcome, valid_t)
+        .expect("MostRecent yields a Survivor, which never refuses at an instant")
+    {
         Some(rm_survivor::Held::Value(v)) => Believed::Value(v.clone()),
         Some(rm_survivor::Held::Absent) => Believed::Absent,
         None => Believed::Unknown,

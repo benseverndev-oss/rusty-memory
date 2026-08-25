@@ -48,7 +48,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rm_core::{Interval, Provenance, Supersession, Timestamp};
-use rm_survivor::{merge, Candidate, Held, Outcome, Refused, Strategy};
+use rm_survivor::{merge, Candidate, Held, Outcome, Refused, Span, Strategy};
 use serde::{Deserialize, Serialize};
 
 /// A durable entity id: assigned once, monotonic, never reused.
@@ -480,11 +480,30 @@ impl MemoryStore {
                 Supersession::Corrects,
             ),
             Outcome::Timeline(facts) => {
+                // A contested span has no representation here: `Version.value`
+                // is an `Option<String>`, and there is nothing to write for
+                // "two values and nothing orders them". A read can be asked
+                // about one instant; a materialised resolution cannot, so this
+                // refuses whole -- and scans before writing, so a refusal
+                // leaves no half-written timeline behind.
+                if let Some(fact) = facts
+                    .iter()
+                    .find(|f| matches!(f.span, Span::Contested { .. }))
+                {
+                    return Err(Refused(format!(
+                        "the span opening at {} is contested, and a resolution written into storage has no way to record two values that nothing orders. Read it with `about` at an instant outside that span, or distinguish the observation times and resolve again.",
+                        fact.valid.from
+                    ))
+                    .into());
+                }
                 for fact in facts {
+                    let Span::Held(value) = fact.span else {
+                        unreachable!("contested spans were refused above")
+                    };
                     self.assert(
                         id,
                         attribute.clone(),
-                        held_to_value(fact.value),
+                        held_to_value(value),
                         fact.valid,
                         latest.clone(),
                         Supersession::Corrects,
@@ -2667,5 +2686,30 @@ mod tests {
         assert!(!rendered.contains(canary), "{rendered}");
         assert!(!rendered.contains('`'), "{rendered}");
         assert!(!rendered.contains("CANARY"), "{rendered}");
+    }
+    /// A resolution containing a contested span refuses whole, and leaves
+    /// nothing behind. Storage has no way to record two values that nothing
+    /// orders, so unlike a read this cannot be asked about one instant.
+    #[test]
+    fn a_resolution_with_a_contested_span_writes_nothing_at_all() {
+        let (mut s, id) = store_with_user();
+        let (a, b) = (user_said(MAR), user_said(MAR));
+        let refused = s.assert_resolved(
+            id,
+            "employer",
+            &[
+                Candidate::new(Some("Acme"), &a).over(Interval::since(JAN)),
+                Candidate::new(Some("Globex"), &b).over(Interval::since(JAN)),
+            ],
+            &Strategy::ValidInterval,
+        );
+        assert!(
+            refused.is_err(),
+            "a contested resolution must not be written"
+        );
+        assert!(
+            s.history(id, "employer").is_empty(),
+            "a refused resolution left a half-written timeline behind"
+        );
     }
 }

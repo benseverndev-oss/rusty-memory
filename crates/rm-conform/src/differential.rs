@@ -3,6 +3,7 @@
 use crate::generate::{generate, Params};
 use crate::history::Assertion;
 use crate::reference;
+use rm_core::Timestamp;
 use rm_survivor::{merge as engine_merge, Strategy};
 
 /// A history on which the two implementations differ.
@@ -153,6 +154,95 @@ pub fn refusal_agreement(
     score
 }
 
+/// How the two implementations line up on *instants* rather than histories.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct InstantScore {
+    pub agreed: usize,
+    pub disagreed: usize,
+    /// Probes both refused: the instant was genuinely contested.
+    pub both_refused: usize,
+    /// Probes both answered.
+    pub both_answered: usize,
+    /// Histories where some probe refused and another answered. The
+    /// anti-vacuity figure: instant-local means nothing unless one timeline
+    /// does both.
+    pub mixed_histories: usize,
+}
+
+impl InstantScore {
+    pub fn exact(&self) -> bool {
+        self.disagreed == 0 && self.agreed > 0
+    }
+}
+
+/// Whether the engine and the reference refuse the same *instants*.
+///
+/// `ValidInterval`'s refusal moved from the merge to the read, so
+/// [`refusal_agreement`] no longer reaches it: `merge` answers over a colliding
+/// history now, and only `held_at` refuses. This probes each history at every
+/// moment a span could open, plus one on either side, which guarantees landing
+/// both inside contested spans and outside them.
+///
+/// Ties are turned up and backdating down for the same reason
+/// [`refusal_agreement`] does it: a collision needs `valid.from` and
+/// `observed_at` to coincide, and a backdated assertion rarely collides on the
+/// first.
+pub fn instant_agreement(seeds: impl Iterator<Item = u64>) -> InstantScore {
+    let params = Params {
+        len: 10,
+        alphabet: 3,
+        tie_pct: 60,
+        backdate_pct: 10,
+        ..Params::default()
+    };
+    let mut score = InstantScore::default();
+    for seed in seeds {
+        let history = generate(seed, &params);
+        let candidates: Vec<_> = history.iter().map(|a| a.candidate()).collect();
+
+        let (Ok(engine_out), Ok(reference_out)) = (
+            engine_merge(&candidates, &Strategy::ValidInterval),
+            reference::merge(&candidates, &Strategy::ValidInterval),
+        ) else {
+            // Neither should refuse at the merge any more. If one does, that is
+            // itself a disagreement with the rule and is counted as one.
+            score.disagreed += 1;
+            continue;
+        };
+
+        let mut probes: Vec<Timestamp> = Vec::new();
+        for c in &candidates {
+            probes.push(c.valid.from.saturating_sub(1));
+            probes.push(c.valid.from);
+            probes.push(c.valid.from.saturating_add(1));
+        }
+        probes.sort_unstable();
+        probes.dedup();
+
+        let (mut refused_here, mut answered_here) = (false, false);
+        for t in probes {
+            // Refusals compare as refusals and never by message.
+            match (engine_out.held_at(t), reference::held_at(&reference_out, t)) {
+                (Err(_), Err(_)) => {
+                    score.agreed += 1;
+                    score.both_refused += 1;
+                    refused_here = true;
+                }
+                (Ok(a), Ok(b)) if a == b => {
+                    score.agreed += 1;
+                    score.both_answered += 1;
+                    answered_here = true;
+                }
+                _ => score.disagreed += 1,
+            }
+        }
+        if refused_here && answered_here {
+            score.mixed_histories += 1;
+        }
+    }
+    score
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,7 +290,9 @@ mod tests {
         let score = refusal_agreement(0..300, &default_strategies());
         // A floor rather than `> 0`: a single refusal in 2,400 comparisons
         // would satisfy "> 0" while leaving the paths effectively unreached.
-        // The measured figure is 450 refused / 1,950 answered.
+        // The measured figure is 158 refused / 2,242 answered. It was 450 /
+        // 1,950 until ValidInterval's refusal moved off the merge and onto the
+        // read, where `instant_agreement` measures it instead.
         let total = score.both_refused + score.both_answered;
         assert!(
             score.both_refused * 20 > total,
@@ -262,6 +354,34 @@ mod tests {
             best.len() < history.len(),
             "shrinking removed nothing from a {}-assertion history",
             history.len()
+        );
+    }
+    /// The engine and the reference agree about which *instants* refuse, not
+    /// merely about which histories do.
+    #[test]
+    fn instant_refusals_line_up_exactly() {
+        let score = instant_agreement(0..300);
+        assert_eq!(score.disagreed, 0, "{score:?}");
+        assert!(score.agreed > 0, "nothing was compared: {score:?}");
+    }
+
+    /// The companion, and the one that stops this from being vacuous. A suite
+    /// where every probe refused, or none did, would report perfect agreement
+    /// having measured nothing. The demanding form is per *history*: contested
+    /// and answerable instants have to occur in the same timeline, which is the
+    /// whole property -- a refusal that fits the question rather than the
+    /// history.
+    #[test]
+    fn contested_and_answerable_instants_occur_in_the_same_history() {
+        let score = instant_agreement(0..300);
+        assert!(
+            score.both_refused > 0,
+            "no probe ever landed in a contested span: {score:?}"
+        );
+        assert!(score.both_answered > 0, "every probe refused: {score:?}");
+        assert!(
+            score.mixed_histories > 0,
+            "no single history both refused an instant and answered another, so instant-local was never actually exercised: {score:?}"
         );
     }
 }

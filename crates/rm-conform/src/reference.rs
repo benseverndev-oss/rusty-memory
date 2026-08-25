@@ -11,8 +11,8 @@
 //! because they are derived from what bi-temporality means rather than from
 //! either implementation.
 
-use rm_core::Interval;
-use rm_survivor::{Asserted, Candidate, Fact, Held, Outcome, Refused, Strategy};
+use rm_core::{Interval, Timestamp};
+use rm_survivor::{Asserted, Candidate, Fact, Held, Outcome, Refused, Span, Strategy};
 
 /// What `rm_survivor::merge` should have returned.
 pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcome, Refused> {
@@ -36,14 +36,22 @@ pub fn merge(candidates: &[Candidate<'_>], strategy: &Strategy) -> Result<Outcom
 /// Note what this means for a `Survivor`: it has no time dimension, so it holds
 /// at every `t` and valid time does not bite at all. Only a `Timeline` -- that
 /// is, only `Strategy::ValidInterval` -- answers "what was true when".
-pub fn held_at(outcome: &Outcome, t: rm_core::Timestamp) -> Option<&Held> {
+pub fn held_at(outcome: &Outcome, t: rm_core::Timestamp) -> Result<Option<&Held>, Refused> {
     match outcome {
-        Outcome::Survivor(v) => v.as_ref(),
-        Outcome::Timeline(facts) => facts
+        Outcome::Survivor(v) => Ok(v.as_ref()),
+        // Half-open `[from, to)`, per `Interval`'s own docs.
+        Outcome::Timeline(facts) => match facts
             .iter()
-            // Half-open `[from, to)`, per `Interval`'s own docs.
             .find(|f| f.valid.from <= t && f.valid.to.is_none_or(|to| t < to))
-            .map(|f| &f.value),
+        {
+            None => Ok(None),
+            Some(f) => match &f.span {
+                Span::Held(v) => Ok(Some(v)),
+                Span::Contested { .. } => Err(Refused(
+                    "nothing orders the values that opened here".to_string(),
+                )),
+            },
+        },
     }
 }
 
@@ -97,32 +105,33 @@ fn most_recent(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
 
 /// Each distinct value with the span of valid time over which it stood.
 ///
-/// Documented rule: "Do not pick a winner. Emit each distinct value with the
-/// validity range over which it stood. Refuses only when two different values
-/// collide on *both* axes -- same `valid.from` and same `observed_at` --
-/// because then nothing orders them and there is no way to say which
-/// superseded which."
+/// Documented rule: "Sort the asserting candidates by `(valid.from,
+/// observed_at)`. Each distinct `valid.from` opens a span, closing where the
+/// next one opens; the last is open-ended. What opens there is decided by the
+/// greatest `observed_at` heard for that moment -- anything said earlier about
+/// the same moment was superseded before any question could be asked. A span
+/// is *contested* when the greatest-`observed_at` group at its `valid.from`
+/// holds two or more distinct values."
 ///
-/// Ordered by when each value began to hold, ties broken by when it was heard.
 /// Sorting by `valid.from` rather than `observed_at` is the whole difference
 /// between a valid-time timeline and a transaction-time one wearing its name.
 ///
-/// # That sentence is quotable because the sweep made it true
+/// # That sentence is quotable because the sweep made it true, twice
 ///
-/// It used to read "refuses when two different values share an observation
+/// It first read "refuses when two different values share an observation
 /// timestamp", which taken literally refuses two values heard in the same
-/// instant however their valid spans differ. `rm_survivor` never did that: it
-/// refuses only on the double collision above.
-///
-/// The implementation was the correct one and the sentence was out of date,
+/// instant however their valid spans differ. `rm_survivor` never did that, and
+/// the sweep found the gap by disagreeing on 53 generated histories: the
+/// implementation was the correct one and the sentence was out of date,
 /// written when a `Candidate` carried no `valid` and the timeline was cut at
-/// `observed_at` -- at which point two values sharing an observation really did
-/// have no order between them. Adding valid time gave them one.
+/// `observed_at`. Adding valid time gave those two values an order.
 ///
-/// The sweep found the gap by disagreeing on 53 generated histories. This
-/// reference was written against the behaviour and the divergence recorded
-/// here; `rm_survivor`'s comment has since been corrected to match, so the
-/// quote above is now the rule rather than a claim about it.
+/// It then read that the refusal was history-wide -- a collision anywhere
+/// refusing the whole read. That one was true of the code and disagreed with
+/// the oracle `rm-contrast` grades against, at 4,067 of 6,353 answerable
+/// questions. This model is written from the corrected sentence, before the
+/// engine was touched, which is the only reason a green sweep is evidence of
+/// anything.
 fn valid_interval(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
     let claims = claims(candidates);
     if claims.is_empty() {
@@ -134,37 +143,52 @@ fn valid_interval(candidates: &[Candidate<'_>]) -> Result<Outcome, Refused> {
         (a.valid.from, a.provenance.observed_at).cmp(&(b.valid.from, b.provenance.observed_at))
     });
 
-    // Refusal: only where nothing orders the two. Adjacent pairs suffice once
-    // sorted, because the colliding keys are equal and therefore neighbours.
-    for pair in ordered.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        if a.valid.from == b.valid.from
-            && a.provenance.observed_at == b.provenance.observed_at
-            && held(a) != held(b)
-        {
-            return Err(Refused(
-                "neither supersedes the other and no validity range can be assigned".to_string(),
-            ));
-        }
-    }
+    let mut moments: Vec<Timestamp> = ordered.iter().map(|c| c.valid.from).collect();
+    moments.dedup();
 
     let mut facts: Vec<Fact> = Vec::new();
-    for c in ordered {
-        let value = held(c);
-        // A repeat of the value already standing extends it rather than
-        // opening a second span: the timeline holds *distinct* values.
-        if facts.last().map(|f| &f.value) == Some(&value) {
+    for from in moments {
+        let at_moment: Vec<_> = ordered.iter().filter(|c| c.valid.from == from).collect();
+        let latest = at_moment
+            .iter()
+            .map(|c| c.provenance.observed_at)
+            .max()
+            .expect("a moment exists because a candidate opened it");
+        let mut values: Vec<Held> = Vec::new();
+        for c in at_moment
+            .iter()
+            .filter(|c| c.provenance.observed_at == latest)
+        {
+            let v = held(c);
+            if !values.contains(&v) {
+                values.push(v);
+            }
+        }
+
+        let span = if values.len() == 1 {
+            Span::Held(values.remove(0))
+        } else {
+            Span::Contested {
+                values,
+                observed_at: latest,
+            }
+        };
+
+        // A restatement of the value already standing extends it. Contested
+        // spans never coalesce: each records the collision it came from.
+        if matches!(span, Span::Held(_)) && facts.last().map(|f| &f.span) == Some(&span) {
             continue;
         }
         // Close the previous span where this one opens.
         if let Some(prev) = facts.last_mut() {
-            prev.valid = Interval::between(prev.valid.from, c.valid.from);
+            prev.valid = Interval::between(prev.valid.from, from);
         }
         facts.push(Fact {
-            value,
-            valid: Interval::since(c.valid.from),
+            span,
+            valid: Interval::since(from),
         });
     }
+
     Ok(Outcome::Timeline(facts))
 }
 
@@ -351,11 +375,11 @@ mod tests {
             out,
             Outcome::Timeline(vec![
                 Fact {
-                    value: Held::Value("fly.io".into()),
+                    span: Span::Held(Held::Value("fly.io".into())),
                     valid: Interval::between(100, 300)
                 },
                 Fact {
-                    value: Held::Value("render".into()),
+                    span: Span::Held(Held::Value("render".into())),
                     valid: Interval::since(300)
                 },
             ])
@@ -377,11 +401,11 @@ mod tests {
             out,
             Outcome::Timeline(vec![
                 Fact {
-                    value: Held::Value("fly.io".into()),
+                    span: Span::Held(Held::Value("fly.io".into())),
                     valid: Interval::between(100, 200)
                 },
                 Fact {
-                    value: Held::Value("render".into()),
+                    span: Span::Held(Held::Value("render".into())),
                     valid: Interval::since(200)
                 },
             ])
@@ -389,15 +413,22 @@ mod tests {
     }
 
     #[test]
-    fn two_values_with_nothing_at_all_to_order_them_refuse() {
+    fn two_values_with_nothing_at_all_to_order_them_contest_their_span() {
         // Same instant heard, same instant held: nothing orders these two, so
-        // no validity range can be assigned to either.
+        // neither can be said to have held over the span they both open. The
+        // timeline is still built, with that span named -- the refusal is at
+        // the instant, not at the merge.
         let (p1, p2) = (prov(500), prov(500));
         let cs = [
             Candidate::new(Some("fly.io"), &p1).over(Interval::since(100)),
             Candidate::new(Some("render"), &p2).over(Interval::since(100)),
         ];
-        assert!(merge(&cs, &Strategy::ValidInterval).is_err());
+        let out = merge(&cs, &Strategy::ValidInterval).expect("the timeline builds");
+        assert!(held_at(&out, 100).is_err(), "the contested instant refuses");
+        assert!(
+            held_at(&out, 99).unwrap().is_none(),
+            "before either opened, this is no coverage rather than a refusal"
+        );
     }
 
     #[test]
@@ -418,11 +449,11 @@ mod tests {
             merge(&cs, &Strategy::ValidInterval).unwrap(),
             Outcome::Timeline(vec![
                 Fact {
-                    value: Held::Value("fly.io".into()),
+                    span: Span::Held(Held::Value("fly.io".into())),
                     valid: Interval::between(100, 300)
                 },
                 Fact {
-                    value: Held::Value("render".into()),
+                    span: Span::Held(Held::Value("render".into())),
                     valid: Interval::since(300)
                 },
             ])

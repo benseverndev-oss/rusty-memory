@@ -93,11 +93,12 @@ pub fn table(full: bool) -> String {
     let (store, flat) = unanswerable(seeds);
     out.push_str(&format!(
         "\n**Questions with no right answer**, measured separately at a {TIE_PCT}% tie \
-         rate because `ValidInterval` refuses a read whose history contains a \
-         collision even at an instant where nothing is ambiguous.\n\n\
+         rate because ambiguity is a different phenomenon from the two temporal \
+         axes, and mixing them would confound the surface.\n\n\
          Of {} asked, {} had no right answer. Of the rest the store refused {} \
          it could have answered; the control refused {}, because it has no way \
-         to.\n",
+         to. That middle figure was 4,067 while `ValidInterval` refused a \
+         whole read over one collision.\n",
         store.asked(),
         store.ungradeable,
         store.declined,

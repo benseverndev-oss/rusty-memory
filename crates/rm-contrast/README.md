@@ -92,24 +92,39 @@ something, the control must get *some* retrospective questions right — it does
 whenever the value had not changed — and unanswerable questions must actually
 occur.
 
-## What cuts against this store
+## What cut against this store, and what happened to it
 
-At a 25% tie rate, of 8,000 questions asked, 1,647 had no right answer. **Of the
-remainder the store refused 4,067 it could have answered.** The control refused
-none, because it has no way to.
+At a 25% tie rate, of 8,000 questions asked, 1,647 had no right answer. **Of
+the remainder the store refused 4,067 it could have answered.** The control
+refused none, because it has no way to.
 
-`Strategy::ValidInterval` cannot build a timeline when two segments collide, so
-it refuses **the whole read** — including for an instant where nothing is
-ambiguous. The refusal is history-wide, not instant-local. On a history with one
-in four writes colliding, that is most of the store's usefulness gone.
+`Strategy::ValidInterval` could not build a timeline when two segments collided,
+so it refused **the whole read** — including for an instant where nothing was
+ambiguous. The refusal was history-wide rather than instant-local, and on a
+history with one in four writes colliding that was most of the store’s
+usefulness gone.
 
-This is measured separately from the grid, and the grid is tie-free, because
-otherwise it would confound the temporal axes with the refusal behaviour. It was
-found by the calibration cell failing on its first run.
+It was found by the calibration cell failing on its first run, recorded as a
+decision rather than fixed, and then fixed in #50 once the argument for leaving
+it turned out to be the wrong shape: it rested on the collision never having
+fired on real data, which is a frequency claim about a universally quantified
+property. **That count is now 0.**
 
-An unanswerable question is excluded from both stores' accuracy rather than
-counted for or against either. Marking it either way is a thumb on the scale:
-against, and refusal is punished; for, and the result is rigged.
+The assertion that used to pin the defect — `store.declined > 0`, with a comment
+saying that if it stopped happening the measurement had gone quiet rather than
+clean — is now `assert_eq!(store.declined, 0)`, and pins the fix. Zero rather
+than a threshold, deliberately: the instants the store contests and the instants
+`workload.rs` calls ambiguous are meant to be the same set, so a residue would
+be the two rules disagreeing rather than a number to relax.
+
+This is still measured separately from the grid, and the grid is still tie-free,
+because ambiguity is a different phenomenon from the two temporal axes and
+mixing them would confound the surface.
+
+An unanswerable question is still excluded from both stores’ accuracy rather
+than counted for or against either. Marking it either way is a thumb on the
+scale: against, and refusal is punished; for, and the result is rigged. The
+store scores no points for detecting its own ambiguity.
 
 ## The control
 
