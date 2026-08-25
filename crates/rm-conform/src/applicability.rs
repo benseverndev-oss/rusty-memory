@@ -53,11 +53,6 @@ const NAMES: [&str; 8] = [
     "arrow",
 ];
 
-/// The last `/`-separated part of a path.
-fn last_segment(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
 /// How much world to build.
 #[derive(Clone, Debug)]
 pub struct Params {
@@ -160,6 +155,12 @@ pub fn world(seed: u64, params: &Params) -> World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last `/`-separated part of a path. Only the vacuity check
+    /// needs it, so it lives here rather than shipping unused.
+    fn last_segment(path: &str) -> &str {
+        path.rsplit('/').next().unwrap_or(path)
+    }
 
     #[test]
     fn a_scope_reaches_its_own_position_and_everything_below() {
