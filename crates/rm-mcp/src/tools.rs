@@ -1323,4 +1323,55 @@ mod tests {
         let tokens = chars as f64 / CHARS_PER_TOKEN;
         assert!((tokens - 2_600.0).abs() < 150.0, "~{tokens:.0} tokens");
     }
+    /// Measured 2026-08-26, before the prose edit that follows.
+    const EXPECTED_BYTES: &[(&str, usize)] = &[
+        ("remember", 788),
+        ("note", 2164),
+        ("recall", 1174),
+        ("about", 889),
+        ("reviews", 380),
+        ("decide", 2089),
+        ("decisions", 1188),
+        ("decision", 1194),
+        ("resolve_review", 492),
+    ];
+
+    /// Each tool's serialised size, so a description growing back shows up in
+    /// a diff rather than in a token bill a year later.
+    fn tool_bytes() -> Vec<(String, usize)> {
+        all_definitions()
+            .iter()
+            .map(|t| {
+                (
+                    t["name"].as_str().unwrap().to_string(),
+                    serde_json::to_string(t).unwrap().len(),
+                )
+            })
+            .collect()
+    }
+
+    /// Per-tool size, pinned.
+    ///
+    /// The band is generous: a reworded sentence must not fail this, a tool
+    /// appearing or vanishing must. The point is that prose which grows back
+    /// over a year is visible, not that any particular byte count is right.
+    #[test]
+    fn each_tool_is_about_the_size_it_was_measured_at() {
+        for &(name, was) in EXPECTED_BYTES {
+            let now = tool_bytes()
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} left the table"))
+                .1;
+            assert!(
+                (now as i64 - was as i64).abs() < 250,
+                "{name} is {now} bytes, was {was} -- update this and the README's row together"
+            );
+        }
+        assert_eq!(
+            tool_bytes().len(),
+            EXPECTED_BYTES.len(),
+            "a tool was added or removed without updating the sizes"
+        );
+    }
 }
