@@ -21,3 +21,8 @@ rm-providers = { workspace = true }
 rm-embed = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+
+[dev-dependencies]
+# The resolution corpus is JSON on disk, so its ground truth is data a
+# reviewer can read rather than a fixture built by the code under test.
+serde_json = { workspace = true }
