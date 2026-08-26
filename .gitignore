@@ -12,3 +12,10 @@ benches/ann-bakeoff/src/goldenhnsw.rs
 # something to share; the settings that wire the hook are personal too.
 .rmem/
 .claude/settings.local.json
+
+# Agent scaffolding, checked out per-machine and sometimes as embedded
+# worktrees -- which `git add -A` will commit as gitlinks that resolve
+# nowhere. Ignored rather than remembered, because remembering is what
+# failed.
+.claude/
+.superpowers/
