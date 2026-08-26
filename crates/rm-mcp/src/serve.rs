@@ -63,6 +63,7 @@ impl<P: Embedder> Embedder for Vectors<P> {
 enum Planned {
     Remember(command::RememberPlan),
     Decide(command::DecidePlan),
+    Note(command::NotePlan),
     Recall(Vec<f32>),
     Nothing,
 }
@@ -438,6 +439,7 @@ where
                 command::commit_remember(engine, plan)
             }
             (Call::Decide { .. }, Planned::Decide(plan)) => command::commit_decide(engine, plan),
+            (Call::Note { .. }, Planned::Note(plan)) => command::commit_note(engine, plan),
             (Call::ResolveReview { id, same }, _) => {
                 if same {
                     command::review_confirm(engine, id)
@@ -496,6 +498,33 @@ where
                     &provider,
                     dimension,
                     metric,
+                )?))
+            }
+            Call::Note {
+                who,
+                kind,
+                attribute,
+                value,
+                fields,
+                valid_from,
+                scope,
+                session,
+            } => {
+                // An embedder alone, like `decide`. A fact someone already
+                // knows has a known shape, so nothing has to be guessed out of
+                // prose -- which is what `remember` pays a completion for.
+                let embedder = Self::vectors(config, provider)?;
+                Ok(Planned::Note(command::plan_note(
+                    who,
+                    kind,
+                    attribute,
+                    value.as_deref(),
+                    fields,
+                    *valid_from,
+                    now,
+                    session,
+                    scope.as_deref(),
+                    &embedder,
                 )?))
             }
             Call::Decide {

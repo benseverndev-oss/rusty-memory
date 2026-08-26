@@ -192,7 +192,7 @@ fn a_legacy_client_handshakes_and_is_served() {
     assert!(instructions.contains("unknown"), "{instructions}");
     assert!(instructions.contains("absent"), "{instructions}");
 
-    assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(out[1]["result"]["tools"].as_array().unwrap().len(), 9);
 }
 
 #[test]
