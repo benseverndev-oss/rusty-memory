@@ -1,5 +1,9 @@
 # Capture at the moment, record on judgement
 
+> **Superseded before implementation, the same day. Not built.** The evidence
+> below is kept because the reasoning was sound and the conclusion was wrong,
+> which is worth more than a deleted file. See *What killed it* at the end.
+
 A hook that preserves what was tried and what happened when a tool fails, so a
 lesson can still be written afterwards — and a nudge, at the end of the turn,
 when the same failure has happened more than once.
@@ -162,3 +166,46 @@ the way the `update-config` skill describes:
 - **No change to aiTrak.** Its duplicate registration and apparent lost writes
   are reported, not fixed. It is corporate tooling with a sync agent, and its
   owner should decide.
+
+## What killed it
+
+Two findings arrived while the first script was being written.
+
+**It would have captured almost nothing.** Of six lessons worth recording that
+day, exactly one produced a tool failure at all. The rest were silent wrong
+answers: an `awk` counter returning a confident zero, `rg -rn` returning
+plausible nonsense, `cargo fmt` quietly reformatting a string literal, `git add
+-A` succeeding while sweeping in two embedded worktrees. A
+`PostToolUseFailure` hook never sees any of those.
+
+And the one that *did* fail produced four different messages -- `table_hint body
+not found`, `session block not found`, and two more -- so the normaliser would
+not have grouped them either, unless it were loosened to the point of merging
+unrelated assertions. The test written to pin that grouping failed, and the test
+was right.
+
+**Capture was never the bottleneck.** A peer session had the relevant record,
+had `decisions` and `decision` in its tool list all day, and hit the same
+failure three times without ever looking. Two others hit it twice and once.
+Four sessions, one day, one family of failure, and the lesson was already
+written down and reachable by at least one of them.
+
+So the gap was recall, not capture. **A tool you have to choose to call is not
+memory.** An opt-in that fires on "I suspect there is a record" cannot fire on
+the case where you suspect nothing, which is every case that matters.
+
+## What was built instead
+
+A `SessionStart` hook that injects every `*`-scoped lesson title as
+`additionalContext`. Measured: 49 titles, ~1,092 tokens, **once per session** --
+against ~1,130 tokens **per turn** for the three MCP tools it partly replaces.
+Cheaper than a single turn of the alternative, and it works, because it is in
+front of the session rather than behind a call it has to decide to make.
+
+`~/Tools/claude-hooks/lessons-inject.ps1`, wired into `~/.claude/settings.json`.
+It reads through `rmem decisions` rather than parsing the snapshot, needs no API
+key (only `recall` and `decide` embed), and exits 0 silently on every failure
+path -- a memory aid that can stop you working is worse than none.
+
+The one piece of this spec that survived intact is the constraint list: one
+writer per file, and nothing near aiTrak's buffer.
