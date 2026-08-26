@@ -122,9 +122,23 @@ worth confirming rather than assuming.
 **Depth 1, across all 1,086 attribute slots** -- 219 decisions, five attributes
 each, and nothing revised. Measured from `decisions.json` on 2026-08-25.
 
-One caveat, because that anchor is doing a lot of work: the store is two days
-old and was seeded once, so depth 1 says where it sits and not that revisions
-are rare in general.
+Two caveats, because that anchor is doing a lot of work.
+
+The store is two days old and was seeded once, so depth 1 says where it sits
+and not that revisions are rare in general.
+
+**And depth may be a fact about when a store is written to rather than how
+often things are re-decided.** A peer session running its own store had a
+genuine supersession inside a few hours and recorded one record holding the
+final state, because it wrote its decisions at end of day once things had
+settled -- so the intermediate belief never reached the store. This store
+shows the same signature: one of its 219 decisions is `rejected`, and its
+`status` slot is at depth 1.
+
+Age does not cure that. It predicts depth stays at 1 in a store used for
+months, so long as the writer keeps recording after the fact -- which means
+a depth figure read off a retrospectively-written store measures a habit as
+much as a history.
 
 ### What depth 1 does not tell you about `rescope`
 
