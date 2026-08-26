@@ -1138,6 +1138,24 @@ impl Engine {
         }
     }
 
+    /// Every attribute this entity has a version log for, in name order.
+    ///
+    /// The missing half of [`Engine::store_history`], which can only be
+    /// called by someone who already knows the name. Without this there is no
+    /// way to walk a store and see what is in it -- which is what a tool
+    /// reporting on a real store needs, and what `benches/read-cost` uses to
+    /// re-measure the depth `rm_contrast::cost::LIVE_STORE_DEPTH` records.
+    ///
+    /// Empty for an entity this engine does not know, which is the same
+    /// answer as an entity that has no attributes yet: both mean there is
+    /// nothing to read, and neither is an error.
+    pub fn attributes_of(&self, entity: StableId) -> Vec<&str> {
+        self.store
+            .entity(entity)
+            .map(|e| e.attributes.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
     /// The raw version log, for callers that want the audit trail rather than
     /// an answer.
     pub fn store_history(&self, entity: StableId, attribute: &str) -> &[rm_store::Version] {
@@ -4500,5 +4518,34 @@ mod tests {
             .recall(&Query::new(vec![1.0, 0.0, 0.0], 50).at("anywhere/at/all"))
             .unwrap();
         assert_eq!(hits.len(), 1, "no scope recorded means it reaches here");
+    }
+    /// `attributes_of` names what `store_history` can be asked about.
+    ///
+    /// The pair is the point: `store_history` needs a name, and until this
+    /// existed there was no way to obtain one, so a store could not be walked
+    /// at all from outside.
+    #[test]
+    fn attributes_of_names_every_slot_and_nothing_else() {
+        let mut e = engine();
+        let (id, _) = e
+            .remember_as(None, observation("Ben Severn", "employer", "Acme", 1))
+            .unwrap();
+        e.remember_as(Some(id), observation("Ben Severn", "spouse", "Sam", 2))
+            .unwrap();
+
+        let names = e.attributes_of(id);
+        assert!(
+            names.contains(&"employer") && names.contains(&"spouse"),
+            "{names:?}"
+        );
+        for name in &names {
+            assert!(
+                !e.store_history(id, name).is_empty(),
+                "{name} was named but has no history"
+            );
+        }
+
+        // An entity nobody has heard of reads as nothing, not as an error.
+        assert!(e.attributes_of(9_999).is_empty());
     }
 }

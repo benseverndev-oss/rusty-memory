@@ -16,7 +16,9 @@
 //! confident number that means nothing. The store-versus-control crossover is
 //! measured in nanoseconds, in the bench, where the units really are the same.
 
-use rm_engine::Strategy;
+use std::collections::BTreeMap;
+
+use rm_engine::{Engine, Strategy};
 
 /// Versions per attribute slot in the live store, measured rather than
 /// assumed.
@@ -119,6 +121,30 @@ pub fn fit(samples: &[(f64, f64)]) -> Option<Fit> {
         fixed_ns: (sy - marginal_ns * sx) / n,
         marginal_ns,
     })
+}
+
+/// Versions per attribute slot, counted across a whole store.
+///
+/// The measurement [`LIVE_STORE_DEPTH`] records, as something that can be
+/// run again. That constant was measured once by hand against one store, and
+/// a constant standing in for a moving thing with nothing able to re-check it
+/// is the drift this project keeps finding -- in its own README sentences, in
+/// a strategy's doc comment, in a recorded refusal figure.
+///
+/// Lives here rather than in `benches/read-cost`, which is excluded from the
+/// workspace and never built by CI: the bench does the file reading and the
+/// printing, and this does the counting, so the part with a right answer is
+/// the part under test.
+pub fn depth_histogram(engine: &Engine) -> BTreeMap<usize, usize> {
+    let mut histogram = BTreeMap::new();
+    for id in engine.entity_ids() {
+        for name in engine.attributes_of(id) {
+            *histogram
+                .entry(engine.store_history(id, name).len())
+                .or_default() += 1;
+        }
+    }
+    histogram
 }
 
 /// The shallowest depth at which `ValidInterval` costs `factor` times
@@ -238,6 +264,71 @@ mod tests {
                     v + 1
                 );
             }
+        }
+    }
+    /// The histogram counts slots, not entities and not assertions.
+    ///
+    /// One entity with two attributes at different depths has to show up as
+    /// two slots at two depths -- the mistake worth guarding is summing per
+    /// entity, which would report one number for a store whose slots differ.
+    #[test]
+    fn the_depth_histogram_counts_each_slot_at_its_own_depth() {
+        let mut e = engine();
+        // `employer` written three times, `spouse` once.
+        let (id, _) = e.remember_as(None, obs("employer", "Acme", 1)).unwrap();
+        e.remember_as(Some(id), obs("employer", "Globex", 2))
+            .unwrap();
+        e.remember_as(Some(id), obs("employer", "Initech", 3))
+            .unwrap();
+        e.remember_as(Some(id), obs("spouse", "Sam", 4)).unwrap();
+
+        let h = depth_histogram(&e);
+        assert_eq!(
+            h.get(&3),
+            Some(&1),
+            "employer is one slot at depth 3: {h:?}"
+        );
+        assert_eq!(h.get(&1), Some(&1), "spouse is one slot at depth 1: {h:?}");
+        assert_eq!(h.values().sum::<usize>(), 2, "two slots in total: {h:?}");
+    }
+
+    /// An empty store is an empty histogram, not a panic and not a zero.
+    #[test]
+    fn an_empty_store_has_no_slots_at_all() {
+        assert!(depth_histogram(&engine()).is_empty());
+    }
+
+    fn engine() -> Engine {
+        use rm_engine::{Metric, Policy, VectorIndex};
+        Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            rm_resolve::Ruleset::new(
+                vec![rm_resolve::FieldRule::new(
+                    "name",
+                    rm_resolve::Comparator::JaroWinkler,
+                    0.9,
+                    0.01,
+                )],
+                vec![rm_resolve::BlockingKey::Prefix("name".to_string(), 3)],
+                4.0,
+                8.0,
+            )
+            .expect("a one-field ruleset is valid"),
+            Policy::new(Strategy::MostRecent),
+        )
+    }
+
+    fn obs(attribute: &str, value: &str, at: rm_engine::Timestamp) -> rm_engine::Observation {
+        use rm_engine::{Interval, Observation, Provenance, Record, Source, Supersession};
+        Observation {
+            kind: "thing".to_string(),
+            mention: Record::new().with("name", "subject one"),
+            attribute: attribute.to_string(),
+            value: Some(value.to_string()),
+            valid: Interval::since(at),
+            provenance: Provenance::new(Source::UserAssertion, at, format!("cost-{at}")),
+            supersession: Supersession::Corrects,
+            embedding: vec![1.0, 0.0, 0.0],
         }
     }
 }

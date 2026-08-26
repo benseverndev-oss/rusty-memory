@@ -18,6 +18,39 @@ and about ten seconds end to end.
 cargo run --release --manifest-path benches/read-cost/Cargo.toml
 ```
 
+## Checking a real store
+
+```sh
+cargo run --release --manifest-path benches/read-cost/Cargo.toml -- path/to/store.json
+```
+
+Reports versions per attribute slot for that store, and says whether the
+deepest slot still matches `rm_contrast::cost::LIVE_STORE_DEPTH`.
+
+**That constant is the load-bearing part of everything below.** It was measured
+once, by hand, against one store, and two READMEs quote it as the reason cost
+does not matter. A constant standing in for a moving thing with nothing able to
+re-check it is the drift this project keeps finding, so this is the way to
+re-check it:
+
+```
+# Store depth: D:/memory/decisions.json
+
+entities: 219
+slots:    1086
+depth histogram (versions per slot -> slots): {1: 1086}
+deepest:  1 versions, entity 0 "because"
+
+deepest slot is 1, matching rm_contrast::cost::LIVE_STORE_DEPTH.
+```
+
+A store that has moved on is **reported, not failed**: this runs against
+whatever it is pointed at, and a deeper store is news rather than a broken
+build. It reads through `Engine::open_split` rather than picking the snapshot
+apart, so it cannot drift from the format the store actually writes, and the
+counting itself lives in `rm_contrast::cost::depth_histogram` where CI can test
+it -- this crate is excluded from the workspace and never built there.
+
 ## What it measures
 
 Three configurations, because two would answer the wrong question:
