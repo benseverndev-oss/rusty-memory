@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::hint::black_box;
 use std::time::Instant;
 
-use rm_contrast::cost::{fit, predicted_work, Fit, LIVE_STORE_DEPTH};
+use rm_contrast::cost::{depth_histogram, fit, predicted_work, Fit, LIVE_STORE_DEPTH};
 use rm_contrast::flat::Flat;
 use rm_engine::{
     BlockingKey, Comparator, Engine, FieldRule, Interval, Metric, Observation, Policy, Provenance,
@@ -93,6 +93,15 @@ fn time<F: FnMut()>(depth: usize, mut f: F) -> f64 {
 }
 
 fn main() {
+    // `read-cost <path/to/store.json>` reports that store's depth instead of
+    // sweeping. The sweep's whole conclusion turns on where a real store sits
+    // on the curve, and `rm_contrast::cost::LIVE_STORE_DEPTH` records that as
+    // a constant measured once by hand. A constant standing in for a moving
+    // thing, with nothing able to re-check it, is the shape of drift this
+    // project keeps finding -- so here is the way to re-check it.
+    if let Some(path) = std::env::args().nth(1) {
+        return depth_report(&path);
+    }
     println!("# Read cost against history depth\n");
     println!("Iterations scale with depth. Values are nanoseconds per `about()`.\n");
     println!("| depth | distinct | flat | most_recent | valid_interval | mr ns/work | vi ns/work |");
@@ -221,4 +230,72 @@ fn report(name: &str, f: &Fit, measured_at_depth_1: f64) {
         f.fixed_ns,
         crossover.map_or("never".to_string(), |v| v.to_string())
     );
+}
+
+/// Versions per attribute slot in a real store, and how that compares with
+/// the figure `rm-contrast` was written against.
+///
+/// Reads through `Engine::open_split` rather than picking the snapshot apart,
+/// so this cannot drift from the format the store actually writes. The
+/// ruleset and policy are throwaway: nothing here resolves or survives
+/// anything, it only counts version logs.
+fn depth_report(path: &str) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("could not read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    // The vector sidecar is not needed to count versions, and a store whose
+    // vectors are missing still has a history worth reporting.
+    let vectors = std::fs::read(format!("{}.vec", path.trim_end_matches(".json"))).ok();
+    let engine = match Engine::open_split(
+        &text,
+        vectors.as_deref(),
+        ruleset(),
+        Policy::new(Strategy::MostRecent),
+    ) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("{path} is not a store this build can open: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // The counting lives in rm-contrast so CI can test it; this crate is
+    // excluded from the workspace and never built there.
+    let histogram = depth_histogram(&engine);
+    let mut deepest: Option<(usize, StableId, String)> = None;
+    for id in engine.entity_ids() {
+        for name in engine.attributes_of(id) {
+            let depth = engine.store_history(id, name).len();
+            if deepest.as_ref().is_none_or(|(d, _, _)| depth > *d) {
+                deepest = Some((depth, id, name.to_string()));
+            }
+        }
+    }
+
+    let slots: usize = histogram.values().sum();
+    println!("# Store depth: {path}\n");
+    println!("entities: {}", engine.entity_ids().len());
+    println!("slots:    {slots}");
+    println!("depth histogram (versions per slot -> slots): {histogram:?}");
+    if let Some((depth, id, name)) = &deepest {
+        println!("deepest:  {depth} versions, entity {id} {name:?}");
+    }
+
+    // The comparison is the reason this exists. Reported rather than
+    // asserted: a store that has moved on is news, not a failure, and this
+    // runs against whatever store it is pointed at.
+    let recorded = LIVE_STORE_DEPTH;
+    match histogram.keys().next_back() {
+        None => println!("\nempty store: nothing to compare against the recorded depth of {recorded}"),
+        Some(&max) if max == recorded => println!(
+            "\ndeepest slot is {max}, matching rm_contrast::cost::LIVE_STORE_DEPTH. The cost curve's first row is still the row that describes this store."
+        ),
+        Some(&max) => println!(
+            "\ndeepest slot is {max}, where LIVE_STORE_DEPTH records {recorded}. That constant and the two READMEs quoting it were measured against a different store than this one -- re-read them before trusting the depth-1 conclusion."
+        ),
+    }
 }
