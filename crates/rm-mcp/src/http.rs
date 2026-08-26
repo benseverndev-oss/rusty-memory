@@ -180,17 +180,23 @@ where
     // this server did not mint -- or has since dropped -- is a 404 rather than
     // a quiet fresh start: a client that believes it has a session needs to
     // learn that it does not, and the answer either way is to handshake again.
-    let resumed = match head.session.as_deref() {
-        None => Handshake::default(),
-        Some(id) => match sessions.resume(id, now) {
-            Some(handshake) => handshake,
-            None => {
-                let s = Status::NotFound;
-                return reply(&mut stream, s, "text/plain", "no such session");
-            }
-        },
-    };
-
+    // The body comes off the wire before anything can refuse the request.
+    //
+    // Not for tidiness: a reply sent while the request is still sitting
+    // unread in the receive buffer is a reply the client may never see. This
+    // connection closes after every response, and closing a socket with
+    // unread data makes the kernel send RST rather than FIN -- so the client
+    // gets ECONNRESET where the body should have been, having already read a
+    // perfectly good status line. That is what the session lookup below used
+    // to do on a 404, and it failed CI twice as a `ConnectionReset` that
+    // looked like a slow runner.
+    //
+    // `head.check` has already run, so `head.length` is inside `MAX_BODY`.
+    // The one refusal that still answers without draining is `TooLarge`,
+    // which is the entire point of it -- see
+    // `a_body_over_the_limit_is_refused_before_it_is_read`. A client that is
+    // told its megabyte is too big does not get to make us read the megabyte
+    // to hear it.
     let mut body = vec![0u8; head.length];
     if reader.read_exact(&mut body).is_err() {
         let s = Status::BadRequest;
@@ -204,6 +210,16 @@ where
     let Ok(body) = String::from_utf8(body) else {
         let s = Status::BadRequest;
         return reply(&mut stream, s, "text/plain", "body is not UTF-8");
+    };
+    let resumed = match head.session.as_deref() {
+        None => Handshake::default(),
+        Some(id) => match sessions.resume(id, now) {
+            Some(handshake) => handshake,
+            None => {
+                let s = Status::NotFound;
+                return reply(&mut stream, s, "text/plain", "no such session");
+            }
+        },
     };
 
     let mut server = match crate::Server::open(config, provider) {
