@@ -355,3 +355,36 @@ fn a_revision_agreed_at_the_handshake_still_holds_on_the_next_connection() {
         bare.body
     );
 }
+
+/// A refused request still gets its whole reply delivered.
+///
+/// This is the flake that failed CI twice, and it is a server bug rather
+/// than a slow runner. The session lookup answered 404 and returned
+/// *before* the body was read, so the connection closed with the request
+/// still sitting unread in the receive buffer -- and a close with unread
+/// data makes the kernel send RST instead of FIN. The client got the status
+/// line and the headers, then `ECONNRESET` where the body should have been.
+///
+/// The body here is large deliberately. A short one often fits in flight and
+/// the race goes the harmless way, which is exactly why this took two CI
+/// runs to catch rather than failing the first time anyone ran it.
+#[test]
+fn a_refused_request_still_delivers_its_body() {
+    let (addr, _dir) = server();
+    let padding = "x".repeat(256 * 1024);
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {"name": "decide", "arguments": {"title": padding}}
+    })
+    .to_string();
+
+    // A session this server never minted: refused before the body is used.
+    let reply = send(addr, "POST", Some("nosuchsession"), &body);
+    assert_eq!(reply.status, 404);
+    assert_eq!(
+        reply.body, "no such session",
+        "the reply was refused and then truncated by a reset"
+    );
+}
