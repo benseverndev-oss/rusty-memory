@@ -399,7 +399,7 @@ Every vector in this store now comes from one model.",
                 .map(|r| {
                     let other = if r.a == *entity { r.b } else { r.a };
                     format!(
-                        "  scored {:.2} against entity {other}, inside the review band. `rmem review --confirm {}` says they are the same; `--reject {}` says they are not.",
+                        "  scored {:.2} against entity {other}, inside the review band. `rmem review confirm {}` says they are the same; `rmem review reject {}` says they are not.",
                         r.score, r.id, r.id
                     )
                 })
@@ -891,5 +891,50 @@ mod tests {
         ))));
         assert!(out.contains("marked replaced"), "{out}");
         assert!(!out.contains("this never stood"), "{out}");
+    }
+    /// Every command this crate tells a user to run must parse.
+    ///
+    /// The `Noted` hint shipped saying `rmem review --confirm <id>`, which is
+    /// a usage error -- `review` takes a subcommand, not a flag, and the
+    /// correct spelling was already a few hundred lines up in this same file.
+    /// A string-equality test against the right text would have missed it
+    /// just as easily, so this runs what the message says through the real
+    /// parser: the only thing that can tell a command from a plausible one.
+    #[test]
+    fn every_command_the_output_suggests_actually_parses() {
+        let rendered = render(&Outcome::Noted {
+            entity: 0,
+            attribute: "team".into(),
+            absent: false,
+            merged: false,
+            reviews: vec![rm_engine::PendingReview {
+                id: 3,
+                a: 0,
+                b: 27,
+                score: 6.17,
+            }],
+        });
+
+        // Every `rmem ...` span the message offers, taken from the text
+        // rather than restated -- restating it is how the two drift.
+        let suggested: Vec<Vec<String>> = rendered
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|c| c.starts_with("rmem "))
+            .map(|c| c.split_whitespace().skip(1).map(str::to_string).collect())
+            .collect();
+        assert!(
+            suggested.len() >= 2,
+            "the hint stopped offering commands: {rendered}"
+        );
+        for argv in suggested {
+            crate::args::parse(argv.iter().cloned()).unwrap_or_else(|e| {
+                panic!(
+                    "the output suggests `rmem {}`, which does not parse: {e}",
+                    argv.join(" ")
+                )
+            });
+        }
     }
 }
