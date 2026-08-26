@@ -380,6 +380,19 @@ pub fn init(
         contents = contents.replace("embedder = \"http\"", "embedder = \"local\"");
     }
 
+    // An absolute store path, so a config this crate writes needs no rule to
+    // interpret. `Config::parse` anchors a relative path against the config's
+    // own directory, which is what makes hand-written and older configs behave
+    // sensibly; writing it out in full is what stops the question arising at
+    // all. `TEMPLATE` keeps the relative example so the committed file stays
+    // readable and portable -- the two differ on purpose.
+    if let Some(dir) = config_path.parent() {
+        let store = dir.join("memory.json");
+        // Forward slashes: TOML would read a Windows backslash as an escape.
+        let store = store.to_string_lossy().replace('\\', "/");
+        contents = contents.replace("path = \"memory.json\"", &format!("path = \"{store}\""));
+    }
+
     std::fs::write(config_path, contents).map_err(|e| {
         HostError::Config(format!("could not write {}: {e}", config_path.display()))
     })?;
@@ -4232,5 +4245,31 @@ mod rescope_tests {
             plan_rescope("D", "", AUGUST, "t", &stub),
             Err(HostError::Refused(_))
         ));
+    }
+    /// `init` writes a path that needs no rule to interpret.
+    ///
+    /// `Config::parse` anchoring a relative path is what makes hand-written
+    /// and older configs behave sensibly. Writing the path out in full is
+    /// what stops the question arising for configs this crate produces, and
+    /// it is checked through `Config::load` -- the path a real command takes
+    /// -- rather than by reading the bytes back for a substring.
+    #[test]
+    fn init_writes_a_store_path_that_needs_no_anchoring() {
+        let dir = crate::testing::TempDir::new();
+        let config_path = dir.path().join("rmem.toml");
+        init(&config_path, false, true, None, &|| Ok(1536)).unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("path = \"memory.json\""),
+            "init left the template's relative example in the file"
+        );
+        assert_eq!(
+            crate::config::Config::load(&config_path)
+                .unwrap()
+                .store
+                .path,
+            dir.path().join("memory.json")
+        );
     }
 }

@@ -438,7 +438,7 @@ impl Config {
     /// the fields legal in whichever table the fault fell inside. Between them
     /// they say where, why, and what would have been valid.
     fn parse(path: &Path, text: &str) -> Result<Config, HostError> {
-        toml::from_str(text).map_err(|e| {
+        let mut config: Config = toml::from_str(text).map_err(|e| {
             let span = e.span();
             HostError::Config(format!(
                 "{} is not valid: {} ({}){}",
@@ -447,7 +447,28 @@ impl Config {
                 location(text, span.clone()),
                 table_hint(text, span),
             ))
-        })
+        })?;
+
+        // A relative store path is relative to the config that names it, not
+        // to whoever happened to start the process. `RMEM_CONFIG` exists so one
+        // config can be shared between projects; resolving against the caller's
+        // working directory makes that config name a different file per caller,
+        // which is the opposite of what sharing it was for.
+        //
+        // It matters more than it looks because a missing store is not refused
+        // -- `store::load` returns an empty engine for `NotFound` -- so the
+        // wrong path does not fail, it silently answers every question with
+        // "nothing known".
+        //
+        // `parent` is `None` only for a path with no directory component at
+        // all, which `load` cannot produce because it read a file from it.
+        if config.store.path.is_relative() {
+            if let Some(dir) = path.parent() {
+                config.store.path = dir.join(&config.store.path);
+            }
+        }
+
+        Ok(config)
     }
 
     /// A config built from [`TEMPLATE`] rather than a file.
@@ -2224,5 +2245,73 @@ embedder = \"local\"
             .and_then(|v| v.trim().parse().ok())
             .expect("and sets it to a number");
         assert_eq!(written, TEMPLATE_DIMENSION);
+    }
+    /// A relative store path belongs to the config that names it.
+    ///
+    /// `RMEM_CONFIG` exists so one config can be shared between projects. A
+    /// path resolved against the caller's working directory makes that config
+    /// name a different file for every caller, which is the opposite of what
+    /// sharing it was for. This silently pointed two stores at one file on
+    /// 2026-08-26, and the tell was implausibly clean data rather than an
+    /// error -- a missing store is not refused, it starts empty.
+    #[test]
+    fn a_relative_store_path_resolves_against_the_config_not_the_caller() {
+        use crate::testing::TempDir;
+
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        std::fs::write(&path, TEMPLATE).unwrap();
+
+        assert_eq!(
+            Config::load(&path).unwrap().store.path,
+            dir.path().join("memory.json"),
+            "the store belongs beside its config, wherever the caller stood"
+        );
+    }
+
+    /// Two configs naming the same relative path are two stores, not one.
+    ///
+    /// The property a comparison between two configurations depends on. Both
+    /// writing to one file is not a subtle failure -- the second run reads
+    /// back the first one's work and reports it as its own result.
+    #[test]
+    fn two_configs_naming_one_relative_path_are_two_stores() {
+        use crate::testing::TempDir;
+
+        let (a, b) = (TempDir::new(), TempDir::new());
+        let mut paths = Vec::new();
+        for dir in [&a, &b] {
+            let p = dir.path().join("rmem.toml");
+            std::fs::write(&p, TEMPLATE).unwrap();
+            paths.push(Config::load(&p).unwrap().store.path);
+        }
+        assert_ne!(paths[0], paths[1]);
+    }
+
+    /// An absolute path is already unambiguous and is left alone.
+    ///
+    /// The guard that the rule does not over-reach, rather than a red test:
+    /// it passes before the change as well as after.
+    #[test]
+    fn an_absolute_store_path_is_not_re_anchored() {
+        use crate::testing::TempDir;
+
+        let dir = TempDir::new();
+        let path = dir.path().join("rmem.toml");
+        let absolute = if cfg!(windows) {
+            "C:/elsewhere/memory.json"
+        } else {
+            "/elsewhere/memory.json"
+        };
+        std::fs::write(
+            &path,
+            TEMPLATE.replace("path = \"memory.json\"", &format!("path = \"{absolute}\"")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            Config::load(&path).unwrap().store.path,
+            PathBuf::from(absolute)
+        );
     }
 }
