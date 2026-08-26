@@ -52,6 +52,7 @@ rmem — a memory that resolves contradictions deterministically
     rmem review                      open questions the resolver could not answer
     rmem review confirm <id>         answer one: the same thing
     rmem review reject <id>          answer one: different things
+    rmem note <who> <attr> <value>   record a fact; --absent asserts there is none
     rmem decide \"<title>\" \"<choice>\" --scope <s> [--because <why>]
                                      [--context <what prompted it>]
                                      [--status proposed|accepted|rejected|deprecated]
@@ -83,6 +84,21 @@ pub enum Command {
         /// without a key it writes nothing -- and the keyless path is the one
         /// the documentation recommends.
         local: bool,
+    },
+    Note {
+        who: String,
+        /// What sort of thing this is. Defaults to `person`, which is what
+        /// the first real dataset is; anything else says so with `--kind`.
+        kind: String,
+        attribute: String,
+        /// `None` when `--absent` was given: an asserted absence, which is
+        /// a claim and not a gap.
+        value: Option<String>,
+        /// Extra mention fields, in the order given. They reach the identity
+        /// record the resolver compares, not the attributes.
+        fields: Vec<(String, String)>,
+        valid_from: Option<Timestamp>,
+        scope: Option<String>,
     },
     Remember {
         text: String,
@@ -332,6 +348,75 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                 "review takes nothing, or `confirm <id>`, or `reject <id>`\n\n{USAGE}"
             ))),
         },
+
+        "note" => {
+            // Positionals first, exactly as `decide` requires, so a flag
+            // cannot be swallowed as a value.
+            let absent = args.iter().any(|a| a == "--absent");
+            let positional: Vec<&String> = args[1..]
+                .iter()
+                .take_while(|a| !a.starts_with("--"))
+                .collect();
+            let (who, attribute, value) = match (positional.len(), absent) {
+                (3, false) => (
+                    positional[0].clone(),
+                    positional[1].clone(),
+                    Some(positional[2].clone()),
+                ),
+                (2, true) => (positional[0].clone(), positional[1].clone(), None),
+                (3, true) => {
+                    return Err(CliError::Usage(format!(
+                        "a value and --absent contradict each other: --absent says there is no value, so do not also give one
+
+{USAGE}"
+                    )))
+                }
+                _ => {
+                    return Err(CliError::Usage(format!(
+                        "note takes <who> <attribute> <value>, or <who> <attribute> --absent
+
+{USAGE}"
+                    )))
+                }
+            };
+
+            // `--field` repeats, so `flag` -- which finds the first -- is not
+            // enough. A pair with no `=` is refused rather than stored under
+            // a field named after the whole argument.
+            let mut fields: Vec<(String, String)> = Vec::new();
+            for (i, a) in args.iter().enumerate() {
+                if a != "--field" {
+                    continue;
+                }
+                let Some(pair) = args.get(i + 1) else {
+                    return Err(CliError::Usage(format!(
+                        "--field needs name=value after it
+
+{USAGE}"
+                    )));
+                };
+                let Some((k, v)) = pair.split_once('=') else {
+                    return Err(CliError::Usage(format!(
+                        "--field takes name=value, and {pair:?} has no '=' -- without one there is nothing to compare against
+
+{USAGE}"
+                    )));
+                };
+                fields.push((k.to_string(), v.to_string()));
+            }
+
+            Ok(Command::Note {
+                who,
+                attribute,
+                value,
+                fields,
+                kind: flag(&args, "--kind")?.unwrap_or_else(|| "person".to_string()),
+                valid_from: flag(&args, "--valid-from")?
+                    .map(|d| rm_host::time::parse_day(&d).map_err(CliError::Usage))
+                    .transpose()?,
+                scope: flag(&args, "--scope")?,
+            })
+        }
 
         "decide" => {
             let (Some(title), Some(choice)) = (args.get(1), args.get(2)) else {
@@ -951,5 +1036,79 @@ mod tests {
             err.contains("--force"),
             "and not drop the one it already named: {err}"
         );
+    }
+    /// The shape of a note: who, what, and the value.
+    #[test]
+    fn a_note_parses_who_what_and_value() {
+        assert_eq!(
+            parse_args(&["note", "Jon Severn", "role", "leads circ"]).unwrap(),
+            Command::Note {
+                who: "Jon Severn".into(),
+                kind: "person".into(),
+                attribute: "role".into(),
+                value: Some("leads circ".into()),
+                fields: vec![],
+                valid_from: None,
+                scope: None,
+            }
+        );
+    }
+
+    /// `--absent` is a claim, so it takes the place of the value rather
+    /// than sitting beside one. Given both, the two contradict each other
+    /// and neither is guessed at.
+    #[test]
+    fn absent_replaces_the_value_rather_than_joining_it() {
+        assert_eq!(
+            parse_args(&["note", "Jon", "reports", "--absent"]).unwrap(),
+            Command::Note {
+                who: "Jon".into(),
+                kind: "person".into(),
+                attribute: "reports".into(),
+                value: None,
+                fields: vec![],
+                valid_from: None,
+                scope: None,
+            }
+        );
+        let err = parse_args(&["note", "Jon", "reports", "none", "--absent"]).unwrap_err();
+        assert!(
+            format!("{err}").contains("--absent"),
+            "a value and --absent contradict each other: {err}"
+        );
+    }
+
+    /// `--field` repeats, because a person has more than one identifier and
+    /// the mention is written once.
+    #[test]
+    fn field_repeats_and_keeps_its_order() {
+        let Command::Note { fields, .. } = parse_args(&[
+            "note",
+            "Jon",
+            "role",
+            "x",
+            "--field",
+            "email=j@example.com",
+            "--field",
+            "handle=jsev",
+        ])
+        .unwrap() else {
+            panic!("expected Note")
+        };
+        assert_eq!(
+            fields,
+            vec![
+                ("email".to_string(), "j@example.com".to_string()),
+                ("handle".to_string(), "jsev".to_string())
+            ]
+        );
+    }
+
+    /// A `--field` with no `=` is a typo, and typos are refused rather than
+    /// stored as a field named after the whole argument.
+    #[test]
+    fn a_field_without_a_value_is_refused() {
+        let err = parse_args(&["note", "Jon", "role", "x", "--field", "email"]).unwrap_err();
+        assert!(format!("{err}").contains("--field"), "{err}");
     }
 }

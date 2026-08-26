@@ -139,6 +139,7 @@ pub fn run(
         Remember(command::RememberPlan),
         Decide(command::DecidePlan),
         Rescope(command::RescopePlan),
+        Note(command::NotePlan),
     }
 
     let mutates = matches!(
@@ -148,6 +149,7 @@ pub fn run(
             | Command::ReviewReject(_)
             | Command::Decide { .. }
             | Command::Rescope { .. }
+            | Command::Note { .. }
             | Command::Reindex
     );
 
@@ -255,6 +257,33 @@ pub fn run(
                     &embedder,
                 )?))
             }
+            Command::Note {
+                who,
+                kind,
+                attribute,
+                value,
+                fields,
+                valid_from,
+                scope,
+            } => {
+                // An embedder, never a provider. A fact someone already
+                // knows has a known shape, so this costs one embedding and
+                // no completion at all -- the same bargain `decide` makes,
+                // and the reason facts could not reach this store before.
+                let embedder = config.embedder()?;
+                Some(Planned::Note(command::plan_note(
+                    who,
+                    kind,
+                    attribute,
+                    value.as_deref(),
+                    fields,
+                    *valid_from,
+                    now,
+                    &attribution::cli(),
+                    scope.as_deref(),
+                    &embedder,
+                )?))
+            }
             Command::Rescope { title, scope } => {
                 // One field, so one embedding. Same bargain as `decide`: the
                 // embedder, never a completion provider.
@@ -282,6 +311,9 @@ pub fn run(
                 }
                 (Command::Decide { .. }, Some(Planned::Decide(plan))) => {
                     command::commit_decide(engine, plan)
+                }
+                (Command::Note { .. }, Some(Planned::Note(plan))) => {
+                    command::commit_note(engine, plan)
                 }
                 (Command::ReviewConfirm(id), _) => command::review_confirm(engine, id),
                 (Command::ReviewReject(id), _) => command::review_reject(engine, id),
