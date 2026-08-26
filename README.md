@@ -51,6 +51,7 @@ never discussed it" are different answers.)
 cargo install --path crates/rm-cli
 export OPENAI_API_KEY=...
 rmem init                       # asks the model its embedding size, writes rmem.toml
+rmem init --local               # same, without asking: no key, no socket
 rmem remember "I just started at Globex"
 rmem recall "where do I work"
 ```
@@ -510,6 +511,41 @@ places the right decision first **6 times in 12** where
 `text-embedding-3-small` manages **10**. It has morphology and no semantics:
 nothing lexical connects *talking* to *speaking*. Asked by exact title both are
 perfect, which is why that is the wrong test to judge it by.
+
+### Setting one up
+
+```sh
+rmem init --local
+```
+
+That writes a config with `embedder = "local"` and asks nothing of any
+model. **`rmem init` on its own cannot produce this file**, which is the
+defect the flag exists to fix: `init` probes the model for its embedding
+dimension, so with no key it exits 1 having written nothing at all. The
+documented keyless path had no reachable way to create the config it
+recommends, and a session following these steps literally landed exactly
+there.
+
+The `[provider]` block still carries `base_url`, `api_key_env`,
+`completion_model` and `embedding_model`, and the local embedder dials none
+of them. They stay required deliberately: making them optional would weaken
+validation on the http path -- the one where a wrong `api_key_env` costs
+money -- to tidy four inert lines here.
+
+Left in place they are also worth using. **Point `api_key_env` at a variable
+nothing sets**, and an accidental fall back to `http` fails loudly instead
+of quietly spending someone's key:
+
+```toml
+[provider]
+embedder = "local"
+api_key_env = "RMEM_OPENAI_API_KEY"   # deliberately unset
+```
+
+The dimension `--local` writes is the template's own, 1536. That is not a
+number chosen for subword hashing: it is the configuration the recall figure
+below was measured under, and writing a different one would leave that
+number describing a config `rmem init` does not produce.
 
 Switching is not free — vectors from the two are not comparable — but it is
 reversible: `rmem reindex` rebuilds the index under whichever is configured.

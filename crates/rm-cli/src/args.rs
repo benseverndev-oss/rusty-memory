@@ -37,7 +37,8 @@ use crate::CliError;
 pub const USAGE: &str = "\
 rmem — a memory that resolves contradictions deterministically
 
-    rmem init [--force]              write rmem.toml, asking the model its embedding size
+    rmem init [--force] [--local]    write rmem.toml, asking the model its embedding size
+                                     (--local uses the offline embedder: no key, no socket)
     rmem remember \"<turn>\" [--speaker <name>]
                                      extract a turn and record what it said
     rmem recall \"<query>\" [-k N] [--scope <s>] [--all]
@@ -77,6 +78,11 @@ A decision is found again by its title, so write one you would search for.
 pub enum Command {
     Init {
         force: bool,
+        /// Write a config for the local embedder: no dimension probe, no key,
+        /// no socket. `init` otherwise asks the model its embedding size, so
+        /// without a key it writes nothing -- and the keyless path is the one
+        /// the documentation recommends.
+        local: bool,
     },
     Remember {
         text: String,
@@ -214,17 +220,18 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
             let unknown: Vec<&str> = args[1..]
                 .iter()
                 .map(String::as_str)
-                .filter(|a| *a != "--force")
+                .filter(|a| *a != "--force" && *a != "--local")
                 .collect();
             if !unknown.is_empty() {
                 return Err(CliError::Usage(format!(
-                    "init does not take {unknown:?} -- the only thing it takes is --force
+                    "init does not take {unknown:?} -- the only things it takes are --force and --local
 
 {USAGE}"
                 )));
             }
             Ok(Command::Init {
                 force: args.iter().any(|a| a == "--force"),
+                local: args.iter().any(|a| a == "--local"),
             })
         }
 
@@ -537,11 +544,17 @@ mod tests {
     fn each_command_parses_to_what_it_says() {
         assert_eq!(
             parse_args(&["init"]).unwrap(),
-            Command::Init { force: false }
+            Command::Init {
+                force: false,
+                local: false
+            }
         );
         assert_eq!(
             parse_args(&["init", "--force"]).unwrap(),
-            Command::Init { force: true }
+            Command::Init {
+                force: true,
+                local: false
+            }
         );
         assert_eq!(
             parse_args(&["remember", "I moved"]).unwrap(),
@@ -648,11 +661,17 @@ mod tests {
         // And the two spellings it does accept still parse.
         assert_eq!(
             parse_args(&["init"]).unwrap(),
-            Command::Init { force: false }
+            Command::Init {
+                force: false,
+                local: false
+            }
         );
         assert_eq!(
             parse_args(&["init", "--force"]).unwrap(),
-            Command::Init { force: true }
+            Command::Init {
+                force: true,
+                local: false
+            }
         );
     }
 
@@ -884,5 +903,53 @@ mod tests {
         };
         assert!(all, "--all suspends the rule");
         assert_eq!(scope, None);
+    }
+    /// `--local` is a second flag, and the two compose.
+    ///
+    /// It exists because `init` probes the model for its embedding dimension,
+    /// so without a key it exits 1 and writes nothing -- while the README
+    /// recommends `embedder = "local"` as a path needing no key and no socket.
+    /// The only documented way to make a config could not make the config the
+    /// documentation recommends. Found by a session following those steps
+    /// literally.
+    #[test]
+    fn init_takes_local_and_force_together() {
+        assert_eq!(
+            parse_args(&["init", "--local"]).unwrap(),
+            Command::Init {
+                force: false,
+                local: true
+            }
+        );
+        assert_eq!(
+            parse_args(&["init", "--local", "--force"]).unwrap(),
+            Command::Init {
+                force: true,
+                local: true
+            }
+        );
+        assert_eq!(
+            parse_args(&["init"]).unwrap(),
+            Command::Init {
+                force: false,
+                local: false
+            }
+        );
+    }
+
+    /// And a mistyped flag is still refused rather than ignored, with both
+    /// names in the message -- the reason the existing check exists.
+    #[test]
+    fn init_still_refuses_a_flag_it_does_not_know() {
+        let err = parse_args(&["init", "--locl"]).unwrap_err().to_string();
+        assert!(err.contains("--locl"), "{err}");
+        assert!(
+            err.contains("--local"),
+            "the message must name the real flag: {err}"
+        );
+        assert!(
+            err.contains("--force"),
+            "and not drop the one it already named: {err}"
+        );
     }
 }

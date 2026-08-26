@@ -53,7 +53,7 @@ pub fn run(
 ) -> Result<Outcome, CliError> {
     let command = parse(args)?;
 
-    if let Command::Init { force } = command {
+    if let Command::Init { force, local } = command {
         // Loaded here rather than by `init`, because init is what a user runs
         // when there is no config -- so only the provider block has to be
         // readable, and it comes from the template if the file is absent.
@@ -97,8 +97,13 @@ pub fn run(
         return Ok(command::init(
             config_path,
             force,
+            local,
             replaced_unparsable,
             &|| {
+                // Not branched on `--local` here: `command::init` does not
+                // call this closure at all in that case, so the key is
+                // demanded only when it is about to be used. Keeping the
+                // branch in one place means a caller cannot forget it.
                 let provider = config.provider().map_err(|e| e.to_string())?;
                 provider.probe_dimension().map_err(|e| e.to_string())
             },
