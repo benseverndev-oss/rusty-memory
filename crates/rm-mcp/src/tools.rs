@@ -58,6 +58,20 @@ pub const SCOPE_ENV: &str = "RMEM_SCOPE";
 /// startup on a path with no good way to report, and a server that will not
 /// start because a list has a typo in it is worse than one that offers fewer
 /// tools than expected -- which `tools/list` shows plainly.
+/// Characters per token for this table's JSON.
+///
+/// From the four counted rows in the README: 8,203/2,060, 5,650/1,420,
+/// 4,475/1,130 and 2,385/610 give 3.91 to 3.98. Stated here once so the
+/// README's rows, the comment on [`definitions`] and the test below all
+/// derive from one number rather than three copies of it -- those last two
+/// disagreed for a day in August 2026, when the README moved twice for the
+/// clocks and for scope and the comment did not follow.
+///
+/// `cfg(test)` because nothing in a running server needs it: it exists so the
+/// documentation's arithmetic is checkable, not so the code can do arithmetic.
+#[cfg(test)]
+pub(crate) const CHARS_PER_TOKEN: f64 = 3.97;
+
 pub fn definitions() -> Vec<Value> {
     let all = all_definitions();
     let Ok(wanted) = std::env::var(TOOLS_ENV) else {
@@ -1292,5 +1306,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:?}").contains("absent"), "{err:?}");
+    }
+    /// The table is the size the documentation says it is.
+    ///
+    /// The byte count is the measurement; the token figure is derived from
+    /// it, so only one of the two can rot. The band is wide on purpose: a
+    /// reworded description must not fail this, a tool appearing or vanishing
+    /// must.
+    #[test]
+    fn the_tool_table_is_the_size_the_documentation_says() {
+        let chars = serde_json::to_string(&all_definitions()).unwrap().len();
+        assert!(
+            (10_000..11_000).contains(&chars),
+            "the table is {chars} chars; update the README's row and the comment on `definitions` together"
+        );
+        let tokens = chars as f64 / CHARS_PER_TOKEN;
+        assert!((tokens - 2_600.0).abs() < 150.0, "~{tokens:.0} tokens");
     }
 }
