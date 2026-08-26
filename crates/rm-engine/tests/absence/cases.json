@@ -1,0 +1,125 @@
+{
+  "_comment": [
+    "Synthetic. This repository is public, so no real person, employer or",
+    "identifier appears here. See README.md beside this file.",
+    "",
+    "`states` is what the conversation established: a string is a value, and",
+    "null is an asserted absence -- somebody said there is none. Attributes in",
+    "`truth` but not in `states` were never mentioned at all, and that gap is",
+    "the point of the corpus rather than an oversight.",
+    "",
+    "`why` says what acting on a wrong answer would cost. A case that cannot",
+    "answer that is a case not worth carrying.",
+    "",
+    "Subjects have deliberately dissimilar names. The first draft called them",
+    "Case A and Case B, which share a three-character prefix and scored inside",
+    "the review band -- so the resolver filed a question and the corpus was",
+    "measuring identity instead of the three-way answer."
+  ],
+  "cases": [
+    {
+      "subject": "Alder Whitlock",
+      "states": {
+        "specialty": "cardiology",
+        "prescribing_authority": null
+      },
+      "truth": {
+        "specialty": "value",
+        "prescribing_authority": "absent",
+        "npi_number": "unknown"
+      },
+      "why": "Answering absent for npi_number states this clinician has no NPI because nobody supplied one. Acting on it means filing a claim that will be rejected, and the rejection reads as a data problem rather than as a memory that made something up."
+    },
+    {
+      "subject": "Brandt Okonjo",
+      "states": {
+        "outstanding_balance": null,
+        "account_status": "open"
+      },
+      "truth": {
+        "account_status": "value",
+        "outstanding_balance": "absent",
+        "payment_method": "unknown"
+      },
+      "why": "Absent and unknown lead to opposite actions on an account: one closes it, the other asks. A system that cannot tell them apart picks one and is silently wrong half the time."
+    },
+    {
+      "subject": "Coyle Marchetti",
+      "states": {
+        "employer": "Northwind Analytics",
+        "non_compete": null
+      },
+      "truth": {
+        "employer": "value",
+        "non_compete": "absent",
+        "former_employer": "unknown"
+      },
+      "why": "A stated current employer says nothing about whether there was a previous one. Inferring absence from a single stated value is the most tempting fabrication of the three, because the record looks complete."
+    },
+    {
+      "subject": "Devereaux Nakamura",
+      "states": {
+        "consent_to_contact": null,
+        "preferred_channel": "email"
+      },
+      "truth": {
+        "preferred_channel": "value",
+        "consent_to_contact": "absent",
+        "consent_withdrawn_on": "unknown"
+      },
+      "why": "Consent withheld and consent never discussed are different legal positions. Recording the second as the first invents a refusal nobody made; recording the first as the second invites contacting someone who declined."
+    },
+    {
+      "subject": "Ellsworth Baptiste",
+      "states": {
+        "dependants": null,
+        "employment_type": "contract"
+      },
+      "truth": {
+        "employment_type": "value",
+        "dependants": "absent",
+        "beneficiary": "unknown"
+      },
+      "why": "Stating a beneficiary is absent because none was mentioned would let a payment be made to the wrong party while the record looked settled."
+    },
+    {
+      "subject": "Fairbanks Oyelaran",
+      "states": {
+        "prior_authorisation": null,
+        "plan": "Meridian Select"
+      },
+      "truth": {
+        "plan": "value",
+        "prior_authorisation": "absent",
+        "appeal_filed": "unknown"
+      },
+      "why": "An appeal that was never discussed is not an appeal that was never filed. A store that answers absent closes a case that may still be open."
+    },
+    {
+      "subject": "Grimaldi Thorsen",
+      "states": {
+        "conflicts_of_interest": null,
+        "role": "reviewer"
+      },
+      "truth": {
+        "role": "value",
+        "conflicts_of_interest": "absent",
+        "recusals": "unknown"
+      },
+      "why": "A declared absence of conflicts is a statement someone is accountable for. Manufacturing one from silence puts words in a person's mouth in exactly the setting where that matters most."
+    },
+    {
+      "subject": "Halloran Vasquez",
+      "states": {
+        "termination_date": null,
+        "start_date": "2021-03-01"
+      },
+      "truth": {
+        "start_date": "value",
+        "termination_date": "absent",
+        "last_review_date": "unknown"
+      },
+      "why": "Termination stated as none means still employed. A review date nobody mentioned means nobody has looked, which is not the same as a review that found nothing."
+    }
+  ]
+}

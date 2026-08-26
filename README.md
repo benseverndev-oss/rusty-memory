@@ -1,11 +1,29 @@
 # rusty-memory
 
-Agent memory that resolves contradictions deterministically.
+A memory that knows what it doesn't know.
 
-Memory systems for agents dedupe by embedding similarity and settle conflicts by
-asking a model to re-summarise. `rusty-memory` treats conflicting facts as the
-core problem rather than an afterthought, and applies entity resolution and
-survivorship — solved problems in master data management — to agent memory.
+```
+spouse    Alex
+employer  no value — asserted to have none
+pets      nothing known — this was never discussed
+```
+
+Three answers, not two. Memory systems for agents dedupe by embedding
+similarity and settle conflicts by asking a model to re-summarise; both
+operations are lossy and neither reports that it happened. Ask one whether
+someone has an employer and it will tell you. Ask this one and it can say it
+does not know — which is a different answer from "they have none", and the
+difference is the point.
+
+Measured on a corpus where all three answers are labelled by hand: 8/8/8, no
+fabrications. See [`docs/absence-benchmark.md`](docs/absence-benchmark.md),
+including why a benchmark built around a distinction only one system makes is
+reported alongside recall on a corpus others use.
+
+The same refusal runs underneath: conflicting facts are kept rather than
+settled at write time, and two entities that score too close to call are filed
+as a question rather than merged. Entity resolution and survivorship — solved
+problems in master data management — applied to agent memory.
 
 Status: early. See [`docs/architecture-sketch.md`](docs/architecture-sketch.md)
 for the design and what is planned.
