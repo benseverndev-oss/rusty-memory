@@ -19,6 +19,7 @@
 //! it is what lets a second consumer render the same result as JSON without
 //! reaching for a parser.
 
+pub mod attribution;
 pub mod command;
 pub mod config;
 pub mod scope;
