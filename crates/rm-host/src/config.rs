@@ -131,6 +131,14 @@ u = 0.01
 # across four stores from a real corpus. m is lower than for a name because
 # extraction is not perfectly consistent about the boundary cases; it called
 # the same pets "animal" once and "thing" the next run.
+#
+# Measured 2026-08-21 (commit 526d5e6, PR #19). The four stores are not in
+# this repository and the harness was not committed, so this number cannot be
+# re-measured here -- which matters, because the thresholds above are derived
+# from it. `the_thresholds_are_the_one_field_figures_plus_kinds_agreement_
+# weight` checks that derivation and would still pass if 0.38 were wrong about
+# the world: it checks the arithmetic built on this value, never the value.
+# Re-measuring it needs a corpus of the kind in crates/rm-host/tests/corpus.
 [[resolution.field]]
 field = "kind"
 comparator = "exact"
@@ -2312,6 +2320,78 @@ embedder = \"local\"
         assert_eq!(
             Config::load(&path).unwrap().store.path,
             PathBuf::from(absolute)
+        );
+    }
+    /// The thresholds are the one-field figures plus what `kind` contributes.
+    ///
+    /// The comment above `review_at` in [`TEMPLATE`] states this derivation:
+    /// they were 4.0 and 6.0 when `name` was the only field, and adding `kind`
+    /// adds log2(0.9/0.38) to every pair whose kinds agree, so both rose by
+    /// that much and a pair agreeing on kind lands where it landed before.
+    ///
+    /// Nothing recomputed it. Changing `u` from 0.38 would have left that
+    /// paragraph false, both thresholds miscalibrated by the difference, and
+    /// every test in the workspace green.
+    #[test]
+    fn the_thresholds_are_the_one_field_figures_plus_kinds_agreement_weight() {
+        let config = Config::from_template();
+        let kind = config
+            .resolution
+            .field
+            .iter()
+            .find(|f| f.field == "kind")
+            .expect("the template resolves on kind");
+
+        let shift = (kind.m / kind.u).log2();
+        assert!(
+            (shift - 1.2439256).abs() < 5e-8,
+            "the comment says 1.2439256; the fields give {shift}"
+        );
+
+        // 4.0 and 6.0 are the thresholds from before `kind` was a field.
+        //
+        // The tolerance is 1e-4 because the config rounds to four places and
+        // says so: "written to four places, which leaves each boundary
+        // 0.000026 bits below the exact figure". A tighter bound would fail
+        // on rounding the author chose deliberately.
+        assert!((config.resolution.review_at - (4.0 + shift)).abs() < 1e-4);
+        assert!((config.resolution.match_at - (6.0 + shift)).abs() < 1e-4);
+    }
+
+    /// A name can contribute at most log2(0.9/0.01) bits, and three doc
+    /// comments in this workspace state that in prose.
+    ///
+    /// It is the ceiling the kind veto is argued from, so it is worth having
+    /// computed rather than asserted.
+    #[test]
+    fn a_name_can_contribute_at_most_six_point_four_nine_bits() {
+        let config = Config::from_template();
+        let name = config
+            .resolution
+            .field
+            .iter()
+            .find(|f| f.field == "name")
+            .expect("the template resolves on name");
+        let ceiling = (name.m / name.u).log2();
+        assert!((ceiling - 6.49).abs() < 5e-3, "{ceiling}");
+
+        // And the veto arithmetic the same comment states: a kind
+        // disagreement costs log2((1-m)/(1-u)), and a perfect name minus that
+        // cost still lands below `review_at`, which is what makes a kind
+        // mismatch final rather than merely expensive.
+        let kind = config
+            .resolution
+            .field
+            .iter()
+            .find(|f| f.field == "kind")
+            .expect("the template resolves on kind");
+        let penalty = ((1.0 - kind.m) / (1.0 - kind.u)).log2();
+        assert!((penalty + 2.63).abs() < 5e-3, "{penalty}");
+        assert!(
+            ceiling + penalty < config.resolution.review_at,
+            "a kind disagreement stopped being final: {} is not below {}",
+            ceiling + penalty,
+            config.resolution.review_at
         );
     }
 }
