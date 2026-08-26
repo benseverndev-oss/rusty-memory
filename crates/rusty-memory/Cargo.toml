@@ -1,0 +1,16 @@
+[package]
+name = "rusty-memory"
+version.workspace = true
+description = "A memory that knows what it doesn't know: three-state answers, kept contradictions, and identity questions rather than silent merges"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+keywords = ["memory", "agents", "entity-resolution", "bitemporal", "llm"]
+categories = ["database-implementations", "data-structures"]
+
+[dependencies]
+rm-engine = { workspace = true }
+rm-resolve = { workspace = true }

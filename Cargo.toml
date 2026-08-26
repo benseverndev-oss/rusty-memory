@@ -15,6 +15,7 @@ members = [
     "crates/rm-mcp",
     "crates/rm-conform",
     "crates/rm-contrast",
+    "crates/rusty-memory",
 ]
 resolver = "2"
 # The ANN bake-off is run by hand, not in CI: it pulls hnsw_rs and takes
@@ -45,6 +46,7 @@ rm-cli = { path = "crates/rm-cli", version = "0.1.0", package = "rusty-memory-cl
 rm-mcp = { path = "crates/rm-mcp", version = "0.1.0", package = "rusty-memory-mcp" }
 rm-conform = { path = "crates/rm-conform", version = "0.1.0", package = "rusty-memory-conform" }
 rm-contrast = { path = "crates/rm-contrast", version = "0.1.0", package = "rusty-memory-contrast" }
+rusty-memory = { path = "crates/rusty-memory", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2", default-features = false, features = ["tls"] }
