@@ -1,12 +1,17 @@
 [package]
-name = "rm-engine"
-version = "0.0.0"
+name = "rusty-memory-engine"
+version.workspace = true
 description = "remember() / recall() / forget() over the rusty-memory crates"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_engine::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_engine"
 
 [dependencies]
 rm-core = { workspace = true }

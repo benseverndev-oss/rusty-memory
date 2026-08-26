@@ -1,6 +1,6 @@
 [package]
-name = "rm-conform"
-version = "0.0.0"
+name = "rusty-memory-conform"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -8,6 +8,11 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 description = "Scores the store on contradiction, supersession and time against an independent reference model"
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_conform::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_conform"
 
 [dependencies]
 rm-core.workspace = true

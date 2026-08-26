@@ -1,6 +1,6 @@
 [package]
-name = "rm-mcp"
-version = "0.0.0"
+name = "rusty-memory-mcp"
+version.workspace = true
 description = "rmem-mcp: an MCP server over rusty-memory"
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,11 @@ authors.workspace = true
 [[bin]]
 name = "rmem-mcp"
 path = "src/main.rs"
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_mcp::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_mcp"
 
 [dependencies]
 rm-engine = { workspace = true }

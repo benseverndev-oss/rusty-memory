@@ -1,12 +1,17 @@
 [package]
-name = "rm-store"
-version = "0.1.0"
+name = "rusty-memory-store"
+version.workspace = true
 description = "Bi-temporal record store for agent memory, with attribute history"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_store::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_store"
 
 [dependencies]
 rm-core = { workspace = true }
