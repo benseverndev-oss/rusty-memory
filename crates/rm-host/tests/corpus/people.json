@@ -1,0 +1,44 @@
+{
+  "_comment": [
+    "Synthetic. This repository is public. The corpus that produced the",
+    "original measurements was 27 real colleagues and must not be committed.",
+    "",
+    "`is` is hand-written ground truth: the person a mention is really about,",
+    "or null when the mention is somebody the corpus has not seen before. It is",
+    "never derived from a resolver result -- a test that supplies the thing it",
+    "checks cannot fail.",
+    "",
+    "Two shapes pull against each other on purpose, and any configuration that",
+    "gets both right has earned it:",
+    "  changed-surname-stable-local-part is a TRUE match an exact email",
+    "    comparator turns into a silent duplicate.",
+    "  shared-given-name-shared-domain is a TRUE non-match a fuzzy email",
+    "    comparator merges outright.",
+    "Both were found by deliberately building the case that would break the",
+    "configuration about to be recommended."
+  ],
+  "people": [
+    { "id": "p1", "name": "Jonathan Merrick", "kind": "person", "email": "jmerrick@northwind.example" },
+    { "id": "p2", "name": "Christopher Vale", "kind": "person", "email": null },
+    { "id": "p3", "name": "Priyanka Raghunathan", "kind": "person", "email": "praghunathan@northwind.example" },
+    { "id": "p4", "name": "Rosalind Okafor", "kind": "person", "email": "rokafor@northwind.example" },
+    { "id": "p5", "name": "Roland Ashby", "kind": "person", "email": "rashby@northwind.example" },
+    { "id": "p6", "name": "Delia Okafor", "kind": "person", "email": "dokafor@westgate.example" },
+    { "id": "p7", "name": "Marguerite Sandoval", "kind": "person", "email": "msandoval@northwind.example" },
+    { "id": "p8", "name": "Northwind Analytics", "kind": "organisation", "email": null }
+  ],
+  "mentions": [
+    { "name": "Jonathan Merrick", "kind": "person", "email": "jmerrick@northwind.example", "is": "p1", "shape": "exact-repeat" },
+    { "name": "Jon Merrick", "kind": "person", "email": null, "is": "p1", "shape": "nickname" },
+    { "name": "Christopher Vale", "kind": "person", "email": null, "is": "p2", "shape": "exact-repeat" },
+    { "name": "Chris Vale", "kind": "person", "email": null, "is": "p2", "shape": "nickname" },
+    { "name": "Priyanka", "kind": "person", "email": null, "is": "p3", "shape": "given-name-alone" },
+    { "name": "Merrick", "kind": "person", "email": null, "is": "p1", "shape": "surname-alone" },
+    { "name": "Rosalind Ashby", "kind": "person", "email": "rokafor@westgate.example", "is": "p4", "shape": "changed-surname-stable-local-part" },
+    { "name": "Delia Okafor", "kind": "person", "email": "dokafor@westgate.example", "is": "p6", "shape": "shared-surname-different-people" },
+    { "name": "Roland Ashby", "kind": "person", "email": "rashby@northwind.example", "is": "p5", "shape": "shared-given-name-shared-domain" },
+    { "name": "Marguerite Sandoval", "kind": "person", "email": "msandoval@northwind.example", "is": "p7", "shape": "exact-repeat" },
+    { "name": "Northwind Analytics", "kind": "organisation", "email": null, "is": "p8", "shape": "kind-disagreement-guard" },
+    { "name": "Northwind Analytics", "kind": "person", "email": null, "is": null, "shape": "kind-disagreement-guard" }
+  ]
+}
