@@ -49,7 +49,7 @@ pub const SCOPE_ENV: &str = "RMEM_SCOPE";
 /// # Why a session should be able to ask for fewer
 ///
 /// The tool table is sent on every turn of every session that has this server
-/// configured, whether or not it is used. Measured: nine tools are about 2,150
+/// configured, whether or not it is used. Measured: nine tools are about 2,600
 /// tokens, which is more than a thirty-decision log costs to read in full -- so
 /// a project that only ever consults decisions pays a log's worth of context
 /// per turn to advertise six tools it will never call.

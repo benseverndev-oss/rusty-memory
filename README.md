@@ -128,6 +128,34 @@ rmem decision "Pin the compiler"   # its history reads 2026-02-28, not today
 rmem decisions --status rejected   # what was tried and turned down
 ```
 
+### A fact you already know
+
+`rmem note` records a fact you already know. One embedding, no completion --
+the same bargain `decide` makes, and the reason it exists is that the only
+other way in charges a completion model per fact, which is why this store held
+265 decisions, zero facts and an empty review queue.
+
+```sh
+rmem note "Jon Severn" role "leads circ"
+rmem note "Jon Severn" team "circulation" --field email=jon@example.com
+rmem note "Jon Severn" reports --absent      # asserted to have none
+rmem note "Jon Severn" role "ran print ops" --valid-from 2019-01-01
+```
+
+`--absent` is the whole point of the three-way answer reaching the write side.
+Leaving an attribute unrecorded reads as `unknown` -- nobody has said. `--absent`
+reads as `absent` -- someone asserted there is none. "Has no direct reports" and
+"nobody has been asked" are different answers, and this is the only way to record
+the first.
+
+It resolves by name. If the store cannot tell whether that is someone it already
+knows, the fact is recorded and the identity question is queued: `rmem review`
+lists it. A wrong merge is silent and permanent; an open question is neither.
+
+It does not extract. `remember` reads prose and finds facts in it; `note`
+receives one someone decided to record. Both are useful and they have different
+failure modes.
+
 ### The embedder is a choice you can now change your mind about
 
 The store keeps a value, an interval and a provenance. The text that was
@@ -418,7 +446,7 @@ session that has this configured, used or not:
 
 | exposed | tools | tokens per turn |
 |---|---|---|
-| everything | 8 | ~2,060 |
+| everything | 9 | ~2,600 |
 | `decide,decisions,decision,recall` | 4 | ~1,420 |
 | `decide,decisions,decision` | 3 | ~1,130 |
 | `decisions,decision` | 2 | ~610 |
@@ -428,6 +456,17 @@ These figures are measured, and they have moved twice. The two clocks
 and `decision` appear in all of them. Scope added about 162 more to the rows
 carrying `decide`, and about 93 to the row that does not — it gains the two read
 parameters but not `decide`'s own.
+
+`note` added the ninth tool and about 540 tokens to the first row, which is the
+largest single addition in the table -- a write tool carries eight properties and
+the paragraph explaining when to reach for it rather than `remember`. That row is
+the one to narrow: a project that never records facts should not advertise the
+ability to.
+
+The ninth row is derived rather than counted directly -- the serialised table is
+10,368 characters against 8,203 at eight tools, and the four rows above imply
+3.91 to 3.98 characters per token. Said plainly because it is a weaker
+measurement than the rows it sits with.
 
 Scoping `recall` added ~48 more, to the two rows that expose it — the other two
 are byte-identical, which is the check that the figure is the flag rather than
