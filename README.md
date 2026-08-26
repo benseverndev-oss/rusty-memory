@@ -478,7 +478,7 @@ session that has this configured, used or not:
 
 | exposed | tools | tokens per turn |
 |---|---|---|
-| everything | 9 | ~2,600 |
+| everything | 9 | ~2,450 |
 | `decide,decisions,decision,recall` | 4 | ~1,420 |
 | `decide,decisions,decision` | 3 | ~1,130 |
 | `decisions,decision` | 2 | ~610 |
@@ -489,11 +489,7 @@ and `decision` appear in all of them. Scope added about 162 more to the rows
 carrying `decide`, and about 93 to the row that does not — it gains the two read
 parameters but not `decide`'s own.
 
-`note` added the ninth tool and about 540 tokens to the first row, which is the
-largest single addition in the table -- a write tool carries eight properties and
-the paragraph explaining when to reach for it rather than `remember`. That row is
-the one to narrow: a project that never records facts should not advertise the
-ability to.
+`note` added the ninth tool. Cutting per-property prose that restated the schema then took the table from ~2,600 tokens to ~2,450: the top-level description is only about a third of a tool's bytes, and the rest is the prose inside `inputSchema`. What came out restated a type, a default, or something the tool description had already said; `default` and `format` keys now carry what two of those sentences used to.
 
 The ninth row is derived rather than counted directly -- the serialised table is
 10,368 characters against 8,203 at eight tools, and the four rows above imply
