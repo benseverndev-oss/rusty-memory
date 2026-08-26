@@ -31,6 +31,16 @@ That was an argument, not a measurement. This is the measurement.
 
 **The store's column is 1.000 by construction, and is not the finding.**
 
+**And it is measured under `Strategy::ValidInterval`, which is not the
+shipped default.** `rmem.toml`'s template defaults to `most_recent` and
+opts one example attribute into `valid_interval`. That is deliberate on
+both sides: `most_recent` is the right default -- it always answers, and
+`about --valid-at` refuses under it rather than answering about the wrong
+moment -- while measuring `most_recent` here would be close to measuring
+the flat control against itself, since neither reads valid time. So this
+column is what the store can do, not what it does out of the box, and a
+reader should not take the two for the same thing.
+
 Ground truth is computed the way `Strategy::ValidInterval` answers — the latest
 value that had begun to hold, among those already heard. So the store agreeing
 with it is close to a tautology, and a perfect column is what that design
@@ -183,9 +193,28 @@ slots, every one of them at depth 1** — nothing has been revised — and at de
 1 there is no history to scan and no timeline to sort. The whole difference
 between the two strategies there is about 140 nanoseconds.
 
-One caveat on that anchor, because it is doing a lot of work: the store is two
-days old and was seeded once, so depth 1 says where it sits and not that
-revisions are rare.
+Two caveats on that anchor, because it is doing a lot of work.
+
+The store is two days old and was seeded once, so depth 1 says where it sits
+and not that revisions are rare.
+
+**And depth may be a fact about when a store is written to rather than how
+often things are re-decided.** A peer session running its own store hit a
+real supersession -- a decision made, shipped, found wanting, and remade
+within hours -- and recorded *one* record holding the final state, because
+it wrote its decisions at the end of the day once everything had settled.
+The intermediate belief never reached the store. Recorded when decided, that
+slot would sit at depth 2.
+
+This store shows the same signature: of 219 decisions, **one is `rejected`,
+and its `status` slot is at depth 1.** A decision that ended up rejected was
+presumably considered first, and no intermediate state was ever written.
+
+That is a different claim from "nothing gets revised", and a more awkward
+one, because age does not cure it: it predicts depth stays at 1 in a store
+used for months, so long as the writer keeps recording after the fact. Any
+depth figure read off a retrospectively-written store is measuring a habit
+as much as a history.
 
 An earlier version of this section carried a second caveat suggesting `rescope`
 might be overwriting rather than appending, on the grounds that a `rescope` pass
