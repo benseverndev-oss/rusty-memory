@@ -269,8 +269,13 @@ fn a_client_with_no_session_is_served_and_written_down_as_mcp() {
     let wrote = send(addr, "POST", None, &decide(1, "Anonymous choice", "yes"));
     assert_eq!(wrote.status, 200, "{}", wrote.body);
     let authors = authors(dir.path());
+    // `mcp` is still the agent, now qualified by the machine it ran on:
+    // `mcp@<host>`. The property pinned here is unchanged -- an unattributed
+    // write is written down as mcp rather than refused -- so this checks the
+    // agent part and not a whole string, which would be a machine name
+    // hardcoded into a test.
     assert!(
-        authors.iter().any(|s| s == "mcp"),
+        authors.iter().any(|s| s.starts_with("mcp@")),
         "an unattributed write should say mcp: {authors:?}"
     );
 }

@@ -395,14 +395,24 @@ impl Call {
     /// the other.
     fn attributed(arguments: &Value, client: Option<&str>) -> Result<String, Unreadable> {
         let session = optional_string(arguments, "session")?;
-        Ok(match (client, session) {
-            (Some(c), Some(s)) => format!("{c}/{s}"),
-            (Some(c), None) => c.to_string(),
-            // No handshake identity: a client that did not name itself, which
-            // the specification allows. The old default, so nothing that worked
-            // before now records less.
-            (None, Some(s)) => s,
-            (None, None) => "mcp".to_string(),
+        // The agent, then the machine, then the run: `RM@bsev-002/abc123`,
+        // matching what `rm_host::attribution` writes on the CLI side so both
+        // hosts are comparable rather than one being useful and one being a
+        // constant.
+        let host = rm_host::attribution::host();
+        let host = if host.trim().is_empty() {
+            "unknown-host".to_string()
+        } else {
+            host
+        };
+        // No handshake identity: a client that did not name itself, which the
+        // specification allows. `mcp` was the old default and stays the agent
+        // part, so nothing that worked before now records less -- it records
+        // the machine as well.
+        let agent = client.unwrap_or("mcp");
+        Ok(match session {
+            Some(s) => format!("{agent}@{host}/{s}"),
+            None => format!("{agent}@{host}"),
         })
     }
 
@@ -668,6 +678,17 @@ mod tests {
     /// In a store one agent uses this is cosmetic. In one several share it is
     /// the difference between a log and a pile, and asking each agent to pass a
     /// `session` argument is asking for the writes where it was forgotten.
+    /// The machine, or a stated stand-in. Computed rather than written down:
+    /// a hardcoded name would pass on one box and fail on every other.
+    fn host_or_unknown() -> String {
+        let h = rm_host::attribution::host();
+        if h.trim().is_empty() {
+            "unknown-host".to_string()
+        } else {
+            h
+        }
+    }
+
     #[test]
     fn a_write_is_attributed_to_the_client_that_made_it() {
         let with = |client: Option<&str>, args: Value| match Call::read("decide", &args, client)
@@ -677,11 +698,19 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let bare = json!({"title": "T", "choice": "C", "scope": "work"});
+        // The machine, computed rather than written down: a hardcoded name
+        // would pass on one box and fail on every other.
+        let h = rm_host::attribution::host();
+        let h = if h.trim().is_empty() {
+            "unknown-host".to_string()
+        } else {
+            h
+        };
 
-        // The handshake name alone.
+        // The handshake name, and where it ran.
         assert_eq!(
             with(Some("claude-code 2.1"), bare.clone()),
-            "claude-code 2.1"
+            format!("claude-code 2.1@{h}")
         );
 
         // Both, and neither hides the other: an agent can name its conversation
@@ -691,22 +720,22 @@ mod tests {
                 Some("claude-code 2.1"),
                 json!({"title":"T","choice":"C","scope":"work","session":"refactor"})
             ),
-            "claude-code 2.1/refactor"
+            format!("claude-code 2.1@{h}/refactor")
         );
 
         // A client that named itself in the handshake and nothing else still
         // gets attribution, which is the case this exists for.
-        assert_eq!(with(Some("agent-B"), bare.clone()), "agent-B");
+        assert_eq!(with(Some("agent-B"), bare.clone()), format!("agent-B@{h}"));
 
         // No handshake identity: the specification allows it, and nothing that
         // worked before now records less.
-        assert_eq!(with(None, bare), "mcp");
+        assert_eq!(with(None, bare), format!("mcp@{h}"));
         assert_eq!(
             with(
                 None,
                 json!({"title":"T","choice":"C","scope":"work","session":"s"})
             ),
-            "s"
+            format!("mcp@{h}/s")
         );
     }
 
@@ -772,7 +801,7 @@ mod tests {
             .unwrap(),
             Call::Remember {
                 text: "I moved to Chicago".into(),
-                session: "mcp".into(),
+                session: format!("mcp@{}", host_or_unknown()),
                 speaker: Some("Melanie".into()),
             }
         );
@@ -787,7 +816,7 @@ mod tests {
             read("remember", json!({"text": "x"})).unwrap(),
             Call::Remember {
                 text: "x".into(),
-                session: "mcp".into(),
+                session: format!("mcp@{}", host_or_unknown()),
                 // No default, and none promised: the description says to omit
                 // it only when the turn has no identified speaker. Guessing
                 // one would be worse than leaving it out, because the prompt
@@ -1081,5 +1110,37 @@ mod tests {
             panic!("not a recall call")
         };
         assert!(all);
+    }
+    /// The handshake name is an agent, and an agent is on a machine.
+    ///
+    /// `attributed` already recorded who the client said it was; what it could
+    /// not say is where. Two agents called `Print` on two machines were
+    /// indistinguishable, and on the machine this was written for there were
+    /// five.
+    #[test]
+    fn the_author_names_the_machine_as_well_as_the_client() {
+        let host = rm_host::attribution::host();
+        let got = Call::attributed(&json!({}), Some("RM")).unwrap();
+        assert!(got.starts_with("RM@"), "{got}");
+        if !host.is_empty() {
+            assert!(got.contains(&host), "{got} should name {host}");
+        }
+    }
+
+    /// A client that gives a session id keeps it, after the host.
+    #[test]
+    fn a_client_supplied_session_follows_the_machine() {
+        let got = Call::attributed(&json!({"session": "abc"}), Some("RM")).unwrap();
+        assert!(got.starts_with("RM@"), "{got}");
+        assert!(got.ends_with("/abc"), "{got}");
+    }
+
+    /// A client that never named itself still records where it ran. The
+    /// specification allows an anonymous client, so this must not become a
+    /// refusal -- but `mcp` alone was as uninformative as the CLI's `cli`.
+    #[test]
+    fn an_anonymous_client_still_records_the_machine() {
+        let got = Call::attributed(&json!({}), None).unwrap();
+        assert!(got.starts_with("mcp@"), "{got}");
     }
 }
