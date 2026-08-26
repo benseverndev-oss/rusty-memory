@@ -1,4 +1,4 @@
-# What this is, who it is for, and what has to be true before anyone can adopt it
+# What this is, what it grows into, and what has to be true before anyone can adopt it
 
 **Status:** proposed
 **Date:** 2026-08-26
@@ -30,11 +30,51 @@ that it happened. Ask one whether someone has an employer and it will tell you.
 Ask this one and it can say `Unknown` — nobody has ever discussed it — which is
 a different answer from `Absent`, and the difference is the product.
 
+## Where the idea has not reached yet
+
+A memory has boundaries: things come in, are stored, are identified, are
+related, are asked about, and are shared. The principle above is a claim about
+**all six**, and it currently holds at three of them.
+
+| boundary | crate | does it refuse to fabricate? |
+|---|---|---|
+| storage — competing values over time | `rm-survivor` | **yes.** Both kept, resolved at read time |
+| identity — is this the same thing? | `rm-resolve` | **yes.** The review band files a question |
+| query — what does it hold? | `rm-engine` | **yes.** Three states, not two |
+| input — what did that text assert? | `rm-extract` | **not yet.** Extraction asserts; it does not decline |
+| relations — how do these connect? | `rm-graph` | **not yet.** No edge has ever been written |
+| retrieval — is this near enough? | `rm-index` | **partly.** `weak_below` labels rather than filters, and is off by default because no cutoff transferred between corpora |
+
+This is the growth story, and it is why the dormant crates are not a backlog.
+`rm-extract` and `rm-graph` are the same idea not yet extended to the two
+boundaries where it would be most visible:
+
+- **An extractor that declines.** Reading prose and asserting what it found is
+  what every extractor does. One that marks a fact as *uncertain* rather than
+  asserting it — that files the ambiguous reading the way the resolver files an
+  ambiguous identity — is the thesis applied at the input boundary, where the
+  most fabrication enters.
+- **A graph with `Unknown` edges.** "Does A report to B?" has three answers, and
+  every graph store gives two. A relation that can be *asserted absent* — they
+  do not report to each other — separately from *never discussed* is the
+  clearest possible demonstration of the whole idea, because in a graph the gap
+  is visible as a missing line and reads as a fact.
+
+Neither is a distraction from the identity. They are the identity, at
+boundaries it has not been carried to yet. They are also, deliberately, **not
+next** — see the sequencing below.
+
 ## Who it is for
 
-**Rust developers building agents that need memory they can trust more than a
-summariser.** Specifically agents where a confidently wrong answer costs more
-than a missing one: anything touching people, money, records, or compliance.
+**Anyone building agents where a confidently wrong answer costs more than a
+missing one.** Anything touching people, money, records, or compliance.
+
+Reach is wider than the implementation language. The library is Rust, and Rust
+developers embed `rm-engine` directly. But the MCP server makes the same store
+reachable from **any agent that speaks MCP**, whatever it is written in, and
+that is the larger audience. Both are first-class and they need different
+things — crates.io, docs.rs and semver for one; an installable binary and a
+config that works first time for the other.
 
 And, sharpening it: **agents that share a store.** A single agent
 misremembering costs one bad turn. A shared store that fabricates propagates a
@@ -68,8 +108,8 @@ control: 382 answerable questions against **112 unanswerable** ones, whose
 premise the conversation does not support. Under the recall framing the 112 are
 noise. Under this identity they are the entire product.
 
-The asset to build is a benchmark that reports both axes, for this store and
-for the alternatives:
+The asset to build is a benchmark reporting both axes, for this store and for
+the alternatives:
 
 - **recall on the 382** — be honest here even if it is not best in class
 - **correct refusal on the 112** — the number the identity claims
@@ -79,10 +119,16 @@ that is a linkable, reproducible result, and it is the difference between "an
 interesting architecture" and "I should use this." If they refuse just as well,
 the positioning is wrong and better to know now.
 
-The README already contains a warning against overclaiming here, and it should
-be honoured: a cutoff tuned on LoCoMo marked a question with a perfect answer
-as having nothing near it. The benchmark measures refusal *behaviour*, not a
-tuned threshold, and the report says which is which.
+That last sentence is not a formality. The claim that summarise-and-dedupe
+architectures fabricate on unanswerable questions is an **inference from how
+they work, not a measurement**. It is the first thing the benchmark should
+test rather than assume.
+
+The evidence surface grows with the boundaries. Each row of the table above
+wants its own measurement, and two are already specified: the resolution corpus
+scores wrong merges at the identity boundary, and a wrong merge *is* a
+fabrication. An extractor that declines would need the same treatment — a
+labelled set where the right answer is "this text does not say."
 
 ## What is blocking adoption right now
 
@@ -93,45 +139,57 @@ all**, and that is a shorter list of fixable things:
    add` that works.
 2. **There is no facade.** Fifteen `rm-*` crates and no `rusty-memory` crate
    re-exporting a coherent surface. An adopter cannot tell which of them is the
-   public API, and picking wrong means depending on internals.
+   public API, and picking wrong means depending on internals. A facade is also
+   what lets the internals keep moving without breaking anyone — it is a
+   growth mechanism, not just a convenience.
 3. **The name `rusty-memory` is free on crates.io and should be claimed.** The
    binary name `rmem` is **already taken** by an unrelated 0.2.0 memory-usage
    CLI, so `cargo install rmem` installs someone else's tool. Shipping the
    binary from the `rusty-memory` crate works, but the collision on `PATH` is
    real and should be a deliberate choice rather than a surprise.
-4. **Two audiences are half-served.** Rust embedders need crates.io, docs.rs
-   and semver. MCP users need an installable binary and a config that works on
-   the first try. These are different distribution problems and neither is
-   finished.
-5. **"Status: early" with no stability story.** `rm-core` and `rm-survivor` are
+4. **"Status: early" with no stability story.** `rm-core` and `rm-survivor` are
    0.1 and additive-only. That is a good story and it is not told anywhere an
-   adopter would look.
+   adopter would look. Saying which crates are stable is what makes it safe to
+   change the ones that are not.
 
 MIT licensed, which is one thing that is not in the way.
 
-## What not to build for adoption
+## Sequencing, and what earns the next step
 
-**Extraction and the graph.** They serve the conversational-memory story, they
-are where the competition is strongest, and they are not the differentiator.
-`rm-extract` and `rm-graph` being dormant has read like a backlog; under this
-identity it is a scope decision, and `note` shipping ahead of them was the
-right instinct — deliberate records have a different quality bar from harvested
-ones.
+Order, with the reason each step waits for the one before it:
 
-**A recall leaderboard.** Winning on recall means competing on their axis with
-their metric. Report recall honestly; do not chase it.
-
-## Sequence
-
-1. **Prove the claim** — the two-axis benchmark. Until this exists, the
-   positioning is an assertion, and everything else is decoration on it.
+1. **Prove the claim** — the two-axis benchmark. Until this exists the
+   positioning is an assertion and everything else decorates it.
 2. **Make it installable** — facade crate, claim the name, publish, docs.rs.
+   The facade is what makes steps 4 and 5 possible without breaking adopters.
 3. **Rewrite the README around the differentiator** — lead with an `Unknown`
    that saves the reader, not with Acme to Globex. The current headline example
    describes a use case this store has never once served.
-4. **Then ergonomics** — the store-path fix and the tool-table cost, which are
-   already specced and planned.
+4. **Ergonomics** — the store-path fix and the tool-table cost, already specced
+   and planned.
+5. **Carry the principle to the remaining boundaries** — the graph first, then
+   extraction.
 
-The resolution corpus already specced serves step 1 from the other side: a
-wrong merge *is* a fabrication, and it is the first measurement of the honesty
-thesis anywhere in the repository.
+Steps 4 and 5 are not a prohibition on the dormant crates, and the earlier
+draft of this document was wrong to frame them as competitor turf. They are
+waiting on a trigger, and the triggers are nameable:
+
+- **The graph becomes next** when there is a real relational dataset in a
+  store and a question being asked of it that the attribute model answers
+  badly. Three-state edges are the best demonstration of the thesis available,
+  and building them before anything needs them would produce a demo rather than
+  a feature.
+- **Extraction becomes next** when the input boundary is the one letting
+  fabrication in — which will show up as records nobody meant to write. Today
+  the input boundary is `note` and `decide`, where a person or an agent asserts
+  something deliberately, and deliberate records have a different quality bar
+  from harvested ones.
+- **Recall work becomes next** if the benchmark shows recall is bad enough to
+  disqualify the store before anyone gets to the refusal number. Do not chase a
+  recall leaderboard otherwise: winning on their axis with their metric is not
+  what makes anyone switch.
+
+The discipline that keeps this from becoming a wishlist: **every step has to be
+the same principle at a new boundary, and has to be earned by evidence rather
+than by ambition.** A feature that does not refuse to fabricate something is
+not this project growing — it is this project becoming one of its competitors.
