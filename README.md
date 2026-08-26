@@ -401,6 +401,20 @@ to make on someone's behalf by their cloning a repo. See
 
 ## Where a store lives
 
+A relative `[store] path` is resolved against the directory holding the config
+file, not against wherever the command was run. That is what lets one
+`RMEM_CONFIG` be shared: a path resolved against the caller would name a
+different store for every caller, and two stores are not an error, so nothing
+would report it.
+
+It matters more than it looks, because a store that is not there is not
+refused — it starts empty. So the wrong path does not fail, it answers every
+question with "nothing known", which is indistinguishable from a store you
+have not written to yet. This once pointed two stores at one file and the tell
+was implausibly clean data rather than an error.
+
+`rmem init` writes an absolute path, so the rule only matters for configs
+written by hand or before this was true.
 Two files. `memory.json` holds everything the store remembers — assertions,
 identities, the review queue — and `memory.vec` holds the vectors, as a flat run
 of little-endian `f32` rows.
