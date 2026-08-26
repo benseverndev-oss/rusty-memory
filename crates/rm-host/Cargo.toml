@@ -1,12 +1,17 @@
 [package]
-name = "rm-host"
-version = "0.0.0"
+name = "rusty-memory-host"
+version.workspace = true
 description = "What a host of rusty-memory has to decide: config, store file, and the operations over them"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_host::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_host"
 
 [dependencies]
 rm-core = { workspace = true }

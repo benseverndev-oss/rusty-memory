@@ -1,12 +1,17 @@
 [package]
-name = "rm-graph"
-version = "0.1.0"
+name = "rusty-memory-graph"
+version.workspace = true
 description = "Deterministic k-hop traversal over rusty-memory's bi-temporal edges"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_graph::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_graph"
 
 [dependencies]
 rm-core = { workspace = true }

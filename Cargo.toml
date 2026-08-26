@@ -22,6 +22,7 @@ resolver = "2"
 exclude = ["benches/ann-bakeoff", "benches/locomo", "benches/read-cost"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -29,21 +30,21 @@ repository = "https://github.com/benseverndev-oss/rusty-memory"
 authors = ["rusty-memory contributors"]
 
 [workspace.dependencies]
-rm-core = { path = "crates/rm-core" }
-rm-survivor = { path = "crates/rm-survivor" }
-rm-store = { path = "crates/rm-store" }
-rm-resolve = { path = "crates/rm-resolve" }
-rm-index = { path = "crates/rm-index" }
-rm-engine = { path = "crates/rm-engine" }
-rm-graph = { path = "crates/rm-graph" }
-rm-extract = { path = "crates/rm-extract" }
-rm-providers = { path = "crates/rm-providers" }
-rm-embed = { path = "crates/rm-embed" }
-rm-host = { path = "crates/rm-host" }
-rm-cli = { path = "crates/rm-cli" }
-rm-mcp = { path = "crates/rm-mcp" }
-rm-conform = { path = "crates/rm-conform" }
-rm-contrast = { path = "crates/rm-contrast" }
+rm-core = { path = "crates/rm-core", version = "0.1.0", package = "rusty-memory-core" }
+rm-survivor = { path = "crates/rm-survivor", version = "0.1.0", package = "rusty-memory-survivor" }
+rm-store = { path = "crates/rm-store", version = "0.1.0", package = "rusty-memory-store" }
+rm-resolve = { path = "crates/rm-resolve", version = "0.1.0", package = "rusty-memory-resolve" }
+rm-index = { path = "crates/rm-index", version = "0.1.0", package = "rusty-memory-index" }
+rm-engine = { path = "crates/rm-engine", version = "0.1.0", package = "rusty-memory-engine" }
+rm-graph = { path = "crates/rm-graph", version = "0.1.0", package = "rusty-memory-graph" }
+rm-extract = { path = "crates/rm-extract", version = "0.1.0", package = "rusty-memory-extract" }
+rm-providers = { path = "crates/rm-providers", version = "0.1.0", package = "rusty-memory-providers" }
+rm-embed = { path = "crates/rm-embed", version = "0.1.0", package = "rusty-memory-embed" }
+rm-host = { path = "crates/rm-host", version = "0.1.0", package = "rusty-memory-host" }
+rm-cli = { path = "crates/rm-cli", version = "0.1.0", package = "rusty-memory-cli" }
+rm-mcp = { path = "crates/rm-mcp", version = "0.1.0", package = "rusty-memory-mcp" }
+rm-conform = { path = "crates/rm-conform", version = "0.1.0", package = "rusty-memory-conform" }
+rm-contrast = { path = "crates/rm-contrast", version = "0.1.0", package = "rusty-memory-contrast" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ureq = { version = "2", default-features = false, features = ["tls"] }

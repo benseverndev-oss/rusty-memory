@@ -1,12 +1,17 @@
 [package]
-name = "rm-survivor"
-version = "0.1.0"
+name = "rusty-memory-survivor"
+version.workspace = true
 description = "Survivorship rules for agent memory: deterministic resolution of conflicting facts"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_survivor::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_survivor"
 
 [dependencies]
 rm-core = { workspace = true }

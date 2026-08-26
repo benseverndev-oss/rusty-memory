@@ -1,12 +1,17 @@
 [package]
-name = "rm-embed"
-version = "0.1.0"
+name = "rusty-memory-embed"
+version.workspace = true
 description = "An Embedder that opens no socket and reads no model file. Subword hashing, written out."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_embed::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_embed"
 
 [dependencies]
 rm-engine = { workspace = true }

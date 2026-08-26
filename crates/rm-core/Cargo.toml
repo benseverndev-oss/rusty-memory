@@ -1,12 +1,17 @@
 [package]
-name = "rm-core"
-version = "0.1.0"
+name = "rusty-memory-core"
+version.workspace = true
 description = "Core types for rusty-memory: memories, provenance, and the temporal model"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_core::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_core"
 
 [dependencies]
 serde = { workspace = true }

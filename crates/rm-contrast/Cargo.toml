@@ -1,12 +1,18 @@
 [package]
-name = "rm-contrast"
-version = "0.0.0"
+name = "rusty-memory-contrast"
+version.workspace = true
 description = "Measures where bi-temporal answering beats a flat latest-wins store"
 edition.workspace = true
 rust-version.workspace = true
+publish = false
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_contrast::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_contrast"
 
 [dependencies]
 rm-core = { workspace = true }

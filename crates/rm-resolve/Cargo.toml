@@ -1,12 +1,17 @@
 [package]
-name = "rm-resolve"
-version = "0.1.0"
+name = "rusty-memory-resolve"
+version.workspace = true
 description = "Probabilistic entity resolution for agent memory, with an explicit review band"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_resolve::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_resolve"
 
 [dependencies]
 serde = { workspace = true }

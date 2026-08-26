@@ -1,6 +1,6 @@
 [package]
-name = "rm-cli"
-version = "0.0.0"
+name = "rusty-memory-cli"
+version.workspace = true
 description = "rmem: a command line over rusty-memory"
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,11 @@ authors.workspace = true
 [[bin]]
 name = "rmem"
 path = "src/main.rs"
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_cli::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_cli"
 
 [dependencies]
 rm-engine = { workspace = true }

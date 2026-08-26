@@ -1,12 +1,17 @@
 [package]
-name = "rm-providers"
-version = "0.0.0"
+name = "rusty-memory-providers"
+version.workspace = true
 description = "Completer and Embedder over an OpenAI-compatible API. The only crate here that opens a socket."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+
+# The package is namespaced for crates.io; the lib keeps the short name so
+# every `use rm_providers::...` -- including this crate's own tests -- is unchanged.
+[lib]
+name = "rm_providers"
 
 [dependencies]
 rm-engine = { workspace = true }
