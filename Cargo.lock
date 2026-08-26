@@ -271,155 +271,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rm-cli"
-version = "0.0.0"
-dependencies = [
- "rm-engine",
- "rm-host",
- "toml",
-]
-
-[[package]]
-name = "rm-conform"
-version = "0.0.0"
-dependencies = [
- "rm-core",
- "rm-embed",
- "rm-engine",
- "rm-host",
- "rm-index",
- "rm-resolve",
- "rm-survivor",
-]
-
-[[package]]
-name = "rm-contrast"
-version = "0.0.0"
-dependencies = [
- "rm-core",
- "rm-engine",
- "rm-index",
- "rm-resolve",
-]
-
-[[package]]
-name = "rm-core"
-version = "0.1.0"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "rm-embed"
-version = "0.1.0"
-dependencies = [
- "rm-engine",
-]
-
-[[package]]
-name = "rm-engine"
-version = "0.0.0"
-dependencies = [
- "rm-core",
- "rm-extract",
- "rm-graph",
- "rm-index",
- "rm-resolve",
- "rm-store",
- "rm-survivor",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rm-extract"
-version = "0.0.0"
-dependencies = [
- "rm-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rm-graph"
-version = "0.1.0"
-dependencies = [
- "rm-core",
- "rm-store",
-]
-
-[[package]]
-name = "rm-host"
-version = "0.0.0"
-dependencies = [
- "rm-core",
- "rm-embed",
- "rm-engine",
- "rm-extract",
- "rm-providers",
- "serde",
- "toml",
-]
-
-[[package]]
-name = "rm-index"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rm-mcp"
-version = "0.0.0"
-dependencies = [
- "rm-embed",
- "rm-engine",
- "rm-host",
- "serde_json",
-]
-
-[[package]]
-name = "rm-providers"
-version = "0.0.0"
-dependencies = [
- "rm-engine",
- "rm-extract",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "ureq",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "rm-resolve"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rm-store"
-version = "0.1.0"
-dependencies = [
- "rm-core",
- "rm-survivor",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "rm-survivor"
-version = "0.1.0"
-dependencies = [
- "rm-core",
- "serde",
-]
-
-[[package]]
 name = "rustls"
 version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -461,6 +312,163 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "untrusted",
+]
+
+[[package]]
+name = "rusty-memory"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-engine",
+ "rusty-memory-resolve",
+]
+
+[[package]]
+name = "rusty-memory-cli"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-engine",
+ "rusty-memory-host",
+ "toml",
+]
+
+[[package]]
+name = "rusty-memory-conform"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-core",
+ "rusty-memory-embed",
+ "rusty-memory-engine",
+ "rusty-memory-host",
+ "rusty-memory-index",
+ "rusty-memory-resolve",
+ "rusty-memory-survivor",
+]
+
+[[package]]
+name = "rusty-memory-contrast"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-core",
+ "rusty-memory-engine",
+ "rusty-memory-index",
+ "rusty-memory-resolve",
+]
+
+[[package]]
+name = "rusty-memory-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "rusty-memory-embed"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-engine",
+]
+
+[[package]]
+name = "rusty-memory-engine"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-core",
+ "rusty-memory-extract",
+ "rusty-memory-graph",
+ "rusty-memory-index",
+ "rusty-memory-resolve",
+ "rusty-memory-store",
+ "rusty-memory-survivor",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rusty-memory-extract"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rusty-memory-graph"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-core",
+ "rusty-memory-store",
+]
+
+[[package]]
+name = "rusty-memory-host"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-core",
+ "rusty-memory-embed",
+ "rusty-memory-engine",
+ "rusty-memory-extract",
+ "rusty-memory-providers",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "rusty-memory-index"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rusty-memory-mcp"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-embed",
+ "rusty-memory-engine",
+ "rusty-memory-host",
+ "serde_json",
+]
+
+[[package]]
+name = "rusty-memory-providers"
+version = "0.1.0"
+dependencies = [
+ "rustls",
+ "rustls-pemfile",
+ "rusty-memory-engine",
+ "rusty-memory-extract",
+ "serde",
+ "serde_json",
+ "ureq",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "rusty-memory-resolve"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rusty-memory-store"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-core",
+ "rusty-memory-survivor",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rusty-memory-survivor"
+version = "0.1.0"
+dependencies = [
+ "rusty-memory-core",
+ "serde",
 ]
 
 [[package]]
