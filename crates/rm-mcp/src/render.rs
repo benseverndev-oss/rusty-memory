@@ -356,6 +356,59 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }),
         },
 
+        Outcome::Noted {
+            entity,
+            attribute,
+            absent,
+            merged,
+            reviews,
+        } => Rendered {
+            text: {
+                let what = if *absent {
+                    format!("{attribute} recorded as absent")
+                } else {
+                    format!("{attribute} recorded")
+                };
+                let who = if *merged {
+                    format!("on entity {entity}, which the store already knew")
+                } else {
+                    format!("on entity {entity}, new")
+                };
+                // Reported, not swallowed: an agent that is not told the
+                // identity is uncertain will go on writing as though it
+                // were settled.
+                if reviews.is_empty() {
+                    format!("{what} {who}.")
+                } else {
+                    let open: Vec<String> = reviews
+                        .iter()
+                        .map(|r| {
+                            let other = if r.a == *entity { r.b } else { r.a };
+                            format!("entity {other} at {:.2} (review {})", r.score, r.id)
+                        })
+                        .collect();
+                    format!(
+                        "{what} {who}. It could not be told apart from {} -- the fact is recorded either way, and whose it is stays open for a person to settle.",
+                        open.join(", ")
+                    )
+                }
+            },
+            structured: json!({
+                "entity": entity.to_string(),
+                "attribute": attribute,
+                "absent": absent,
+                "merged": merged,
+                "open_questions": reviews
+                    .iter()
+                    .map(|r| json!({
+                        "review": r.id.to_string(),
+                        "other": if r.a == *entity { r.b } else { r.a }.to_string(),
+                        "score": r.score,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        },
+
         Outcome::Reindexed {
             assertions,
             dimension,
