@@ -12,6 +12,7 @@ use std::path::Path;
 use rm_engine::Timestamp;
 
 use crate::args::{parse, Command};
+use rm_host::attribution;
 use rm_host::command::{self, Outcome};
 use rm_host::config::{Config, InitConfig};
 use rm_host::store;
@@ -218,7 +219,7 @@ pub fn run(
                 Some(Planned::Remember(command::plan_remember(
                     text,
                     now,
-                    "cli",
+                    &attribution::cli(),
                     speaker.as_deref(),
                     &provider,
                     &provider,
@@ -250,7 +251,7 @@ pub fn run(
                     supersedes.as_deref(),
                     *decided_at,
                     now,
-                    "cli",
+                    &attribution::cli(),
                     &embedder,
                 )?))
             }
@@ -259,7 +260,11 @@ pub fn run(
                 // embedder, never a completion provider.
                 let embedder = config.embedder()?;
                 Some(Planned::Rescope(command::plan_rescope(
-                    title, scope, now, "cli", &embedder,
+                    title,
+                    scope,
+                    now,
+                    &attribution::cli(),
+                    &embedder,
                 )?))
             }
             // The review answers write, but they answer a question the
@@ -694,5 +699,24 @@ mod tests {
         assert_eq!(seen(Some("work/one")), 2, "both reach work/one");
         // And the rule still bites where a position is genuinely given.
         assert_eq!(seen(Some("elsewhere")), 1, "only the universal one");
+    }
+    /// A decision written through the CLI records who wrote it.
+    ///
+    /// Asserted against what `attribution::cli()` produces rather than
+    /// against anything the CLI prints: `decision` renders title, status,
+    /// choice, because and context and no provenance whatever, so a readback
+    /// through it would pass while the field stayed a constant. That is the
+    /// exact shape of the mistake that made this worth fixing.
+    #[test]
+    fn a_decision_records_an_author_rather_than_a_constant() {
+        let author = rm_host::attribution::cli();
+        assert!(
+            author != "cli",
+            "the bare constant is what this replaces: {author}"
+        );
+        assert!(
+            author.contains('@') || author.contains('/'),
+            "an author should name a machine or a session: {author}"
+        );
     }
 }
