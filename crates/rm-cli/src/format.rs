@@ -370,6 +370,47 @@ Every vector in this store now comes from one model.",
         Outcome::Confirmed { survivor } => {
             format!("merged — entity {survivor} survives")
         }
+        Outcome::Noted {
+            entity,
+            attribute,
+            absent,
+            merged,
+            reviews,
+        } => {
+            let what = if *absent {
+                format!("{attribute} recorded as absent")
+            } else {
+                format!("{attribute} recorded")
+            };
+            let who = if *merged {
+                format!("on entity {entity}, which the store already knew")
+            } else {
+                format!("on entity {entity}, new")
+            };
+            // The open questions are reported rather than swallowed. One
+            // nobody is told about is one nobody settles, and the engine's
+            // own position is that the fact is kept either way -- what is
+            // uncertain is only whose it is.
+            if reviews.is_empty() {
+                return format!("{what} {who}");
+            }
+            let open: Vec<String> = reviews
+                .iter()
+                .map(|r| {
+                    let other = if r.a == *entity { r.b } else { r.a };
+                    format!(
+                        "  scored {:.2} against entity {other}, inside the review band. `rmem review --confirm {}` says they are the same; `--reject {}` says they are not.",
+                        r.score, r.id, r.id
+                    )
+                })
+                .collect();
+            format!(
+                "{what} {who}\n\nopen question{}: the fact above is recorded either way -- what is open is only whose it is.\n{}",
+                if reviews.len() == 1 { "" } else { "s" },
+                open.join("\n")
+            )
+        }
+
         Outcome::Rejected => "kept apart, and not asked again".to_string(),
     }
 }

@@ -49,10 +49,10 @@ pub const SCOPE_ENV: &str = "RMEM_SCOPE";
 /// # Why a session should be able to ask for fewer
 ///
 /// The tool table is sent on every turn of every session that has this server
-/// configured, whether or not it is used. Measured: eight tools are about 1,700
-/// tokens, which is roughly what a thirty-decision log costs to read in full --
-/// so a project that only ever consults decisions pays a log's worth of context
-/// per turn to advertise five tools it will never call.
+/// configured, whether or not it is used. Measured: nine tools are about 2,600
+/// tokens, which is more than a thirty-decision log costs to read in full -- so
+/// a project that only ever consults decisions pays a log's worth of context
+/// per turn to advertise six tools it will never call.
 ///
 /// Names that match nothing are ignored rather than refused. This is read at
 /// startup on a path with no good way to report, and a server that will not
@@ -99,6 +99,51 @@ fn all_definitions() -> Vec<Value> {
                     }
                 },
                 "required": ["text"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "note",
+            "title": "Record a fact you already know",
+            "description": "Record a fact you already know about someone or something. Costs one embedding and no completion, unlike remember, which reads prose and works out what the facts are. Use this when you already know the fact and can name it: who it is about, what the attribute is called, and its value. \"who\" is a name, and the store decides whether that is someone it already knows -- if it cannot tell, the fact is still recorded and the identity question is queued for a person to settle. Set absent to assert there is no value, which is different from never having been asked: \"has no direct reports\" and \"nobody has said\" are different answers and this is the only way to record the first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "who": {
+                        "type": "string",
+                        "description": "Who or what the fact is about, by name. This is what the store scores against everyone it already knows."
+                    },
+                    "attribute": {
+                        "type": "string",
+                        "description": "What is being recorded, as a short name it can be asked about by later -- \"role\", \"team\", \"employer\"."
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "The value. Omit it and set absent instead to assert there is none."
+                    },
+                    "absent": {
+                        "type": "boolean",
+                        "description": "Assert that there is no value. Different from leaving the attribute unrecorded, which reads as never discussed."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "What sort of thing this is. Defaults to person."
+                    },
+                    "fields": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": "Extra identifying fields, like an email address. These describe WHO the subject is and are what the store compares to recognise them again -- not facts about them, which are attributes."
+                    },
+                    "valid_from": {
+                        "type": "string",
+                        "description": "The day this started being true, as YYYY-MM-DD, if that is not today. Sets when it held from, not when the store heard it."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "How far this fact reaches, if it is not true everywhere. Omit it for an ordinary fact about a person: with no scope it reaches every project, which is usually right."
+                    }
+                },
+                "required": ["who", "attribute"],
                 "additionalProperties": false
             }
         }),
@@ -327,6 +372,17 @@ pub enum Call {
         id: ReviewId,
         same: bool,
     },
+    Note {
+        who: String,
+        kind: String,
+        attribute: String,
+        /// `None` when `absent` was set: an asserted absence, not a gap.
+        value: Option<String>,
+        fields: Vec<(String, String)>,
+        valid_from: Option<Timestamp>,
+        scope: Option<String>,
+        session: String,
+    },
     Decide {
         title: String,
         choice: String,
@@ -475,6 +531,46 @@ impl Call {
                 valid_at: optional_instant(arguments, "valid_at")?,
                 as_of: optional_instant(arguments, "as_of")?,
             }),
+            "note" => {
+                let value = optional_string(arguments, "value")?;
+                let absent = arguments
+                    .get("absent")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                // Refused rather than resolved by precedence: they
+                // contradict each other, and guessing which was meant is how
+                // an asserted absence silently becomes a value.
+                if absent && value.is_some() {
+                    return Err(Unreadable::from(
+                        "a value and absent contradict each other: absent says there is no value, so do not also give one".to_string(),
+                    ));
+                }
+                if !absent && value.is_none() {
+                    return Err(Unreadable::from(
+                        "a note needs a value, or absent set to assert there is none".to_string(),
+                    ));
+                }
+                let fields = match arguments.get("fields").and_then(Value::as_object) {
+                    None => Vec::new(),
+                    Some(map) => map
+                        .iter()
+                        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string())))
+                        .collect(),
+                };
+                Ok(Call::Note {
+                    who: string(arguments, "who")?,
+                    kind: optional_string(arguments, "kind")?
+                        .unwrap_or_else(|| "person".to_string()),
+                    attribute: string(arguments, "attribute")?,
+                    value,
+                    fields,
+                    valid_from: optional_string(arguments, "valid_from")?
+                        .map(|d| rm_host::time::parse_day(&d))
+                        .transpose()?,
+                    scope: optional_string(arguments, "scope")?,
+                    session: Call::attributed(arguments, client)?,
+                })
+            }
             "decide" => Ok(Call::Decide {
                 title: string(arguments, "title")?,
                 choice: string(arguments, "choice")?,
@@ -506,7 +602,10 @@ impl Call {
     /// business touching.
     pub fn mutates(&self) -> bool {
         match self {
-            Call::Remember { .. } | Call::ResolveReview { .. } | Call::Decide { .. } => true,
+            Call::Remember { .. }
+            | Call::ResolveReview { .. }
+            | Call::Decide { .. }
+            | Call::Note { .. } => true,
             Call::Recall { .. }
             | Call::About { .. }
             | Call::Reviews
@@ -629,6 +728,10 @@ mod tests {
         // `required` list and check the call reads.
         let examples: Vec<(&str, Value)> = vec![
             ("remember", json!({"text": "I moved to Globex"})),
+            (
+                "note",
+                json!({"who": "Jon Severn", "attribute": "role", "value": "leads circ"}),
+            ),
             ("recall", json!({"query": "where do I work"})),
             ("about", json!({"entity": 0, "attribute": "employer"})),
             ("reviews", json!({})),
@@ -953,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn the_table_is_eight_tools_in_a_fixed_order_with_legal_names() {
+    fn the_table_is_nine_tools_in_a_fixed_order_with_legal_names() {
         // Deterministic ordering is what lets a client cache the list and
         // keeps the tool block stable in a model's prompt. The name rules are
         // the specification's: letters, digits, underscore, hyphen and dot.
@@ -965,6 +1068,7 @@ mod tests {
             names,
             [
                 "remember",
+                "note",
                 "recall",
                 "about",
                 "reviews",
@@ -1142,5 +1246,51 @@ mod tests {
     fn an_anonymous_client_still_records_the_machine() {
         let got = Call::attributed(&json!({}), None).unwrap();
         assert!(got.starts_with("mcp@"), "{got}");
+    }
+    /// The note tool reads its arguments, and an absence is a claim it can
+    /// express.
+    #[test]
+    fn the_note_tool_reads_who_what_and_an_absence() {
+        let Call::Note {
+            who,
+            attribute,
+            value,
+            ..
+        } = Call::read(
+            "note",
+            &json!({"who": "Jon Severn", "attribute": "role", "value": "leads circ"}),
+            Some("RM"),
+        )
+        .unwrap()
+        else {
+            panic!("expected Note")
+        };
+        assert_eq!(who, "Jon Severn");
+        assert_eq!(attribute, "role");
+        assert_eq!(value.as_deref(), Some("leads circ"));
+
+        let Call::Note { value, .. } = Call::read(
+            "note",
+            &json!({"who": "Jon", "attribute": "reports", "absent": true}),
+            Some("RM"),
+        )
+        .unwrap() else {
+            panic!("expected Note")
+        };
+        assert_eq!(value, None, "absent is an asserted absence, not a gap");
+    }
+
+    /// A value and `absent` contradict each other, and are refused rather than
+    /// resolved by precedence -- guessing which was meant is how an asserted
+    /// absence silently becomes a value.
+    #[test]
+    fn the_note_tool_refuses_a_value_and_an_absence_together() {
+        let err = Call::read(
+            "note",
+            &json!({"who": "Jon", "attribute": "reports", "value": "none", "absent": true}),
+            Some("RM"),
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("absent"), "{err:?}");
     }
 }

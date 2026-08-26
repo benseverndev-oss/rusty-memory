@@ -78,6 +78,22 @@ pub enum Outcome {
         /// project keeps finding.
         local: bool,
     },
+    /// A fact recorded about someone the store may or may not have known.
+    Noted {
+        entity: StableId,
+        attribute: String,
+        /// The fact asserted there is no value.
+        absent: bool,
+        /// It landed on an entity that already existed.
+        merged: bool,
+        /// Every pair it scored inside the review band against. A vector
+        /// rather than an option because one mention can be ambiguous against
+        /// several entities at once, and reporting only the first would hide
+        /// the rest. Empty is the ordinary case.
+        ///
+        /// The fact is recorded either way; what is open is only whose it is.
+        reviews: Vec<rm_engine::PendingReview>,
+    },
     Remembered {
         ingested: Ingested,
         landings: Vec<MentionLanding>,
@@ -746,6 +762,211 @@ pub struct DecidePlan {
     fields: Vec<FieldWrite>,
 }
 
+/// Everything [`commit_note`] will need from the embedder, and nothing else.
+///
+/// The same split [`DecidePlan`] makes and for the same reason: the
+/// embedding happens before the store's exclusive lock is taken, so a slow
+/// or failing embedder never holds it.
+#[derive(Debug)]
+pub struct NotePlan {
+    who: String,
+    kind: String,
+    attribute: String,
+    /// `None` is a tombstone -- an asserted absence, which is a claim and
+    /// not a gap. `rm_store` keeps the two apart and so does this.
+    value: Option<String>,
+    /// Extra mention fields. They reach the identity record, which is what
+    /// the resolver compares, and are written once per entity.
+    fields: Vec<(String, String)>,
+    valid_from: Timestamp,
+    observed_at: Timestamp,
+    session: String,
+    /// The scope and its embedding together, because a scope is a second
+    /// attribute and therefore a second vector -- taken here so the store's
+    /// lock is never held while an embedder is called.
+    scope: Option<(String, Vec<f32>)>,
+    embedding: Vec<f32>,
+}
+
+/// Record a fact someone already knows.
+///
+/// # No completer, stated as a type
+///
+/// This signature cannot name a `Completer`, which is the whole point:
+/// [`plan_remember`] takes one, so every fact in this store would have cost
+/// a completion call, and the cheapest way to record something you already
+/// knew was to write prose about it and pay a model to read the prose back.
+/// [`plan_decide`] made the opposite bargain for a decision; this makes it
+/// for a fact.
+///
+/// # `scope` is optional here and required by [`plan_decide`]
+///
+/// Not an inconsistency. An entity with no `scope` attribute already reaches
+/// every position, so omitting it is the correct answer rather than an unset
+/// field -- and a fact about a person is usually true whichever project the
+/// asker is standing in. `plan_decide` refuses without one because a
+/// decision's reach genuinely varies.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_note(
+    who: &str,
+    kind: &str,
+    attribute: &str,
+    value: Option<&str>,
+    fields: &[(String, String)],
+    valid_from: Option<Timestamp>,
+    observed_at: Timestamp,
+    session: &str,
+    scope: Option<&str>,
+    embedder: &impl Embedder,
+) -> Result<NotePlan, HostError> {
+    if who.trim().is_empty() {
+        return Err(HostError::Refused(
+            "a note needs to say who or what it is about: that name is how the store decides whether this is someone it already knows".into(),
+        ));
+    }
+    if attribute.trim().is_empty() {
+        return Err(HostError::Refused(
+            "a note needs an attribute: the name of the thing being recorded, so it can be asked about later".into(),
+        ));
+    }
+
+    // Before the embedder, so a typo costs nothing.
+    if let Some(scope) = scope {
+        crate::scope::validate(scope).map_err(HostError::Refused)?;
+    }
+
+    // One embedding, in the same shape `plan_decide` uses for a field.
+    let text = match value {
+        Some(v) => format!("{who}: {attribute} is {v}"),
+        None => format!("{who}: {attribute} is not set"),
+    };
+    let embedding = embedder
+        .embed(&text)
+        .map_err(|e| HostError::Refused(e.to_string()))?;
+
+    // A scope is a second attribute, so it needs its own vector -- taken
+    // here with the first, before the lock, rather than inside `commit_note`.
+    let scope = match scope {
+        Some(sc) => {
+            let v = embedder
+                .embed(&format!("{who}: scope is {sc}"))
+                .map_err(|e| HostError::Refused(e.to_string()))?;
+            Some((sc.to_string(), v))
+        }
+        None => None,
+    };
+
+    Ok(NotePlan {
+        who: who.trim().to_string(),
+        kind: kind.trim().to_string(),
+        attribute: attribute.trim().to_string(),
+        value: value.map(str::to_string),
+        fields: fields.to_vec(),
+        // Valid time defaults to when the store was told, which is the
+        // honest answer when nobody said otherwise.
+        valid_from: valid_from.unwrap_or(observed_at),
+        observed_at,
+        session: session.to_string(),
+        scope,
+        embedding,
+    })
+}
+
+/// Write the fact, resolving who it is about.
+///
+/// [`Engine::remember`], never `remember_as`. `remember_as` takes an entity
+/// the caller has already identified -- which is what `decide` does, and is
+/// why this store reached 265 entities with an empty review queue and a
+/// resolver that had never been asked to judge anything. Naming a person and
+/// letting the ruleset decide whether that is someone already known is the
+/// whole of what this adds.
+pub fn commit_note(engine: &mut Engine, plan: NotePlan) -> Result<Outcome, HostError> {
+    let NotePlan {
+        who,
+        kind,
+        attribute,
+        value,
+        fields,
+        valid_from,
+        observed_at,
+        session,
+        scope,
+        embedding,
+    } = plan;
+
+    let mut mention = Record::new()
+        .with("name", who.as_str())
+        .with("kind", kind.as_str());
+    for (k, v) in &fields {
+        mention = mention.with(k.as_str(), v.as_str());
+    }
+
+    let absent = value.is_none();
+    let observation = Observation {
+        kind: kind.clone(),
+        mention,
+        attribute: attribute.clone(),
+        value,
+        valid: Interval::since(valid_from),
+        provenance: Provenance::new(Source::UserAssertion, observed_at, session.clone()),
+        supersession: Supersession::Corrects,
+        embedding,
+    };
+
+    let remembered = engine
+        .remember(observation)
+        .map_err(|e| HostError::Refused(e.to_string()))?;
+
+    let (entity, merged, review_ids) = match remembered {
+        rm_engine::Remembered::Merged { entity, .. } => (entity, true, Vec::new()),
+        rm_engine::Remembered::Created { entity, .. } => (entity, false, Vec::new()),
+        rm_engine::Remembered::CreatedPendingReview { entity, review, .. } => {
+            (entity, false, review)
+        }
+    };
+
+    // The variant carries ids; a caller needs the pair and the score to say
+    // anything useful, and `pending_review` is where those live. Looked up
+    // here rather than left to the host, so both hosts report the same thing.
+    let reviews: Vec<rm_engine::PendingReview> = engine
+        .pending_review()
+        .into_iter()
+        .filter(|r| review_ids.contains(&r.id))
+        .cloned()
+        .collect();
+
+    // `remember_as`, not `remember`: the entity was identified by the fact
+    // above, and re-resolving the same mention would ask a question already
+    // answered -- and could answer it differently, leaving a fact on one
+    // entity and its scope on another.
+    if let Some((sc, scope_embedding)) = scope {
+        engine
+            .remember_as(
+                Some(entity),
+                Observation {
+                    kind: kind.clone(),
+                    mention: Record::new()
+                        .with("name", who.as_str())
+                        .with("kind", kind.as_str()),
+                    attribute: "scope".to_string(),
+                    value: Some(sc),
+                    valid: Interval::since(valid_from),
+                    provenance: Provenance::new(Source::UserAssertion, observed_at, session),
+                    supersession: Supersession::Corrects,
+                    embedding: scope_embedding,
+                },
+            )
+            .map_err(|e| HostError::Refused(e.to_string()))?;
+    }
+
+    Ok(Outcome::Noted {
+        entity,
+        attribute,
+        absent,
+        merged,
+        reviews,
+    })
+}
 /// The half of [`decide`] that talks to the embedder. No store, no lock.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_decide(
@@ -1490,6 +1711,7 @@ fn write_field(
 pub(crate) mod tests {
     use super::*;
     use crate::testing::TempDir;
+    use rm_embed::Hashed;
 
     #[test]
     fn init_writes_a_config_whose_dimension_came_from_the_model() {
@@ -1650,6 +1872,244 @@ pub(crate) mod tests {
         )
     }
 
+    // ---- a fact you already know -----------------------------------------
+    //
+    // These use `engine()`, which builds from the shipped TEMPLATE -- so the
+    // ruleset and its thresholds are the ones a real store uses. A test
+    // ruleset of its own would prove the resolver works on a ruleset nobody
+    // runs.
+
+    /// A name nobody has mentioned creates an entity.
+    #[test]
+    fn a_note_about_someone_new_creates_them() {
+        let mut e = engine();
+        let plan = plan_note(
+            "Jon Severn",
+            "person",
+            "role",
+            Some("leads circ"),
+            &[],
+            None,
+            100,
+            "test",
+            None,
+            &Hashed::new(3),
+        )
+        .unwrap();
+        let Outcome::Noted {
+            entity,
+            merged,
+            reviews,
+            ..
+        } = commit_note(&mut e, plan).unwrap()
+        else {
+            panic!("expected Noted")
+        };
+        assert!(!merged, "nothing was there to merge onto");
+        assert!(reviews.is_empty(), "{reviews:?}");
+        assert_eq!(
+            e.about(entity, "role", Timestamp::MAX, Timestamp::MAX)
+                .unwrap(),
+            Believed::Value("leads circ".into())
+        );
+    }
+
+    /// The same name again lands on the same entity rather than a second one.
+    ///
+    /// This is the resolver doing its job, and it is the first time anything
+    /// in this store has asked it to.
+    #[test]
+    fn a_second_note_about_the_same_name_joins_the_first() {
+        let mut e = engine();
+        let first = plan_note(
+            "Jon Severn",
+            "person",
+            "role",
+            Some("leads circ"),
+            &[],
+            None,
+            100,
+            "test",
+            None,
+            &Hashed::new(3),
+        )
+        .unwrap();
+        let Outcome::Noted { entity: a, .. } = commit_note(&mut e, first).unwrap() else {
+            panic!("expected Noted")
+        };
+
+        let second = plan_note(
+            "Jon Severn",
+            "person",
+            "team",
+            Some("circulation"),
+            &[],
+            None,
+            200,
+            "test",
+            None,
+            &Hashed::new(3),
+        )
+        .unwrap();
+        let Outcome::Noted {
+            entity: b, merged, ..
+        } = commit_note(&mut e, second).unwrap()
+        else {
+            panic!("expected Noted")
+        };
+
+        assert_eq!(a, b, "the same person twice is one entity");
+        assert!(merged, "and the second write should say so");
+        assert_eq!(e.entity_count(), 1);
+    }
+
+    /// `--absent` asserts there is no value, which is not the same as never
+    /// having been asked. The store's own instructions open with this
+    /// distinction and no write path could express it before.
+    #[test]
+    fn an_absence_is_asserted_rather_than_left_unknown() {
+        let mut e = engine();
+        let plan = plan_note(
+            "Jon Severn",
+            "person",
+            "reports",
+            None,
+            &[],
+            None,
+            100,
+            "test",
+            None,
+            &Hashed::new(3),
+        )
+        .unwrap();
+        let Outcome::Noted { entity, absent, .. } = commit_note(&mut e, plan).unwrap() else {
+            panic!("expected Noted")
+        };
+        assert!(absent);
+
+        // Asserted absence, and an attribute nobody mentioned. Two different
+        // answers, and collapsing them is the failure this guards.
+        assert_eq!(
+            e.about(entity, "reports", Timestamp::MAX, Timestamp::MAX)
+                .unwrap(),
+            Believed::Absent
+        );
+        assert_eq!(
+            e.about(entity, "spouse", Timestamp::MAX, Timestamp::MAX)
+                .unwrap(),
+            Believed::Unknown
+        );
+    }
+
+    /// `--valid-from` is valid time and only that: the store learned it now,
+    /// and it was true earlier.
+    #[test]
+    fn a_backdated_note_is_true_from_when_it_started_being_true() {
+        let mut e = engine();
+        let plan = plan_note(
+            "Jon Severn",
+            "person",
+            "role",
+            Some("leads circ"),
+            &[],
+            Some(50),
+            100,
+            "test",
+            None,
+            &Hashed::new(3),
+        )
+        .unwrap();
+        let Outcome::Noted { entity, .. } = commit_note(&mut e, plan).unwrap() else {
+            panic!("expected Noted")
+        };
+        // True at 60, which is before the store was told at 100.
+        assert_eq!(
+            e.about(entity, "role", 60, Timestamp::MAX).unwrap(),
+            Believed::Value("leads circ".into())
+        );
+    }
+
+    /// Mention fields reach the identity record, so a later ruleset can
+    /// compare them without every record being rewritten.
+    #[test]
+    fn a_mention_field_lands_on_the_identity_not_the_attributes() {
+        let mut e = engine();
+        let plan = plan_note(
+            "Jon Severn",
+            "person",
+            "role",
+            Some("leads circ"),
+            &[("email".to_string(), "j@example.com".to_string())],
+            None,
+            100,
+            "test",
+            None,
+            &Hashed::new(3),
+        )
+        .unwrap();
+        let Outcome::Noted { entity, .. } = commit_note(&mut e, plan).unwrap() else {
+            panic!("expected Noted")
+        };
+        let identity = e
+            .identity_of(entity)
+            .expect("a noted entity has an identity");
+        assert_eq!(identity.get("email"), Some("j@example.com"));
+        assert_eq!(identity.get("name"), Some("Jon Severn"));
+        // And it is not an attribute: `email` was never noted as one.
+        assert_eq!(
+            e.about(entity, "email", Timestamp::MAX, Timestamp::MAX)
+                .unwrap(),
+            Believed::Unknown
+        );
+    }
+
+    /// An empty name is refused before the embedder, so a typo costs nothing
+    /// -- the same bargain `plan_decide` makes.
+    #[test]
+    fn a_note_about_nobody_is_refused_before_it_costs_an_embedding() {
+        let err = plan_note(
+            "   ",
+            "person",
+            "role",
+            Some("x"),
+            &[],
+            None,
+            100,
+            "test",
+            None,
+            &Hashed::new(3),
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("who"), "{err}");
+    }
+
+    /// A scoped note reaches only where it says, and an unscoped one reaches
+    /// everywhere -- the same applicability rule the decision reads use.
+    #[test]
+    fn a_note_can_be_scoped_and_is_otherwise_everywhere() {
+        let mut e = engine();
+        let plan = plan_note(
+            "Jon Severn",
+            "person",
+            "oncall",
+            Some("tuesdays"),
+            &[],
+            None,
+            100,
+            "test",
+            Some("work/circ-tools"),
+            &Hashed::new(3),
+        )
+        .unwrap();
+        let Outcome::Noted { entity, .. } = commit_note(&mut e, plan).unwrap() else {
+            panic!("expected Noted")
+        };
+        assert_eq!(
+            e.about(entity, "scope", Timestamp::MAX, Timestamp::MAX)
+                .unwrap(),
+            Believed::Value("work/circ-tools".into())
+        );
+    }
     // ---- the lock and the network ------------------------------------------
 
     /// Can an exclusive lock on this store be taken right now?
