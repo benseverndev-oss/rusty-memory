@@ -29,6 +29,16 @@ use rm_engine::{Engine, Strategy};
 ///
 /// It is an anchor for where *that* store sits, not a claim about workloads in
 /// general -- it is two days old and was seeded once.
+/// # Overtaken, 2026-08-25
+///
+/// This was measured on a two-day-old store and was true of it. It stopped
+/// being true the same day: an afternoon of five sessions correcting each
+/// other's records took the store to `{1: 1238, 2: 17, 3: 1}`. Depth
+/// arrives when things are *corrected*, and nothing had been corrected yet.
+///
+/// Kept rather than bumped, because the number is a dated observation and
+/// not a setting. Run `benches/read-cost <store.json>` for the live figure;
+/// it reports drift against this constant rather than trusting either.
 pub const LIVE_STORE_DEPTH: usize = 1;
 
 /// Predicted **variable** work for one `about()` against a slot holding `v`

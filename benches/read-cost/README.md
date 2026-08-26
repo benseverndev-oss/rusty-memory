@@ -179,6 +179,36 @@ correction branch is **un-lived rather than untested** — `rm-conform`'s
 *rescope keeps its history* row rescopes an already-scoped decision across 60
 seeds and reports 1.000.
 
+### Falsified, the same day it was published
+
+**Depth 1 was an artefact of construction, and the mechanism was none of the
+ones guessed above.** Not age, and not recording habits. Depth arrives when
+people *correct* things, and a two-day-old store had not been corrected yet.
+
+One afternoon in which five sessions repaired each other's records took the
+store from 1,086 slots all at depth 1 to:
+
+```
+entities: 254   slots: 1256
+depth histogram: {1: 1238, 2: 17, 3: 1}
+```
+
+Eighteen slots deeper than one, and a depth-3, inside an hour. **Reads are not
+fixed-cost dominated in a store anybody maintains.**
+
+The distinction that matters for read cost, and which a histogram cannot carry:
+most of that depth is `scope` slots corrected by a metadata fix, but entities
+246 and 252 went to depth 2 on `choice` and `because` as well — genuine
+re-decisions rather than field repairs. "A field was corrected" and "the
+decision changed" cost the same to read and mean different things.
+
+The measurement in `benches/read-cost` is unaffected — it sweeps synthetic
+depth and never depended on this number. What is affected is the *conclusion*
+drawn from it: that the shipped-default question could be settled on
+correctness because cost was three orders of magnitude away. At depth 1 it was.
+Whether it stays that way is now an open question rather than a closed one, and
+`read-cost <store.json>` is how to keep asking it.
+
 ## The generator would lie if it were allowed to
 
 `merge` returns early when every assertion agrees
