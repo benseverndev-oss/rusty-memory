@@ -8,12 +8,14 @@ employer  no value — asserted to have none
 pets      nothing known — this was never discussed
 ```
 
-Three answers, not two. Memory systems for agents dedupe by embedding
-similarity and settle conflicts by asking a model to re-summarise; both
-operations are lossy and neither reports that it happened. Ask one whether
-someone has an employer and it will tell you. Ask this one and it can say it
-does not know — which is a different answer from "they have none", and the
-difference is the point.
+Three answers, not two. Memory systems for agents settle conflicts in
+different ways — mem0's pipeline decides per fact whether to add, update or
+delete it; Graphiti invalidates edges with temporal metadata; Letta keeps
+free-text blocks an agent rewrites. What none of them **documents** is a way to
+record that something was asserted *not* to be, distinctly from never having
+come up. Ask one whether someone has an employer and it will tell you. Ask this
+one and it can say it does not know — a different answer from "they have none",
+and the difference is the point.
 
 Measured on a corpus where all three answers are labelled by hand: 8/8/8, no
 fabrications. See [`docs/absence-benchmark.md`](docs/absence-benchmark.md),

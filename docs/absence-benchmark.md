@@ -93,6 +93,35 @@ Two things keep it honest:
   failure is the argument for a structural distinction, and it is stronger
   evidence than any assertion about one.
 
+## What the other systems document
+
+A documentation review, done 2026-08-26. **Not a measurement** — see the
+section below, which still stands.
+
+| system | how it settles conflicts | asserted-absent documented? |
+|---|---|---|
+| mem0 | a per-fact decision to `ADD`, `UPDATE`, `DELETE` or leave alone | no |
+| Graphiti / Zep | temporal edge invalidation, with lifecycle metadata on edges | no |
+| Letta / MemGPT | free-text memory blocks an agent rewrites | no |
+
+None of the three documents a way to record that something was asserted *not*
+to be, distinct from never having come up, or any three-valued answer. mem0's
+vocabulary is the clearest case: a negation resolves to `DELETE`, which leaves
+the store in the same state as never having been told.
+
+**This corrected an overstatement on the README's front page.** It had said
+these systems "settle conflicts by asking a model to re-summarise". That is
+fair to mem0 and Letta and wrong about Graphiti, whose own documentation
+contrasts its temporal edge invalidation with GraphRAG's "LLM-driven
+summarization judgments" — an approach genuinely adjacent to the bi-temporality
+here. The claim now names what each does and limits itself to what none of them
+documents.
+
+Two things this review cannot establish. Documentation omitting a capability is
+not proof the capability is absent, and none of these systems was run. The
+claim is therefore about what they *document*, and the README says so in those
+words.
+
 ## The competitive comparison has not been run
 
 The plan calls for a two-scenario demonstration against other memory systems:
