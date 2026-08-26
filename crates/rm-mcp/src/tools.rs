@@ -49,7 +49,7 @@ pub const SCOPE_ENV: &str = "RMEM_SCOPE";
 /// # Why a session should be able to ask for fewer
 ///
 /// The tool table is sent on every turn of every session that has this server
-/// configured, whether or not it is used. Measured: nine tools are about 2,600
+/// configured, whether or not it is used. Measured: nine tools are about 2,450
 /// tokens, which is more than a thirty-decision log costs to read in full -- so
 /// a project that only ever consults decisions pays a log's worth of context
 /// per turn to advertise six tools it will never call.
@@ -119,21 +119,21 @@ fn all_definitions() -> Vec<Value> {
         json!({
             "name": "note",
             "title": "Record a fact you already know",
-            "description": "Record a fact you already know about someone or something. Costs one embedding and no completion, unlike remember, which reads prose and works out what the facts are. Use this when you already know the fact and can name it: who it is about, what the attribute is called, and its value. \"who\" is a name, and the store decides whether that is someone it already knows -- if it cannot tell, the fact is still recorded and the identity question is queued for a person to settle. Set absent to assert there is no value, which is different from never having been asked: \"has no direct reports\" and \"nobody has said\" are different answers and this is the only way to record the first.",
+            "description": "Record a fact you already know about someone or something. Costs one embedding and no completion, unlike remember, which reads prose and works out what the facts are. If the store cannot tell whether the subject is someone it already knows, the fact is still recorded and the identity question is queued for a person. Set absent to assert there is no value: \"has no direct reports\" and \"nobody has said\" are different answers, and this is the only way to record the first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "who": {
                         "type": "string",
-                        "description": "Who or what the fact is about, by name. This is what the store scores against everyone it already knows."
+                        "description": "Who the fact is about -- what the store scores against everyone it already knows."
                     },
                     "attribute": {
                         "type": "string",
-                        "description": "What is being recorded, as a short name it can be asked about by later -- \"role\", \"team\", \"employer\"."
+                        "description": "What is being recorded, as a short name to ask about later: \"role\", \"team\", \"employer\"."
                     },
                     "value": {
                         "type": "string",
-                        "description": "The value. Omit it and set absent instead to assert there is none."
+                        "description": "The value."
                     },
                     "absent": {
                         "type": "boolean",
@@ -141,7 +141,8 @@ fn all_definitions() -> Vec<Value> {
                     },
                     "kind": {
                         "type": "string",
-                        "description": "What sort of thing this is. Defaults to person."
+                        "default": "person",
+                        "description": "What sort of thing this is."
                     },
                     "fields": {
                         "type": "object",
@@ -150,11 +151,12 @@ fn all_definitions() -> Vec<Value> {
                     },
                     "valid_from": {
                         "type": "string",
-                        "description": "The day this started being true, as YYYY-MM-DD, if that is not today. Sets when it held from, not when the store heard it."
+                        "format": "date",
+                        "description": "The day this started being true, if that is not today. Sets when it held from, not when the store heard it."
                     },
                     "scope": {
                         "type": "string",
-                        "description": "How far this fact reaches, if it is not true everywhere. Omit it for an ordinary fact about a person: with no scope it reaches every project, which is usually right."
+                        "description": "How far this fact reaches. Omit it for an ordinary fact about a person: with no scope it reaches every project, which is usually right."
                     }
                 },
                 "required": ["who", "attribute"],
@@ -228,7 +230,7 @@ fn all_definitions() -> Vec<Value> {
         json!({
             "name": "decide",
             "title": "Record a decision",
-            "description": "Record a decision so it can be found and cited later. Use this for choices with reasons behind them -- an approach taken, a library picked, a convention agreed -- not for ordinary facts, which belong in remember. Unlike remember this never guesses a shape: the title, choice, reason and context are stored under those exact names, so a decision stays findable and a later decision can retire it by title. Give a title you would search for. Record options you considered and turned down too, with status rejected and the reason in because -- a rejected option with its reason is what stops the same question being reopened later. If this replaces an earlier decision, name it in supersedes and the old one is marked retired.",
+            "description": "Record a decision so it can be found and cited later. Use this for choices with reasons behind them -- an approach taken, a library picked, a convention agreed -- not for ordinary facts, which belong in remember. Unlike remember this never guesses a shape: title, choice, reason and context are stored under those exact names, so a decision stays findable and a later one can retire it by title. Record options you turned down too: a rejected option with its reason is what stops the same question being reopened later.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -247,7 +249,8 @@ fn all_definitions() -> Vec<Value> {
                     "status": {
                         "type": "string",
                         "enum": ["proposed", "accepted", "rejected", "deprecated"],
-                        "description": "Where this decision stands. Defaults to accepted. Record an option you turned down as rejected, with the reason in because."
+                        "default": "accepted",
+                        "description": "Where this decision stands."
                     },
                     "because": {
                         "type": "string",
@@ -263,7 +266,8 @@ fn all_definitions() -> Vec<Value> {
                     },
                     "decided_at": {
                         "type": "string",
-                        "description": "The day it was made, as YYYY-MM-DD, if that is not today. Sets when it held from, not when the store heard it."
+                        "format": "date",
+                        "description": "The day it was made, if that is not today. Sets when it held from, not when the store heard it."
                     }
                 },
                 "required": ["title", "choice", "scope"],
@@ -1317,10 +1321,107 @@ mod tests {
     fn the_tool_table_is_the_size_the_documentation_says() {
         let chars = serde_json::to_string(&all_definitions()).unwrap().len();
         assert!(
-            (10_000..11_000).contains(&chars),
+            (9_300..10_300).contains(&chars),
             "the table is {chars} chars; update the README's row and the comment on `definitions` together"
         );
         let tokens = chars as f64 / CHARS_PER_TOKEN;
-        assert!((tokens - 2_600.0).abs() < 150.0, "~{tokens:.0} tokens");
+        assert!((tokens - 2_450.0).abs() < 150.0, "~{tokens:.0} tokens");
+    }
+    /// Measured 2026-08-26, before the prose edit that follows.
+    const EXPECTED_BYTES: &[(&str, usize)] = &[
+        ("remember", 788),
+        ("note", 1834),
+        ("recall", 1174),
+        ("about", 889),
+        ("reviews", 380),
+        ("decide", 1811),
+        ("decisions", 1188),
+        ("decision", 1194),
+        ("resolve_review", 492),
+    ];
+
+    /// Each tool's serialised size, so a description growing back shows up in
+    /// a diff rather than in a token bill a year later.
+    fn tool_bytes() -> Vec<(String, usize)> {
+        all_definitions()
+            .iter()
+            .map(|t| {
+                (
+                    t["name"].as_str().unwrap().to_string(),
+                    serde_json::to_string(t).unwrap().len(),
+                )
+            })
+            .collect()
+    }
+
+    /// Per-tool size, pinned.
+    ///
+    /// The band is generous: a reworded sentence must not fail this, a tool
+    /// appearing or vanishing must. The point is that prose which grows back
+    /// over a year is visible, not that any particular byte count is right.
+    #[test]
+    fn each_tool_is_about_the_size_it_was_measured_at() {
+        for &(name, was) in EXPECTED_BYTES {
+            let now = tool_bytes()
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} left the table"))
+                .1;
+            assert!(
+                (now as i64 - was as i64).abs() < 250,
+                "{name} is {now} bytes, was {was} -- update this and the README's row together"
+            );
+        }
+        assert_eq!(
+            tool_bytes().len(),
+            EXPECTED_BYTES.len(),
+            "a tool was added or removed without updating the sizes"
+        );
+    }
+    /// The table's sizes, for updating `EXPECTED_BYTES`, the README's row and
+    /// [`definitions`]' comment together after a prose edit.
+    ///
+    /// Ignored: it asserts nothing. Run it with
+    /// `cargo test -p rusty-memory-mcp --lib report_sizes -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn report_sizes() {
+        let mut total = 0;
+        for (name, bytes) in tool_bytes() {
+            total += bytes;
+            println!("        (\"{name}\", {bytes}),");
+        }
+        println!(
+            "total {total} chars, ~{:.0} tokens",
+            total as f64 / CHARS_PER_TOKEN
+        );
+    }
+    /// The sentences that are not fat.
+    ///
+    /// Each stops a specific wrong answer, and each survived the prose cut
+    /// that took this table from ~2,600 tokens to ~2,450. Asserted on the
+    /// wording that carries the *distinction*, not on a word that could
+    /// survive a rewrite which lost the meaning.
+    #[test]
+    fn the_distinctions_a_model_gets_wrong_without_are_still_stated() {
+        let table = serde_json::to_string(&all_definitions()).unwrap();
+        for phrase in [
+            // note versus remember: choosing wrong costs a completion call.
+            "unlike remember, which reads prose",
+            // absent versus never-asked, the store's central claim.
+            "nobody has said",
+            "reads as never discussed",
+            // scope is the field most often wrong.
+            "it reaches every project",
+            // identifying fields are compared; attributes are not.
+            "not facts about them, which are attributes",
+            // a rejected option with its reason is why a question stays shut.
+            "stops the same question being reopened",
+        ] {
+            assert!(
+                table.contains(phrase),
+                "the table stopped saying {phrase:?} -- a distinction was cut, not fat"
+            );
+        }
     }
 }
