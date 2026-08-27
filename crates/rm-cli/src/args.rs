@@ -52,6 +52,8 @@ rmem — a memory that resolves contradictions deterministically
     rmem review                      open questions the resolver could not answer
     rmem review confirm <id>         answer one: the same thing
     rmem review reject <id>          answer one: different things
+    rmem ingest <dir> [--dry-run]    read every .md under a directory into a
+                                     scratch store; --dry-run calls no model
     rmem note <who> <attr> <value>   record a fact; --absent asserts there is none
     rmem decide \"<title>\" \"<choice>\" --scope <s> [--because <why>]
                                      [--context <what prompted it>]
@@ -102,6 +104,13 @@ pub enum Command {
         /// Whose view this is, as an entity id. `None` records the
         /// store's own fact, which is what saying nothing asserts.
         according_to: Option<StableId>,
+    },
+    Ingest {
+        /// The directory to read. Every `.md` under it, recursively.
+        path: String,
+        /// Chunk and report without calling a model, so the cost of a
+        /// run is known before it is paid.
+        dry_run: bool,
     },
     Remember {
         text: String,
@@ -366,6 +375,21 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
             ))),
         },
 
+        "ingest" => {
+            // The first argument that is not a flag, rather than argument 1,
+            // so `--dry-run <dir>` works. Reading position 1 alone refused a
+            // directory that was sitting in the command line.
+            let Some(path) = args[1..].iter().find(|a| !a.starts_with("--")) else {
+                return Err(CliError::Usage(format!(
+                    "ingest needs a directory to read\n\n{USAGE}"
+                )));
+            };
+            Ok(Command::Ingest {
+                path: path.clone(),
+                dry_run: args.iter().any(|a| a == "--dry-run"),
+            })
+        }
+
         "note" => {
             // Positionals first, exactly as `decide` requires, so a flag
             // cannot be swallowed as a value.
@@ -547,6 +571,26 @@ mod tests {
 
     fn parse_args(args: &[&str]) -> Result<Command, CliError> {
         parse(args.iter().map(|s| s.to_string()))
+    }
+
+    /// The directory can come after the flag, because people type it that way.
+    ///
+    /// `ingest` read argument 1 and nothing else, so `--dry-run <dir>` was
+    /// refused with "ingest needs a directory to read" while the directory was
+    /// sitting right there. Every other flag in this parser is positional-
+    /// insensitive; this one silently was not.
+    #[test]
+    fn ingest_finds_its_directory_on_either_side_of_the_flag() {
+        for args in [
+            ["ingest", "docs", "--dry-run"],
+            ["ingest", "--dry-run", "docs"],
+        ] {
+            let Ok(Command::Ingest { path, dry_run }) = parse_args(&args) else {
+                panic!("{args:?} should parse")
+            };
+            assert_eq!(path, "docs", "{args:?} lost the directory");
+            assert!(dry_run, "{args:?} lost the flag");
+        }
     }
 
     /// `--at` is a day, and a day this cannot read is refused at the prompt.

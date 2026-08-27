@@ -111,6 +111,22 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }
         }
 
+        // Unreachable over MCP today -- ingest is a CLI command, and reading
+        // a tree from a model's turn would let it name any path on the host.
+        // Rendered because `Outcome` is public and a panic is not an answer.
+        Outcome::Ingested(read) | Outcome::Surveyed(read) => Rendered {
+            text: format!(
+                "{} chunks, {} read, {} unchanged, {} facts",
+                read.chunks_seen, read.chunks_read, read.chunks_skipped, read.facts
+            ),
+            structured: json!({
+                "chunks_seen": read.chunks_seen,
+                "chunks_read": read.chunks_read,
+                "chunks_skipped": read.chunks_skipped,
+                "facts": read.facts,
+            }),
+        },
+
         // The cheapest depth: what exists, so a caller can decide what is
         // worth reading before paying for it.
         Outcome::LocatedHits { hits } => Rendered {

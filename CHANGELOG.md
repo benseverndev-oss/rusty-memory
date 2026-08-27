@@ -1,5 +1,52 @@
 # Changelog
 
+## Unreleased
+
+### Reading documents
+
+`rmem ingest <dir>` reads every `.md` under a directory, splitting each on its
+own headings. A section is identified by path, heading path and a hash of its
+text, so a re-run reads only what changed. Sections that yielded nothing are
+still recorded as read: a store that remembers only what it wrote forgets it
+ever looked, which was measured at 21 sections in 30.
+
+`--dry-run` reports what a run would cost without calling anything. A deleted
+file writes nothing -- a section that disappeared is not an assertion that its
+subject has no value.
+
+Ingest writes to a scratch store only, refusing any store that holds a fact
+which did not come from a document. That stands until an extractor can decline
+a reading it is unsure of.
+
+### Extraction no longer returns its own example
+
+`extract` drops a mention whose name comes from the prompt's worked example
+when the turn does not contain that name, and reports the drop in `dropped`
+like any other. A model given text with nothing extractable in it answers with
+the example it was shown rather than with nothing: measured at 16 of 213 facts
+across arrow's API reference, all from sections as short as `Null type`.
+
+A turn that really does name Alex Chen or Globex is unaffected -- the guard is
+on the name being absent from the turn, never on the name itself.
+
+### A code fence is not a heading
+
+The chunker split on any line starting with `#`, which is a heading in prose
+and an attribute in Rust. `#[derive(Debug)]` became a heading and detached the
+rest of an item's documentation from the item it described. Fenced blocks are
+now passed over: 206 lines in this repository's own `docs/` were affected, and
+6% of documented items in `arrow-schema`.
+
+### Smaller
+
+- `rmem ingest --dry-run <dir>` works; the directory no longer has to be the
+  first argument.
+- A run survives one unusable response instead of discarding every completion
+  it had already paid for. Failed sections are named, counted separately from
+  read ones, and not marked read, so the next run retries exactly them.
+  Tolerance stops after five consecutive failures, which is a broken setup
+  rather than an unlucky one.
+
 ## 0.2.0
 
 **Breaking.** Three public signatures changed, so anything built against 0.1.0

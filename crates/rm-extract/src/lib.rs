@@ -425,6 +425,27 @@ pub(crate) fn unfenced(response: &str) -> &str {
     body.trim().strip_suffix("```").unwrap_or(body).trim()
 }
 
+/// Is this string the prompt's worked example rather than something the turn said?
+///
+/// Applied to a mention's name and to a fact's value, because the example
+/// offers both and a model copies whichever it reaches for.
+///
+/// True only when the name is one the prompt shows *and* the turn does not
+/// contain it. A model given a chunk with nothing extractable in it tends to
+/// answer with the example it was shown, and the resulting entity is a person
+/// who does not exist -- measured at 16 of 213 facts across arrow's API
+/// reference, from six chunks whose whole text was a line like "Null type".
+///
+/// The second half of the condition is what makes this safe. Someone who
+/// really does work at Globex is untouched, because their turn says so.
+fn echoes_the_example(name: &str, turn: &str) -> bool {
+    let name = name.trim();
+    crate::prompt::EXAMPLE_NAMES
+        .iter()
+        .any(|e| e.eq_ignore_ascii_case(name))
+        && !turn.to_lowercase().contains(&name.to_lowercase())
+}
+
 pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, ExtractError> {
     let response = completer.complete(&prompt(turn))?;
 
@@ -452,6 +473,17 @@ pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, Ex
                     what: "mention",
                     index: i,
                     why: "it has no name, and resolution matches on the name -- an entity without one can never be recognised again, so every later turn about it would create another".to_string(),
+                });
+            }
+            Ok(m) if echoes_the_example(&m.name, &turn.text) => {
+                slot.push(None);
+                out.dropped.push(Dropped {
+                    what: "mention",
+                    index: i,
+                    why: format!(
+                        "{:?} is a name from the prompt's own example and the turn does not contain it -- a turn with nothing in it draws the example back rather than an empty answer, and recording it would invent a person",
+                        m.name
+                    ),
                 });
             }
             Ok(m) => {
@@ -495,6 +527,18 @@ pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, Ex
                     continue;
                 }
             };
+        // The value, as well as the mention's name. The example offers both,
+        // and a model reaching for one is as likely to reach for the other:
+        // one fact survived a 322-chunk run as `employer = "Globex"` hung on a
+        // mention this guard had let through under a different spelling.
+        if let Some(v) = f.value.as_deref() {
+            if echoes_the_example(v, &turn.text) {
+                out.dropped.push(drop(format!(
+                    "its value {v:?} is from the prompt's own example and the turn does not contain it"
+                )));
+                continue;
+            }
+        }
         out.facts.push(Fact {
             subject,
             attribute: f.attribute,
@@ -1034,5 +1078,148 @@ mod tests {
                 out.dropped[0]
             );
         }
+    }
+    /// The prompt's own worked example is not a fact about the turn.
+    ///
+    /// A model given a chunk with nothing in it does not answer "nothing" -- it
+    /// answers with the example it was shown. Measured on arrow's API
+    /// reference: 16 of 213 facts were Alex Chen working at Globex, extracted
+    /// from six chunks whose whole text was a line like "Null type". For a
+    /// store whose entire claim is that it can tell you what it does not know,
+    /// inventing a person is the worst thing it can do.
+    ///
+    /// Guarded here rather than by rewording the prompt. Wording it away was
+    /// tried first and measured: the leak went to zero and so did the yield,
+    /// 37 facts to 0 on the same corpus, because the sentence that stops the
+    /// model copying an example also stops it reading a definition. This is
+    /// exact, costs nothing when the turn is real, and can be tested without a
+    /// network.
+    #[test]
+    fn the_prompts_own_example_is_not_a_fact_about_the_turn() {
+        let empty = Turn {
+            text: "Null type".to_string(),
+            speaker: None,
+            observed_at: NOW,
+            session: "session-1".to_string(),
+        };
+        let out = extract(
+            &empty,
+            &Canned(
+                r#"{"mentions":[
+                     {"kind":"person","name":"Alex Chen","text":"Alex"},
+                     {"kind":"organisation","name":"Globex","text":"Globex"}],
+                   "facts":[
+                     {"subject":0,"attribute":"employer","value":"Globex",
+                      "text":"Alex works at Globex","days_ago":null}],
+                   "relations":[
+                     {"subject":0,"predicate":"employed_by","object":1,"days_ago":null}],
+                   "closures":[]}"#,
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            out.mentions.is_empty(),
+            "the example was recorded as a mention: {:?}",
+            out.mentions
+        );
+        assert!(out.facts.is_empty(), "{:?}", out.facts);
+        assert!(out.relations.is_empty(), "{:?}", out.relations);
+        // Two mentions, plus the fact and the relation that pointed at them:
+        // nothing is discarded quietly, which is the whole point of `dropped`.
+        let by_example: Vec<&Dropped> = out
+            .dropped
+            .iter()
+            .filter(|d| d.why.contains("example"))
+            .collect();
+        assert_eq!(
+            by_example.len(),
+            2,
+            "the example drop was not reported: {:?}",
+            out.dropped
+        );
+        assert!(
+            by_example.iter().all(|d| d.what == "mention"),
+            "{by_example:?}"
+        );
+        assert_eq!(
+            out.dropped.len(),
+            4,
+            "the fact and relation that pointed at them went unreported: {:?}",
+            out.dropped
+        );
+    }
+
+    /// A turn that really does name one of them keeps it.
+    ///
+    /// The guard is worth nothing if it costs real facts. It fires on the name
+    /// being absent from the turn, never on the name itself -- so a person who
+    /// genuinely works at Globex is unaffected, and this is the test that says
+    /// so.
+    #[test]
+    fn an_example_name_the_turn_actually_uses_is_kept() {
+        let out = extract(
+            &turn(),
+            &Canned(
+                r#"{"mentions":[
+                     {"kind":"person","name":"Alex Chen","text":"Alex"},
+                     {"kind":"organisation","name":"Globex","text":"Globex"}],
+                   "facts":[
+                     {"subject":0,"attribute":"employer","value":"Globex",
+                      "text":"Alex works at Globex","days_ago":null}],
+                   "relations":[],"closures":[]}"#,
+            ),
+        )
+        .unwrap();
+
+        // "Globex" is in the turn, "Alex Chen" is not.
+        assert_eq!(out.mentions.len(), 1, "{:?}", out.mentions);
+        assert_eq!(out.mentions[0].name, "Globex");
+        assert!(
+            out.facts.is_empty(),
+            "a fact about a dropped mention survived: {:?}",
+            out.facts
+        );
+    }
+    /// An example value hung on a real mention is dropped too.
+    ///
+    /// This is the one that got through. The guard covered a mention's name, so
+    /// a 322-chunk run over arrow came back with one leaked fact instead of
+    /// sixteen: a mention the guard let through, carrying `employer = "Globex"`
+    /// from the example. A name-only guard turns a loud failure into a quiet
+    /// one, which is worse than the failure.
+    ///
+    /// The mention here is legitimate and stays. Only the value is the example.
+    #[test]
+    fn an_example_value_on_a_real_mention_is_dropped() {
+        let doc = Turn {
+            text: "BatchCoalescer concatenates small batches into larger ones".to_string(),
+            speaker: None,
+            observed_at: NOW,
+            session: "session-1".to_string(),
+        };
+        let out = extract(
+            &doc,
+            &Canned(
+                r#"{"mentions":[
+                     {"kind":"thing","name":"BatchCoalescer","text":"BatchCoalescer"}],
+                   "facts":[
+                     {"subject":0,"attribute":"employer","value":"Globex",
+                      "text":"BatchCoalescer works at Globex","days_ago":null}],
+                   "relations":[],"closures":[]}"#,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(out.mentions.len(), 1, "a real mention was thrown away");
+        assert_eq!(out.mentions[0].name, "BatchCoalescer");
+        assert!(
+            out.facts.is_empty(),
+            "the example's value was recorded as a fact: {:?}",
+            out.facts
+        );
+        assert_eq!(out.dropped.len(), 1, "{:?}", out.dropped);
+        assert_eq!(out.dropped[0].what, "fact");
+        assert!(out.dropped[0].why.contains("Globex"), "{:?}", out.dropped);
     }
 }

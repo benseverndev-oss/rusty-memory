@@ -595,6 +595,17 @@ impl MemoryStore {
     ///
     /// The audit trail. Empty for an unknown entity or attribute — asking about
     /// something never discussed is not an error.
+    /// Every entity, lowest id first.
+    ///
+    /// A read-only walk for callers that need to ask something of the whole
+    /// store rather than of one entity -- `Engine::source_refs` is the one
+    /// that needed it. Ordered because `entities` is a `BTreeMap`, which is
+    /// what makes snapshots diffable, and an unordered walk here would make
+    /// its callers' answers unstable for no gain.
+    pub fn entities(&self) -> impl Iterator<Item = &Entity> {
+        self.entities.values()
+    }
+
     pub fn history(&self, id: StableId, attribute: &str) -> &[Version] {
         self.entities
             .get(&id)

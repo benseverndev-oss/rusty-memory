@@ -6,6 +6,36 @@
 
 use crate::Turn;
 
+/// The names the prompt's worked example uses.
+///
+/// Here rather than in `lib.rs` so the guard that rejects them and the prompt
+/// that shows them cannot drift apart, and `the_example_names_are_the_ones_the_
+/// prompt_shows` fails if anyone edits one without the other.
+///
+/// They exist because a model handed a chunk with nothing in it does not answer
+/// "nothing" -- it answers with the example. Measured on arrow's API reference:
+/// 16 of 213 facts in the store were Alex Chen working at Globex, from six
+/// chunks whose entire text was a line like "Null type".
+///
+/// Every string the example offers, not just the names. `"Alex"` is the
+/// example's `text` rather than its `name`, and listing only the `name` let one
+/// fact survive a 322-chunk run: the model answered with `"name": "Alex"`.
+/// `the_guard_covers_every_name_the_example_offers` now derives the list from
+/// the example itself rather than trusting this to be complete.
+pub(crate) const EXAMPLE_NAMES: [&str; 3] = ["Alex Chen", "Alex", "Globex"];
+
+/// A turn that names the worked example, for the two tests that feed the
+/// example back through `extract`.
+///
+/// They check that the shape the prompt teaches is one the parser accepts. That
+/// is about shape, not content -- but `extract` also drops an example name the
+/// turn does not contain, because a model given nothing to read answers with
+/// the example. Feeding the example back under a turn saying "anything" trips
+/// that guard and the drift check stops testing drift. Naming them here keeps
+/// the two concerns apart.
+#[cfg(test)]
+const EXAMPLE_TURN: &str = "Alex Chen just started at Globex";
+
 /// The prompt for one turn.
 ///
 /// Public so a host can read it, log it, diff it across versions, or build a
@@ -336,7 +366,8 @@ mod tests {
         // forbid teaches the opposite of what the rules say. This is the same
         // failure the round-trip test below guards against, one level up.
         let p = prompt(&turn("anything", None));
-        let example = crate::extract(&turn("anything", None), &Echo).expect("the example extracts");
+        let example =
+            crate::extract(&turn(EXAMPLE_TURN, None), &Echo).expect("the example extracts");
         for mention in &example.mentions {
             assert!(
                 KINDS.contains(&mention.kind.as_str()),
@@ -456,7 +487,7 @@ mod tests {
         // time, a field of the wrong type no longer fails the document -- it
         // drops that item instead. So a renamed field would have shown up as a
         // silently empty extraction under the old assertion, and shows up here.
-        let out = crate::extract(&turn("anything", None), &Echo)
+        let out = crate::extract(&turn(EXAMPLE_TURN, None), &Echo)
             .expect("the prompt's own example must survive the parser it teaches");
 
         assert!(
@@ -500,7 +531,7 @@ mod tests {
         // is the drift the crate owning both exists to prevent, so the guard
         // has to be the same validation, not a weaker one that happens to
         // stand next to it.
-        let out = crate::extract(&turn("anything", None), &Echo)
+        let out = crate::extract(&turn(EXAMPLE_TURN, None), &Echo)
             .unwrap_or_else(|e| panic!("the prompt's own example must survive `extract`: {e}"));
 
         assert_eq!(out.mentions.len(), 2);
@@ -523,5 +554,52 @@ mod tests {
             lower.contains("ended") || lower.contains("no longer"),
             "the prompt has to say what a closure is for, not just name the field"
         );
+    }
+    /// Every name the example shows is one the guard knows about.
+    ///
+    /// This started as the weaker check that each guarded name appears in the
+    /// prompt, which cannot fail the way the guard actually failed: the example
+    /// carries `"name": "Alex Chen"` and `"text": "Alex"`, only the first was
+    /// listed, and a model answered with the second. One leaked fact survived a
+    /// 322-chunk run because of it.
+    ///
+    /// So the direction that matters is this one -- every string the example
+    /// offers a model to copy must be covered, not merely every string already
+    /// covered must be in the example.
+    #[test]
+    fn the_guard_covers_every_name_the_example_offers() {
+        let p = prompt(&turn("anything at all", None));
+        let example: serde_json::Value =
+            serde_json::from_str(example_json(&p)).expect("the example should be JSON");
+
+        let mut offered: Vec<String> = Vec::new();
+        for m in example["mentions"].as_array().into_iter().flatten() {
+            for key in ["name", "text"] {
+                if let Some(v) = m[key].as_str() {
+                    offered.push(v.to_string());
+                }
+            }
+        }
+        for f in example["facts"].as_array().into_iter().flatten() {
+            if let Some(v) = f["value"].as_str() {
+                offered.push(v.to_string());
+            }
+        }
+        assert!(!offered.is_empty(), "the example offered nothing to check");
+
+        for name in offered {
+            assert!(
+                EXAMPLE_NAMES.iter().any(|e| e.eq_ignore_ascii_case(&name)),
+                "the example offers {name:?} and the guard does not know it -- a model                  that copies the example will put it in the store"
+            );
+        }
+
+        // And the weaker direction too, so a stale entry is still caught.
+        for name in EXAMPLE_NAMES {
+            assert!(
+                p.contains(name),
+                "{name:?} is guarded against but no longer in the prompt"
+            );
+        }
     }
 }

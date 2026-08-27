@@ -15,6 +15,7 @@ use crate::args::{parse, Command};
 use rm_host::attribution;
 use rm_host::command::{self, Outcome};
 use rm_host::config::{Config, InitConfig};
+use rm_host::ingest;
 use rm_host::store;
 use rm_host::time::At;
 
@@ -172,6 +173,40 @@ pub fn run(
     // command has two. Folding it into the brackets below would mean either
     // holding a lock across the embeddings or opening the store twice inside
     // one, and both are the thing this file exists to avoid.
+    // Its own branch for the same reason `Reindex` has one: this reads the
+    // store, calls the network once per changed chunk, then writes. Folding it
+    // into the bracket below would hold the write lock across every one of
+    // those calls, which `command`'s own note records was measured to cap a
+    // live store at three concurrent writers.
+    if let Command::Ingest { path: dir, dry_run } = &command {
+        let (r, p2) = (config.ruleset()?, config.policy_for_engine()?);
+        let seen = store::with_read(&path, r, p2, dimension, metric, |engine| {
+            Ok(engine.read_sources().clone())
+        })?;
+        let root = std::path::Path::new(dir);
+
+        if *dry_run {
+            return Ok(Outcome::Surveyed(ingest::survey(&seen, root)?));
+        }
+
+        let provider = config.provider()?;
+        let plan = ingest::plan_tree(&seen, root, now, &provider, &provider, dimension, metric)?;
+
+        // Named on stderr, one line each, before anything is written. The
+        // summary line carries a count; a count alone does not tell you which
+        // chunk to go and look at, and these are chunks that were paid for.
+        // stderr rather than stdout so a run stays pipeable.
+        for line in &plan.failed {
+            eprintln!("could not read {line}");
+        }
+
+        let (r, p2) = (config.ruleset()?, config.policy_for_engine()?);
+        return store::with_write(&path, r, p2, dimension, metric, |engine| {
+            ingest::commit_tree(engine, plan).map(Outcome::Ingested)
+        })
+        .map_err(CliError::from);
+    }
+
     if matches!(command, Command::Reindex) {
         let (r, p2) = (config.ruleset()?, config.policy_for_engine()?);
         let texts = store::with_read(&path, r, p2, dimension, metric, |engine| {

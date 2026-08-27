@@ -313,6 +313,26 @@ impl Engine {
         )
     }
 
+    /// Every `provenance.source_ref` the store holds.
+    ///
+    /// A `BTreeSet` so the answer is stable across runs and diffable, and so
+    /// a caller asking "have I read this" pays a lookup rather than a scan
+    /// per question.
+    ///
+    /// Deliberately not an index. This is a walk over the store, and the
+    /// caller that needs it -- document ingest -- asks once per run rather
+    /// than once per chunk. An index would be a second copy of something
+    /// already stored, which is exactly the drift the design avoids by
+    /// putting the content hash in the source_ref in the first place.
+    pub fn source_refs(&self) -> std::collections::BTreeSet<String> {
+        self.store
+            .entities()
+            .flat_map(|e| e.attributes.values())
+            .flatten()
+            .map(|v| v.provenance.source_ref.clone())
+            .collect()
+    }
+
     /// Everyone who holds a view on an attribute, lowest id first.
     ///
     /// Deliberately a call rather than a fourth [`Believed`] variant. A

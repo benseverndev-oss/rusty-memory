@@ -185,6 +185,50 @@ It does not extract. `remember` reads prose and finds facts in it; `note`
 receives one someone decided to record. Both are useful and they have different
 failure modes.
 
+### Reading a tree of documents
+
+`rmem ingest` reads every `.md` under a directory, splitting each on its own
+headings and extracting from each section. What a fact came from is a string
+you can act on:
+
+```sh
+rmem ingest ./docs --dry-run
+```
+
+```
+534 chunks, 534 would be read, 0 unchanged -- nothing was called
+```
+
+That is 534 completions if you run it for real, which is why the dry run exists.
+Run it for real twice and the second one reads nothing. Each section is identified by its path, its
+heading path and a hash of its text, so an edited section is re-read and its
+unedited neighbours are not. Sections that produced no facts are still recorded
+as read -- a store that remembers only what it wrote would forget it had ever
+looked and pay for the same section on every run.
+
+`--dry-run` exists because the cost is one completion per changed section and
+you should be able to see the bill first. A deletion writes nothing: a section
+that disappeared is not an assertion that its subject has no value, it is a
+document that stopped saying something.
+
+**Be sceptical about what it is for.** Measured on this repository's own
+`docs/`, nine sections in thirty produced a fact -- correctly, because there is
+nothing to assert in an argument about why a threshold moved. The obvious
+conclusion was that reference documentation is the right shape instead, and
+measuring that overturned it: Apache Arrow's API reference produced a fact from
+**41 sections in 322**, and 80 open identity questions out of 114 entities,
+because `DataType::Float32` and `DataType::Float64` are similar by design and
+the resolver is built for people's names. `docs/ingest-findings.md` has the
+numbers.
+
+**It writes to a scratch store only.** Ingest refuses any store holding a fact
+that did not come from a document, and will keep refusing until an extractor
+can decline a reading it is unsure of. What happens without that is not
+hypothetical: pointing this at arrow's API reference put sixteen facts into a
+store about a person who does not exist, because a model given a section whose
+entire text is `Null type` answers with the example from its own prompt rather
+than with nothing. That particular hole is closed, and it is not the last one.
+
 ### The embedder is a choice you can now change your mind about
 
 The store keeps a value, an interval and a provenance. The text that was
