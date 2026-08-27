@@ -93,6 +93,108 @@ Two things keep it honest:
   failure is the argument for a structural distinction, and it is stronger
   evidence than any assertion about one.
 
+## The two-scenario comparison, run
+
+**Measured 2026-08-26** against mem0 2.0.19, open source, `gpt-4o-mini` and
+`text-embedding-3-small` — the same model this project's own template names,
+so neither side gets a better one. Harness and verbatim output in
+`docs/comparison/`.
+
+Two conversations identical but for one sentence. **A**: the speaker says they
+have no partner. **B**: partners never come up. Both asked the same question.
+
+| | mem0 | rusty-memory |
+|---|---|---|
+| **A** | `"User is not married and does not have a partner."` @ **0.6356** | `Absent` — "no value, asserted to have none" |
+| **B** | three unrelated memories @ 0.1952, 0.1725, 0.1117 | `Unknown` — "nothing known, this was never discussed" |
+
+### This falsified what was written here before
+
+An earlier version of this document, and the README's first paragraph, said
+mem0 could not represent a stated absence — reasoning from its documented
+`ADD`/`UPDATE`/`DELETE` vocabulary that a negation resolves to a delete and
+leaves the store as if nothing had been said.
+
+**That was wrong.** mem0 stores the negation and retrieves it. The inference
+was from documentation, and running it took twenty minutes.
+
+### What the difference actually is
+
+Both systems keep the distinction. They differ in what the caller receives.
+
+mem0 returns content and a relevance score, and the caller decides what 0.19
+means. Note that scenario B is not empty — it returns three memories, all
+about employment and cycling. Nothing in the response says "this was never
+discussed"; that has to be inferred from the numbers.
+
+That inference is the thing this project has already measured and rejected.
+On LoCoMo's 382 answerable against 112 unanswerable questions, the best
+score-based signal reached Youden's J = 0.494, keeping 90% of answerable
+questions meant refusing only 36.6% of unanswerable ones, and a cutoff taken
+from that table marked a question with a perfect answer as a miss on a
+different corpus. `weak_below` ships at `0.0` because of it.
+
+So the claim that survives measurement is narrower than the one that preceded
+it, and more specific: **not that others lose the information, but that they
+return a score where this returns an answer.**
+
+### What was not run
+
+Graphiti/Zep and Letta were not measured — Graphiti needs a graph database
+standing up, and neither was necessary to correct the claim that was wrong.
+The documentation review below still stands for those two, with its own limits.
+
+### What the other systems document
+
+A documentation review, 2026-08-26. **Not a measurement**, and the mem0 row is
+the cautionary case: its documentation supported an inference that running it
+disproved.
+
+| system | how it settles conflicts | three-valued answer documented? |
+|---|---|---|
+| mem0 | a per-fact decision to `ADD`, `UPDATE`, `DELETE` or leave alone | no — but it does retain a negation, see above |
+| Graphiti / Zep | temporal edge invalidation, with lifecycle metadata on edges | no |
+| Letta / MemGPT | free-text memory blocks an agent rewrites | no |
+
+Documentation omitting a capability is not proof the capability is absent.
+That is not a caveat added for balance; it is what happened.
+## What this measures, and what it does not
+
+**It measures** whether the store returns the right one of three answers on a
+corpus where all three are labelled, through `Engine::about` and nothing else.
+No `recall`, no vector threshold, no `weak_below` — the claim is structural, an
+assertion exists or it does not, and measuring it through a probabilistic path
+would reintroduce the mechanism `benches/locomo` already tried and rejected.
+
+**It does not measure** retrieval, recall, or whether this memory is better
+than another. The corpus is synthetic, purpose-built, and eight cases deep.
+That a system handles a known-hard distinction is a smaller claim than that it
+works well.
+
+## The benchmark is designed around a distinction only this system makes
+
+Said plainly, because a reader who works it out unaided will discount
+everything else here.
+
+Competitors do not score badly on this axis. **They cannot be scored on it**,
+having no third state to return. A benchmark whose metric only one system can
+express is not a fair comparison and is not offered as one.
+
+Two things keep it honest:
+
+- **Recall is reported on the axis where comparison *is* fair.** `benches/locomo`
+  scores retrieval against evidence turn ids on the corpus others benchmark on.
+  A store that cannot retrieve is not saved by knowing what it does not know,
+  and that number is published whether or not it flatters.
+- **The prior negative result is cited rather than buried.** A score-based
+  refusal was tried here first: six candidate signals scored by Youden's J
+  against LoCoMo's 382 answerable and 112 unanswerable questions, best J =
+  0.494 on the raw top score. The trade was bad — keeping 90% of answerable
+  questions refuses only 36.6% of unanswerable ones — and the cutoff did not
+  transfer to another corpus, so `weak_below` ships off by default. That
+  failure is the argument for a structural distinction, and it is stronger
+  evidence than any assertion about one.
+
 ## What the other systems document
 
 A documentation review, done 2026-08-26. **Not a measurement** — see the
