@@ -42,7 +42,7 @@ related, are asked about, and are shared. The principle above is a claim about
 | identity — is this the same thing? | `rm-resolve` | **yes.** The review band files a question |
 | query — what does it hold? | `rm-engine` | **yes.** Three states, not two |
 | sharing — whose view is this? | `rm-engine` | **yes.** A holder's assertions are their own slot, and disagreement is kept rather than settled by arrival |
-| input — what did that text assert? | `rm-extract` | **not yet.** Extraction asserts; it does not decline |
+| input — what did that text assert? | `rm-extract` | **partly.** It refuses two fabrications it can name — its own prompt's example, and an absence read out of a document — but still asserts every reading it is unsure of rather than filing it |
 | relations — how do these connect? | `rm-graph` | **not yet.** No edge has ever been written |
 | retrieval — is this near enough? | `rm-index` | **partly.** `weak_below` labels rather than filters, and is off by default because no cutoff transferred between corpora |
 
@@ -139,25 +139,40 @@ labelled set where the right answer is "this text does not say."
 
 ## What is blocking adoption right now
 
-Positioning is not the binding constraint. **The library cannot be adopted at
-all**, and that is a shorter list of fixable things:
+The first three items on this list were the binding constraint and are now
+done: `rusty-memory` is claimed and published, the facade exists and is the
+crate an adopter depends on, and `cargo add rusty-memory` works. Fourteen
+crates are on crates.io at 0.1.0; `rm-conform` and `rm-contrast` are in the
+workspace and not published, which is fine while nothing public depends on
+them and worth knowing before anything does.
 
-1. **Nothing is published.** Most crates are at `0.0.0`. There is no `cargo
-   add` that works.
-2. **There is no facade.** Fifteen `rm-*` crates and no `rusty-memory` crate
-   re-exporting a coherent surface. An adopter cannot tell which of them is the
-   public API, and picking wrong means depending on internals. A facade is also
-   what lets the internals keep moving without breaking anyone — it is a
-   growth mechanism, not just a convenience.
-3. **The name `rusty-memory` is free on crates.io and should be claimed.** The
-   binary name `rmem` is **already taken** by an unrelated 0.2.0 memory-usage
-   CLI, so `cargo install rmem` installs someone else's tool. Shipping the
-   binary from the `rusty-memory` crate works, but the collision on `PATH` is
-   real and should be a deliberate choice rather than a surprise.
-4. **"Status: early" with no stability story.** `rm-core` and `rm-survivor` are
-   0.1 and additive-only. That is a good story and it is not told anywhere an
-   adopter would look. Saying which crates are stable is what makes it safe to
-   change the ones that are not.
+What is left is smaller and one of it is worse than it looks:
+
+1. **The published crate is a release behind the documentation.** crates.io has
+   0.1.0; the repository is 0.2.0 and unpublished. Every feature added since —
+   holder-scoped assertions, recall depths, `rmem ingest` — is documented in a
+   README that an adopter reads before installing a crate that does not have
+   them. Until 2026-08-27 that README also told them to depend on `= "0.2"`,
+   which does not resolve:
+
+   ```
+   error: failed to select a version for the requirement `rusty-memory = "^0.2"`
+   candidate versions found which didn't match: 0.1.0
+   ```
+
+   A first command that errors is a worse front page than any wording. Publish
+   0.2.0, or keep the README to what is installable — the second is now done
+   and the first is the actual fix.
+
+2. **`cargo install rmem` installs someone else's tool.** The binary name is
+   taken by an unrelated memory-usage CLI. Shipping the binary from the
+   `rusty-memory` crate works, but the collision on `PATH` is real and should
+   be a deliberate choice rather than a surprise to whoever hits it.
+
+3. **"Status: early" with no stability story.** `rm-core` and `rm-survivor` are
+   additive-only. That is a good story and it is not told anywhere an adopter
+   would look. Saying which crates are stable is what makes it safe to change
+   the ones that are not.
 
 MIT licensed, which is one thing that is not in the way.
 
@@ -174,8 +189,10 @@ Order, with the reason each step waits for the one before it:
    describes a use case this store has never once served.
 4. **Ergonomics** — the store-path fix and the tool-table cost, already specced
    and planned.
-5. **Carry the principle to the remaining boundaries** — the graph first, then
-   extraction.
+5. **Carry the principle to the remaining boundaries** — extraction first now,
+   then the graph. That is a reversal: the graph led because nothing had yet
+   shown the input boundary letting fabrication through, and then reading a
+   corpus of documents did.
 
 Steps 4 and 5 are not a prohibition on the dormant crates, and the earlier
 draft of this document was wrong to frame them as competitor turf. They are
@@ -186,11 +203,22 @@ waiting on a trigger, and the triggers are nameable:
   badly. Three-state edges are the best demonstration of the thesis available,
   and building them before anything needs them would produce a demo rather than
   a feature.
-- **Extraction becomes next** when the input boundary is the one letting
-  fabrication in — which will show up as records nobody meant to write. Today
-  the input boundary is `note` and `decide`, where a person or an agent asserts
-  something deliberately, and deliberate records have a different quality bar
-  from harvested ones.
+- **Extraction is next. The trigger fired on 2026-08-27.** It was written as
+  "records nobody meant to write", and `rmem ingest` produced them at the first
+  attempt on a real corpus: 16 facts about a person who does not exist, copied
+  out of the extraction prompt's own worked example, and 9 facts asserting an
+  absence that no document had claimed. Both are fixed, and both were the
+  *nameable* half — a leak with a known string and a null with a known meaning.
+  What is left at this boundary is the half that has no tell, which is the
+  reading the model is unsure of and asserts anyway: 5 of 20 sampled facts were
+  worth keeping, and the rest were wrong subjects, category nouns standing in
+  for names, and confident restatements with the qualifier removed.
+
+  The clause that dated this — "today the input boundary is `note` and
+  `decide`, where a person or an agent asserts something deliberately" — is no
+  longer true. `ingest` harvests, and harvested records are exactly the ones
+  that clause said had the weaker quality bar. `docs/ingest-findings.md` has the
+  measurements.
 - **Recall work becomes next** if the benchmark shows recall is bad enough to
   disqualify the store before anyone gets to the refusal number. Do not chase a
   recall leaderboard otherwise: winning on their axis with their metric is not
