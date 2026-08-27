@@ -52,6 +52,8 @@ rmem — a memory that resolves contradictions deterministically
     rmem review                      open questions the resolver could not answer
     rmem review confirm <id>         answer one: the same thing
     rmem review reject <id>          answer one: different things
+    rmem ingest <dir> [--dry-run]    read every .md under a directory into a
+                                     scratch store; --dry-run calls no model
     rmem note <who> <attr> <value>   record a fact; --absent asserts there is none
     rmem decide \"<title>\" \"<choice>\" --scope <s> [--because <why>]
                                      [--context <what prompted it>]
@@ -102,6 +104,13 @@ pub enum Command {
         /// Whose view this is, as an entity id. `None` records the
         /// store's own fact, which is what saying nothing asserts.
         according_to: Option<StableId>,
+    },
+    Ingest {
+        /// The directory to read. Every `.md` under it, recursively.
+        path: String,
+        /// Chunk and report without calling a model, so the cost of a
+        /// run is known before it is paid.
+        dry_run: bool,
     },
     Remember {
         text: String,
@@ -365,6 +374,18 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                 "review takes nothing, or `confirm <id>`, or `reject <id>`\n\n{USAGE}"
             ))),
         },
+
+        "ingest" => {
+            let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+                return Err(CliError::Usage(format!(
+                    "ingest needs a directory to read\n\n{USAGE}"
+                )));
+            };
+            Ok(Command::Ingest {
+                path: path.clone(),
+                dry_run: args.iter().any(|a| a == "--dry-run"),
+            })
+        }
 
         "note" => {
             // Positionals first, exactly as `decide` requires, so a flag

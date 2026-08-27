@@ -92,7 +92,7 @@ pub fn source_ref(path: &str, chunk: &Chunk) -> String {
     format!("{path}#{}@{}", chunk.heading, chunk.hash)
 }
 
-/// What one document produced.
+/// What a run produced.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Read {
     pub chunks_seen: usize,
@@ -101,57 +101,146 @@ pub struct Read {
     pub facts: usize,
 }
 
-/// Read one document into the store.
+/// A chunk that has to be read, with its extraction already done.
+pub struct Planned {
+    pub source_ref: String,
+    plan: crate::command::RememberPlan,
+}
+
+/// Everything a run will write, and what it skipped getting there.
+pub struct Plan {
+    pub planned: Vec<Planned>,
+    pub seen: usize,
+    pub skipped: usize,
+}
+
+/// Extract every chunk the store has not already read.
 ///
-/// Each chunk becomes a turn with **no speaker**. A document has no first
-/// person, and `rm_extract`'s prompt says so explicitly rather than leaving a
-/// blank for the model to fill.
+/// # No store, on purpose
 ///
-/// Nothing is ever deleted. A chunk that has vanished since the last read is
-/// simply not seen, and what it once asserted goes on standing until something
-/// contradicts it. A removed sentence is not somebody saying "there is none" --
-/// writing a tombstone for it would manufacture absences at the rate documents
-/// get edited, in a store whose whole claim is that it does not.
-pub fn read_document(
-    engine: &mut Engine,
-    path: &str,
-    markdown: &str,
+/// This takes `seen` rather than an `Engine`, because every model call in this
+/// crate happens *above* the lock rather than inside it. `command`'s own note
+/// records why: extraction and embedding are seconds each across a network,
+/// `Lock::acquire` waits five seconds, and doing them under the lock was
+/// measured to cap a live store at three concurrent writers.
+///
+/// A tree makes that worse rather than differently: one run is one extraction
+/// per changed chunk, so holding the lock across them would hold it for
+/// minutes.
+pub fn plan_tree(
+    seen: &std::collections::BTreeSet<String>,
+    root: &std::path::Path,
     observed_at: Timestamp,
     completer: &impl Completer,
     embedder: &impl Embedder,
-) -> Result<Read, HostError> {
-    // Asked once per document rather than once per chunk: this is a walk over
-    // the store, and the answer cannot change while we are reading.
-    let seen = engine.source_refs();
-    let all = chunks(markdown);
-    let mut out = Read {
-        chunks_seen: all.len(),
-        ..Read::default()
+    dimension: usize,
+    metric: rm_engine::Metric,
+) -> Result<Plan, HostError> {
+    let mut files = Vec::new();
+    collect(root, &mut files)?;
+    // Sorted, so a run's order does not depend on how a filesystem happens to
+    // enumerate a directory.
+    files.sort();
+
+    let mut out = Plan {
+        planned: Vec::new(),
+        seen: 0,
+        skipped: 0,
     };
 
-    for chunk in &all {
-        let reference = source_ref(path, chunk);
-        // The hash is in the reference, so an unchanged chunk is one the store
-        // has already seen under exactly this name.
-        if seen.contains(&reference) {
-            out.chunks_skipped += 1;
-            continue;
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .map_err(|e| HostError::Refused(format!("could not read {}: {e}", file.display())))?;
+        let shown = file.to_string_lossy().replace('\\', "/");
+
+        for chunk in chunks(&text) {
+            out.seen += 1;
+            let reference = source_ref(&shown, &chunk);
+            // The hash is in the reference, so an unchanged chunk is one the
+            // store has already seen under exactly this name.
+            if seen.contains(&reference) {
+                out.skipped += 1;
+                continue;
+            }
+            let plan = crate::command::plan_remember(
+                &chunk.text,
+                observed_at,
+                &reference,
+                // A document has no first person, and rm-extract's prompt says
+                // so rather than leaving a blank for the model to fill.
+                None,
+                completer,
+                embedder,
+                dimension,
+                metric,
+            )?;
+            out.planned.push(Planned {
+                source_ref: reference,
+                plan,
+            });
         }
-        let outcome = crate::command::remember(
-            engine,
-            &chunk.text,
-            observed_at,
-            &reference,
-            None,
-            completer,
-            embedder,
-        )?;
+    }
+    Ok(out)
+}
+
+/// Write what [`plan_tree`] extracted.
+///
+/// # Refusing a store that is not a scratch one
+///
+/// Step 1 of `docs/superpowers/specs/2026-08-27-document-ingest-design.md`
+/// writes to a scratch store only, until an extractor can decline a reading it
+/// is unsure of. "Please point it somewhere scratch" is not a mechanism, so
+/// this refuses.
+///
+/// The check is deliberately crude: an ingested assertion's `source_ref`
+/// always carries an `@`, and nothing else in this workspace writes one. A
+/// single hand-written `note` is therefore enough to make ingest refuse, which
+/// is the direction this error should lean.
+///
+/// Nothing is ever deleted. A chunk that has vanished since the last read is
+/// simply not planned, and what it once asserted goes on standing until
+/// something contradicts it -- a removed sentence is not somebody saying
+/// "there is none".
+pub fn commit_tree(engine: &mut Engine, plan: Plan) -> Result<Read, HostError> {
+    if let Some(theirs) = engine.source_refs().iter().find(|r| !r.contains('@')) {
+        return Err(HostError::Refused(format!(
+            "this store holds facts that did not come from a document ({theirs:?}), so it is not a scratch store. Ingest writes to a scratch store only until an extractor can decline a reading it is unsure of -- point RMEM_CONFIG at a fresh store"
+        )));
+    }
+
+    let mut out = Read {
+        chunks_seen: plan.seen,
+        chunks_skipped: plan.skipped,
+        ..Read::default()
+    };
+    for Planned { plan, .. } in plan.planned {
+        let outcome = crate::command::commit_remember(engine, plan)?;
         out.chunks_read += 1;
         if let Outcome::Remembered { ingested, .. } = outcome {
             out.facts += ingested.assertions.len();
         }
     }
     Ok(out)
+}
+
+/// Every `.md` under a directory, recursively.
+///
+/// `read_dir` rather than a crate: one function's worth of recursion does not
+/// justify a dependency in a published library's tree.
+fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), HostError> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| HostError::Refused(format!("could not read {}: {e}", dir.display())))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| HostError::Refused(format!("could not read an entry: {e}")))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect(&path, out)?;
+        } else if path.extension().is_some_and(|e| e == "md") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -225,7 +314,8 @@ mod tests {
         let headings: Vec<&str> = out.iter().map(|c| c.heading.as_str()).collect();
         assert_eq!(headings, ["A", "A > B", "A > B > C", "A > D", "E"]);
     }
-    // ---- reading a document ---------------------------------------------
+
+    // ---- reading a tree --------------------------------------------------
 
     use rm_engine::{
         BlockingKey, Comparator, FieldRule, Metric, Policy, Ruleset, Strategy, VectorIndex,
@@ -248,16 +338,16 @@ mod tests {
     impl Completer for CountingCompleter {
         fn complete(&self, prompt: &str) -> Result<String, CompleterError> {
             self.calls.set(self.calls.get() + 1);
-            // One mention and one fact, named after whatever the chunk said, so
-            // two chunks do not collapse onto one entity.
-            let who = prompt
+            // Named after whatever the chunk said, so two chunks do not
+            // collapse onto one entity and hide a miscount.
+            let who: String = prompt
                 .lines()
-                .find(|l| l.contains("alpha") || l.contains("beta") || l.contains("Okta"))
+                .find(|l| l.contains("alpha") || l.contains("beta") || l.contains("gamma"))
                 .unwrap_or("someone")
                 .trim()
                 .chars()
-                .take(20)
-                .collect::<String>();
+                .take(12)
+                .collect();
             Ok(format!(
                 r#"{{"mentions":[{{"kind":"person","name":"{who}","text":"{who}"}}],"facts":[{{"subject":0,"attribute":"role","value":"noted","text":"{who} role"}}],"relations":[],"closures":[]}}"#
             ))
@@ -278,26 +368,57 @@ mod tests {
         )
     }
 
-    /// A second read of an unchanged document calls no model.
+    fn tree() -> crate::testing::TempDir {
+        let dir = crate::testing::TempDir::new();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("a.md"), "# A\n\nalpha\n").unwrap();
+        std::fs::write(dir.path().join("nested/b.md"), "# B\n\nbeta\n").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), "not markdown").unwrap();
+        dir
+    }
+
+    fn run(
+        e: &mut Engine,
+        dir: &std::path::Path,
+        at: Timestamp,
+        c: &CountingCompleter,
+    ) -> Result<Read, HostError> {
+        let emb = crate::testing::StubProvider::new(vec![]);
+        let plan = plan_tree(&e.source_refs(), dir, at, c, &emb, 3, Metric::Cosine)?;
+        commit_tree(e, plan)
+    }
+
+    /// A tree of markdown becomes facts, and nothing else does.
+    #[test]
+    fn a_tree_of_markdown_is_read_and_other_files_are_not() {
+        let dir = tree();
+        let mut e = doc_engine();
+        let c = CountingCompleter::default();
+
+        let out = run(&mut e, dir.path(), 100, &c).unwrap();
+        assert_eq!(out.chunks_seen, 2, "a non-markdown file was read");
+        assert_eq!(out.chunks_read, 2);
+        assert!(out.facts > 0);
+    }
+
+    /// A second run over an unchanged tree calls no model.
     ///
     /// The spec makes this the measurement that decides whether ingest ships:
     /// if it does not hold, ingest is a one-shot import rather than something
     /// runnable on a schedule.
     #[test]
-    fn re_reading_an_unchanged_document_calls_no_model() {
-        let doc = "# Roles\n\nRosalind owns the Okta setup.\n";
+    fn re_running_over_an_unchanged_tree_calls_no_model() {
+        let dir = tree();
         let mut e = doc_engine();
         let c = CountingCompleter::default();
-        let emb = crate::testing::StubProvider::new(vec![]);
 
-        let first = read_document(&mut e, "docs/team.md", doc, 100, &c, &emb).unwrap();
-        assert_eq!(first.chunks_read, 1);
+        run(&mut e, dir.path(), 100, &c).unwrap();
         let after_first = c.calls();
-        assert!(after_first > 0, "the first read called no model at all");
+        assert!(after_first > 0, "the first run called no model at all");
 
-        let second = read_document(&mut e, "docs/team.md", doc, 200, &c, &emb).unwrap();
-        assert_eq!(second.chunks_read, 0);
-        assert_eq!(second.chunks_skipped, 1);
+        let again = run(&mut e, dir.path(), 200, &c).unwrap();
+        assert_eq!(again.chunks_read, 0);
+        assert_eq!(again.chunks_skipped, 2);
         assert_eq!(
             c.calls(),
             after_first,
@@ -305,49 +426,103 @@ mod tests {
         );
     }
 
-    /// An edited section is read again; its unedited neighbours are not.
+    /// An edited file is read again; its unedited neighbours are not.
     #[test]
-    fn editing_one_section_re_reads_only_that_section() {
-        let before = "# A\n\nalpha\n\n# B\n\nbeta\n";
-        let after = "# A\n\nalpha\n\n# B\n\nbeta edited\n";
+    fn editing_one_file_re_reads_only_that_file() {
+        let dir = tree();
         let mut e = doc_engine();
         let c = CountingCompleter::default();
-        let emb = crate::testing::StubProvider::new(vec![]);
 
-        read_document(&mut e, "docs/x.md", before, 100, &c, &emb).unwrap();
+        run(&mut e, dir.path(), 100, &c).unwrap();
         let baseline = c.calls();
 
-        let out = read_document(&mut e, "docs/x.md", after, 200, &c, &emb).unwrap();
-        assert_eq!(out.chunks_read, 1, "both sections were re-read");
+        std::fs::write(dir.path().join("a.md"), "# A\n\ngamma\n").unwrap();
+        let out = run(&mut e, dir.path(), 200, &c).unwrap();
+        assert_eq!(out.chunks_read, 1, "both files were re-read");
         assert_eq!(out.chunks_skipped, 1);
         assert_eq!(c.calls(), baseline + 1);
     }
 
-    /// A section deleted from a document writes nothing.
+    /// Deleting a file writes nothing and calls nothing.
     ///
-    /// A removed sentence is not an assertion of absence: nobody said there is
-    /// none, the document simply stopped saying it. Writing a tombstone here
-    /// would manufacture absences at the rate documents get edited.
+    /// A removed section is not an assertion of absence: nobody said there is
+    /// none, the document simply stopped saying it. Tombstoning here would
+    /// manufacture absences at the rate documents get edited.
     #[test]
-    fn deleting_a_section_asserts_nothing() {
-        let before = "# A\n\nalpha\n\n# B\n\nbeta\n";
-        let after = "# A\n\nalpha\n";
+    fn deleting_a_file_asserts_nothing() {
+        let dir = tree();
         let mut e = doc_engine();
         let c = CountingCompleter::default();
-        let emb = crate::testing::StubProvider::new(vec![]);
 
-        read_document(&mut e, "docs/x.md", before, 100, &c, &emb).unwrap();
+        run(&mut e, dir.path(), 100, &c).unwrap();
         let sources_before = e.source_refs().len();
         let calls_before = c.calls();
 
-        let out = read_document(&mut e, "docs/x.md", after, 200, &c, &emb).unwrap();
-        assert_eq!(out.chunks_seen, 1, "the deleted section was still seen");
+        std::fs::remove_file(dir.path().join("a.md")).unwrap();
+        let out = run(&mut e, dir.path(), 200, &c).unwrap();
+        assert_eq!(out.chunks_seen, 1, "the deleted file was still seen");
         assert_eq!(out.chunks_read, 0);
         assert_eq!(
             e.source_refs().len(),
             sources_before,
-            "removing a section wrote something -- it must write nothing"
+            "removing a file wrote something -- it must write nothing"
         );
         assert_eq!(c.calls(), calls_before, "a deletion called the model");
+    }
+
+    /// Ingest refuses a store that holds anything it did not write.
+    ///
+    /// Step 1 of the spec exists to produce evidence without risking anything
+    /// permanent, and "please point it somewhere scratch" is not a mechanism.
+    #[test]
+    fn ingest_refuses_a_store_that_is_not_a_scratch_one() {
+        let dir = tree();
+        let mut e = doc_engine();
+        let c = CountingCompleter::default();
+
+        // A note: written by a person, so its source_ref carries no '@'.
+        e.remember(rm_engine::Observation {
+            kind: "person".into(),
+            mention: rm_engine::Record::new().with("name", "Jon Severn"),
+            attribute: "role".into(),
+            value: Some("leads circ".into()),
+            valid: rm_engine::Interval::since(100),
+            provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, 100, "cli"),
+            supersession: rm_engine::Supersession::Corrects,
+            according_to: None,
+            embedding: vec![1.0, 0.0, 0.0],
+        })
+        .unwrap();
+
+        let err = run(&mut e, dir.path(), 100, &c).unwrap_err();
+        assert!(format!("{err}").contains("scratch"), "{err}");
+    }
+
+    /// Planning needs no store at all.
+    ///
+    /// The type is the guarantee that every model call happens above the lock:
+    /// `plan_tree` cannot touch an `Engine` because it is not given one, and
+    /// `command`'s own note records why that matters -- extraction under the
+    /// lock was measured to cap a live store at three concurrent writers.
+    #[test]
+    fn planning_takes_no_engine_so_it_cannot_run_under_the_lock() {
+        let dir = tree();
+        let c = CountingCompleter::default();
+        let emb = crate::testing::StubProvider::new(vec![]);
+
+        let plan = plan_tree(
+            &std::collections::BTreeSet::new(),
+            dir.path(),
+            100,
+            &c,
+            &emb,
+            3,
+            Metric::Cosine,
+        )
+        .unwrap();
+
+        assert_eq!(plan.planned.len(), 2);
+        assert_eq!(plan.skipped, 0);
+        assert!(c.calls() > 0, "planning called no model");
     }
 }
