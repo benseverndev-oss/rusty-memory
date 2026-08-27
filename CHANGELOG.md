@@ -37,6 +37,11 @@ rest of an item's documentation from the item it described. Fenced blocks are
 now passed over: 206 lines in this repository's own `docs/` were affected, and
 6% of documented items in `arrow-schema`.
 
+The size of it is easier to see in the chunk count. `docs/` split into 705
+chunks before and 534 after, so **a quarter of what a run would have paid for
+was a spurious split on a line of code** -- and each one handed the model a
+fragment attached to the wrong subject.
+
 ### Smaller
 
 - `rmem ingest --dry-run <dir>` works; the directory no longer has to be the
