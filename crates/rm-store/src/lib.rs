@@ -394,6 +394,12 @@ impl MemoryStore {
     /// has to have an answer. [`Supersession::Unstated`] is a real answer --
     /// "this host does not know" -- and saying it explicitly is the difference
     /// between a caller that has considered the question and one that has not.
+    // Eight arguments, and clippy is right that this is too many. It is
+    // allowed rather than fixed because the fix is a parameter struct and
+    // that is a wider change than the one in hand -- every caller in the
+    // workspace moves with it. Recorded here so the next person to add an
+    // argument treats this as the second warning rather than the first.
+    #[allow(clippy::too_many_arguments)]
     pub fn assert(
         &mut self,
         id: StableId,
