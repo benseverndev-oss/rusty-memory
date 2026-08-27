@@ -668,6 +668,7 @@ pub fn about(
     valid_at: Option<Timestamp>,
     as_of: Option<Timestamp>,
     now: Timestamp,
+    according_to: Option<StableId>,
 ) -> Result<Outcome, HostError> {
     // Asked about a moment, under a strategy that has no moments. Refused
     // rather than warned, because a warning on stderr is a wrong answer with a
@@ -681,15 +682,26 @@ pub fn about(
             )));
         }
     }
-    engine
-        .about(
+    // Whose view, or the store's own. A holder-less read never returns a
+    // view and a holder's read never returns a fact, so these are two
+    // questions rather than one with a filter.
+    match according_to {
+        None => engine.about(
             entity,
             attribute,
             valid_at.unwrap_or(now),
             as_of.unwrap_or(now),
-        )
-        .map(Outcome::About)
-        .map_err(|e| HostError::Refused(e.to_string()))
+        ),
+        Some(holder) => engine.about_according_to(
+            entity,
+            attribute,
+            holder,
+            valid_at.unwrap_or(now),
+            as_of.unwrap_or(now),
+        ),
+    }
+    .map(Outcome::About)
+    .map_err(|e| HostError::Refused(e.to_string()))
 }
 
 /// What an entity currently says it is.
@@ -2956,6 +2968,7 @@ pub(crate) mod tests {
             None,
             Some(Timestamp::MAX),
             Timestamp::MAX,
+            None,
         )
         .unwrap() else {
             panic!("no choice on the re-decided entity")
@@ -3352,7 +3365,8 @@ pub(crate) mod tests {
         // dimension, so `held_at` returned the same value for every instant.
         // The test passed because the flag was ignored: a test endorsing the
         // defect rather than catching it.
-        let Err(HostError::Refused(why)) = about(&e, d.entity, "choice", Some(MARCH), None, AUGUST)
+        let Err(HostError::Refused(why)) =
+            about(&e, d.entity, "choice", Some(MARCH), None, AUGUST, None)
         else {
             panic!("a valid-time question under most_recent should be refused")
         };
@@ -3362,7 +3376,7 @@ pub(crate) mod tests {
         // store did not know this in March, so asking what it believed then
         // gives the answer it would have given then, which is nothing.
         assert_eq!(
-            about(&e, d.entity, "choice", None, Some(MARCH), MARCH).unwrap(),
+            about(&e, d.entity, "choice", None, Some(MARCH), MARCH, None).unwrap(),
             Outcome::About(Believed::Unknown),
             "backdating must not rewrite what the store knew when"
         );
@@ -3386,7 +3400,7 @@ pub(crate) mod tests {
         };
         assert_eq!(d.history[0].0, NOW);
         assert_eq!(
-            about(&e, d.entity, "choice", None, Some(NOW), NOW).unwrap(),
+            about(&e, d.entity, "choice", None, Some(NOW), NOW, None).unwrap(),
             Outcome::About(Believed::Value("a choice".into()))
         );
     }
@@ -4002,7 +4016,16 @@ pub(crate) mod tests {
             panic!()
         };
 
-        let out = about(&e, ingested.entities[0], "spouse", None, Some(1000), 1000).unwrap();
+        let out = about(
+            &e,
+            ingested.entities[0],
+            "spouse",
+            None,
+            Some(1000),
+            1000,
+            None,
+        )
+        .unwrap();
         assert_eq!(out, Outcome::About(rm_engine::Believed::Unknown));
     }
 

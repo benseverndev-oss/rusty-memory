@@ -34,8 +34,10 @@ settled at write time, and two entities that score too close to call are filed
 as a question rather than merged. Entity resolution and survivorship — solved
 problems in master data management — applied to agent memory.
 
-Status: early. See [`docs/architecture-sketch.md`](docs/architecture-sketch.md)
-for the design and what is planned.
+Status: early, and published — `rusty-memory = "0.2"`. See
+[`docs/positioning.md`](docs/positioning.md) for what this is and what it is
+not, and [`docs/architecture-sketch.md`](docs/architecture-sketch.md) for the
+original design reasoning, which is now historical.
 
 ## Why it is different
 

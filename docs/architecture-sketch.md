@@ -1,6 +1,26 @@
 # rusty-memory — architecture sketch
 
-Status: design sketch, pre-implementation. Nothing here is built yet.
+> **Historical. Written before any of this existed; kept for the reasoning,
+> not as a description of the code.**
+>
+> Everything in *What has to be built* below is built. Attribute history,
+> survivorship with the refused strategies, entity resolution with a review
+> band, and the vector index all ship, and the crate layout it proposes is
+> the one in `crates/`. The pitch it argues for — *"agent memory that
+> resolves contradictions deterministically"* — has since been narrowed:
+> versioned facts turned out to be the least distinctive third of the idea,
+> and the claim is now that the store declines to produce a confident answer
+> it has not earned. See `docs/positioning.md`.
+>
+> Three things it did not anticipate. `note` — a write path costing one
+> embedding and no completion, because requiring a completion per fact is
+> why extraction, resolution and the graph sat unused. Holders — an
+> assertion can say whose view it is, so two people disagreeing is not a
+> contradiction to resolve. And recall depths, which let a caller pay for
+> what it asked for.
+>
+> For what is measured rather than intended: `docs/absence-benchmark.md`,
+> `docs/tiering-cost.md`, and the corpora under `crates/*/tests/`.
 
 ## Thesis
 

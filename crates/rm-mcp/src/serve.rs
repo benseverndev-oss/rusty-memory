@@ -601,7 +601,7 @@ where
                     as_of,
                 },
                 _,
-            ) => command::about(engine, entity, &attribute, valid_at, as_of, now),
+            ) => command::about(engine, entity, &attribute, valid_at, as_of, now, None),
             (Call::Reviews, _) => command::review_list(engine),
             (
                 Call::Decisions {
