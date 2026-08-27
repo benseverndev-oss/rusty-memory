@@ -578,9 +578,18 @@ where
     ) -> Result<Outcome, HostError> {
         let _ = now;
         match (call, planned) {
-            (Call::Recall { k, scope, all, .. }, Planned::Recall(vector)) => {
+            (
+                Call::Recall {
+                    k,
+                    scope,
+                    all,
+                    depth,
+                    ..
+                },
+                Planned::Recall(vector),
+            ) => {
                 let here = position(scope, all);
-                command::commit_recall(engine, vector, k, weak_below, here.as_deref())
+                command::commit_recall(engine, vector, k, weak_below, here.as_deref(), depth)
             }
             (
                 Call::About {

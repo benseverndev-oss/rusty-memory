@@ -49,7 +49,7 @@ pub const SCOPE_ENV: &str = "RMEM_SCOPE";
 /// # Why a session should be able to ask for fewer
 ///
 /// The tool table is sent on every turn of every session that has this server
-/// configured, whether or not it is used. Measured: nine tools are about 2,450
+/// configured, whether or not it is used. Measured: nine tools are about 2,560
 /// tokens, which is more than a thirty-decision log costs to read in full -- so
 /// a project that only ever consults decisions pays a log's worth of context
 /// per turn to advertise six tools it will never call.
@@ -170,6 +170,12 @@ fn all_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "depth": {
+                        "type": "string",
+                        "enum": ["located", "stated", "traced"],
+                        "default": "stated",
+                        "description": "How much of each hit to return. \"located\" gives what was found without the text, for deciding what to read before paying for it. \"traced\" adds who asserted it and what it replaced, and is expensive -- ask for it about one answer, not a whole result set. Nothing is summarised at any level: a deeper one is a superset."
+                    },
                     "query": {
                         "type": "string",
                         "description": "What to search for, in words."
@@ -378,6 +384,10 @@ pub enum Call {
         k: usize,
         scope: Option<String>,
         all: bool,
+        /// How much of each hit to return. Defaults to
+        /// [`Depth::Stated`], so a caller who does not know depths
+        /// exist pays exactly what it paid before.
+        depth: rm_host::command::Depth,
     },
     About {
         entity: StableId,
@@ -523,6 +533,16 @@ impl Call {
                         return Err("k must be at least 1".to_string());
                     }
                     Some(k) => k as usize,
+                },
+                depth: match optional_string(arguments, "depth")?.as_deref() {
+                    None | Some("stated") => rm_host::command::Depth::Stated,
+                    Some("located") => rm_host::command::Depth::Located,
+                    Some("traced") => rm_host::command::Depth::Traced,
+                    Some(other) => {
+                        return Err(Unreadable::from(format!(
+                            "depth is located, stated or traced, not {other:?}"
+                        )))
+                    }
                 },
             }),
             "about" => Ok(Call::About {
@@ -951,7 +971,8 @@ mod tests {
                 query: "x".into(),
                 k: 5,
                 scope: None,
-                all: false
+                all: false,
+                depth: rm_host::command::Depth::Stated,
             }
         );
         assert_eq!(
@@ -1321,17 +1342,17 @@ mod tests {
     fn the_tool_table_is_the_size_the_documentation_says() {
         let chars = serde_json::to_string(&all_definitions()).unwrap().len();
         assert!(
-            (9_300..10_300).contains(&chars),
+            (9_700..10_700).contains(&chars),
             "the table is {chars} chars; update the README's row and the comment on `definitions` together"
         );
         let tokens = chars as f64 / CHARS_PER_TOKEN;
-        assert!((tokens - 2_450.0).abs() < 150.0, "~{tokens:.0} tokens");
+        assert!((tokens - 2_560.0).abs() < 150.0, "~{tokens:.0} tokens");
     }
     /// Measured 2026-08-26, before the prose edit that follows.
     const EXPECTED_BYTES: &[(&str, usize)] = &[
         ("remember", 788),
         ("note", 1834),
-        ("recall", 1174),
+        ("recall", 1594),
         ("about", 889),
         ("reviews", 380),
         ("decide", 1811),
@@ -1423,5 +1444,45 @@ mod tests {
                 "the table stopped saying {phrase:?} -- a distinction was cut, not fat"
             );
         }
+    }
+    /// `recall` takes a depth, and the default is what it always returned.
+    ///
+    /// Opt-in in the direction that saves money: a caller who does not know
+    /// depths exist pays exactly today's price, never more.
+    #[test]
+    fn recall_reads_a_depth_and_defaults_to_stated() {
+        use rm_host::command::Depth;
+
+        let Call::Recall { depth, .. } = read("recall", json!({"query": "who owns Okta"})).unwrap()
+        else {
+            panic!("expected Recall")
+        };
+        assert_eq!(
+            depth,
+            Depth::Stated,
+            "the default must not cost more than today"
+        );
+
+        let Call::Recall { depth, .. } = read(
+            "recall",
+            json!({"query": "who owns Okta", "depth": "located"}),
+        )
+        .unwrap() else {
+            panic!("expected Recall")
+        };
+        assert_eq!(depth, Depth::Located);
+    }
+
+    /// An unrecognised depth is refused rather than quietly treated as the
+    /// default, because a caller who asked for `locatd` wanted to save money
+    /// and would silently not have.
+    #[test]
+    fn an_unrecognised_depth_is_refused() {
+        let err = read(
+            "recall",
+            json!({"query": "who owns Okta", "depth": "locatd"}),
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("located"), "{err:?}");
     }
 }

@@ -349,7 +349,18 @@ pub fn run(
                     } else {
                         scope.or_else(|| session_scope.clone())
                     });
-                    command::commit_recall(engine, vector, k, weak_below, here.as_deref())
+                    command::commit_recall(
+                        engine,
+                        vector,
+                        k,
+                        weak_below,
+                        here.as_deref(),
+                        // The CLI offers no depth flag: a person reading a
+                        // terminal wants the text, and the levels exist to
+                        // save an agent a round trip rather than a human a
+                        // scroll.
+                        command::Depth::Stated,
+                    )
                 }
                 (
                     Command::About {

@@ -487,7 +487,7 @@ session that has this configured, used or not:
 
 | exposed | tools | tokens per turn |
 |---|---|---|
-| everything | 9 | ~2,450 |
+| everything | 9 | ~2,560 |
 | `decide,decisions,decision,recall` | 4 | ~1,420 |
 | `decide,decisions,decision` | 3 | ~1,130 |
 | `decisions,decision` | 2 | ~610 |

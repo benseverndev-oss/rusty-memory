@@ -111,6 +111,78 @@ pub fn render(outcome: &Outcome) -> Rendered {
             }
         }
 
+        // The cheapest depth: what exists, so a caller can decide what is
+        // worth reading before paying for it.
+        Outcome::LocatedHits { hits } => Rendered {
+            text: if hits.is_empty() {
+                "Nothing recalled: memory has nothing near that yet.".to_string()
+            } else {
+                hits.iter()
+                    .map(|h| {
+                        format!(
+                            "{} (entity {})  {}  {:.3}",
+                            h.name.as_deref().unwrap_or(""),
+                            h.entity,
+                            h.attribute,
+                            h.score
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("
+")
+            },
+            structured: json!({
+                "hits": hits
+                    .iter()
+                    .map(|h| json!({
+                        "entity": h.entity.to_string(),
+                        "name": h.name,
+                        "attribute": h.attribute,
+                        "score": h.score,
+                    }))
+                    .collect::<Vec<_>>(),
+                "depth": "located",
+            }),
+        },
+
+        // The deepest: what the answer rests on. Expensive by design, and the
+        // tool description says so -- roughly 8x `stated` over twenty hits.
+        Outcome::TracedHits { hits, .. } => Rendered {
+            text: if hits.is_empty() {
+                "Nothing recalled: memory has nothing near that yet.".to_string()
+            } else {
+                hits.iter()
+                    .map(|h| {
+                        format!(
+                            "{} (entity {})  {} = {}  [{} said so; {} version{} in the slot]",
+                            h.recalled.name.as_deref().unwrap_or(""),
+                            h.recalled.entity,
+                            h.recalled.attribute,
+                            h.recalled.value.as_deref().unwrap_or("no value"),
+                            h.recalled.provenance.source_ref,
+                            h.history.len(),
+                            if h.history.len() == 1 { "" } else { "s" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("
+")
+            },
+            structured: json!({
+                "hits": hits
+                    .iter()
+                    .map(|h| json!({
+                        "entity": h.recalled.entity.to_string(),
+                        "attribute": h.recalled.attribute,
+                        "value": h.recalled.value,
+                        "said_by": h.recalled.provenance.source_ref,
+                        "versions_in_slot": h.history.len(),
+                    }))
+                    .collect::<Vec<_>>(),
+                "depth": "traced",
+            }),
+        },
+
         Outcome::Recalled { hits, .. } if hits.is_empty() => Rendered {
             text: "Nothing recalled: memory has nothing near that yet.".to_string(),
             structured: json!({"hits": []}),

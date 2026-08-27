@@ -57,6 +57,24 @@ pub struct ReviewLine {
 }
 
 /// What a command did.
+/// How much of each hit a recall should return.
+///
+/// No level summarises: a deeper one is a superset of a shallower one, byte
+/// for byte. `Stated` is what `recall` has always returned and is the
+/// default, so tiering is opt-in in the direction that saves money.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Depth {
+    /// What was found and whether it stands. No assertion text.
+    Located,
+    /// ...and what it says. Today's behaviour.
+    #[default]
+    Stated,
+    /// ...and who asserted it, and what it stands against. Expensive:
+    /// measured at roughly 8x `Stated` over twenty hits, so it is for one
+    /// answer rather than for a result set. See `docs/tiering-cost.md`.
+    Traced,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
     Initialised {
@@ -122,6 +140,17 @@ pub enum Outcome {
     Recalled {
         hits: Vec<Recalled>,
         /// From `[retrieval] weak_below`. Zero turns the notice off.
+        weak_below: f32,
+    },
+
+    /// A recall at [`Depth::Located`]: locators, no assertion text.
+    LocatedHits {
+        hits: Vec<rm_engine::Located>,
+    },
+    /// A recall at [`Depth::Traced`]: each hit with the versions it stands
+    /// against.
+    TracedHits {
+        hits: Vec<rm_engine::Traced>,
         weak_below: f32,
     },
     About(Believed),
@@ -554,7 +583,16 @@ pub fn recall(
     weak_below: f32,
     here: Option<&str>,
 ) -> Result<Outcome, HostError> {
-    commit_recall(engine, plan_recall(query, embedder)?, k, weak_below, here)
+    // `Stated` because this convenience wrapper is what the CLI's one-shot
+    // path uses, and its behaviour must not change when a depth exists.
+    commit_recall(
+        engine,
+        plan_recall(query, embedder)?,
+        k,
+        weak_below,
+        here,
+        Depth::Stated,
+    )
 }
 
 /// Embed a query, touching no store.
@@ -575,6 +613,7 @@ pub fn commit_recall(
     k: usize,
     weak_below: f32,
     here: Option<&str>,
+    depth: Depth,
 ) -> Result<Outcome, HostError> {
     // The position filters inside the index scan rather than over a fetched
     // page, so `k` still means "k results that apply" rather than "k
@@ -583,10 +622,28 @@ pub fn commit_recall(
     if let Some(here) = here {
         query = query.at(here);
     }
-    let hits = engine
-        .recall(&query)
-        .map_err(|e| HostError::Refused(e.to_string()))?;
-    Ok(Outcome::Recalled { hits, weak_below })
+    // Dispatched here rather than in each host, so the CLI and the MCP server
+    // cannot drift on what a depth means.
+    match depth {
+        Depth::Located => {
+            let hits = engine
+                .recall_located(&query)
+                .map_err(|e| HostError::Refused(e.to_string()))?;
+            Ok(Outcome::LocatedHits { hits })
+        }
+        Depth::Stated => {
+            let hits = engine
+                .recall(&query)
+                .map_err(|e| HostError::Refused(e.to_string()))?;
+            Ok(Outcome::Recalled { hits, weak_below })
+        }
+        Depth::Traced => {
+            let hits = engine
+                .recall_traced(&query)
+                .map_err(|e| HostError::Refused(e.to_string()))?;
+            Ok(Outcome::TracedHits { hits, weak_below })
+        }
+    }
 }
 
 /// What the store believes an attribute held.
@@ -3128,7 +3185,7 @@ pub(crate) mod tests {
             .embed("decision Pin the compiler: choice is rust-toolchain.toml names the version")
             .unwrap();
         let Outcome::Recalled { hits: was, .. } =
-            commit_recall(&e, query.clone(), 5, 0.0, None).unwrap()
+            commit_recall(&e, query.clone(), 5, 0.0, None, Depth::Stated).unwrap()
         else {
             panic!()
         };
@@ -3136,7 +3193,8 @@ pub(crate) mod tests {
         let plan = plan_reindex(reindex_texts(&e).unwrap(), &stub, 3, Metric::Cosine).unwrap();
         commit_reindex(&mut e, plan).unwrap();
 
-        let Outcome::Recalled { hits: now, .. } = commit_recall(&e, query, 5, 0.0, None).unwrap()
+        let Outcome::Recalled { hits: now, .. } =
+            commit_recall(&e, query, 5, 0.0, None, Depth::Stated).unwrap()
         else {
             panic!()
         };
