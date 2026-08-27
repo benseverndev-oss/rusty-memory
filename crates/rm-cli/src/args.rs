@@ -45,7 +45,7 @@ rmem — a memory that resolves contradictions deterministically
                                      find assertions near a query (default 5).
                                      --scope asks from a position, --all
                                      searches regardless of reach
-    rmem about <entity> <attribute> [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD]
+    rmem about <entity> <attribute> [--valid-at YYYY-MM-DD] [--as-of YYYY-MM-DD] [--according-to <id>]
                                      what the store believes an attribute holds;
                                      --valid-at asks what was true then, --as-of
                                      what the store knew then
@@ -123,6 +123,9 @@ pub enum Command {
         valid_at: Option<Timestamp>,
         /// What the store knew then. `None` is now.
         as_of: Option<Timestamp>,
+        /// Whose view to ask for. `None` asks what the store itself
+        /// holds, which never includes anybody's view.
+        according_to: Option<StableId>,
     },
     ReviewList,
     ReviewConfirm(u64),
@@ -334,6 +337,17 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                 attribute: attribute.clone(),
                 valid_at: day(&args, "--valid-at")?,
                 as_of: day(&args, "--as-of")?,
+                // An id, not a name, for the same reason `note` refuses
+                // one: resolving here would put a resolution failure in
+                // the middle of a read.
+                according_to: match flag(&args, "--according-to")? {
+                    None => None,
+                    Some(v) => Some(v.parse::<StableId>().map_err(|_| {
+                        CliError::Usage(format!(
+                            "--according-to takes an entity id, not {v:?}\n\n{USAGE}"
+                        ))
+                    })?),
+                },
             })
         }
 
@@ -583,6 +597,7 @@ mod tests {
                 attribute: "choice".into(),
                 valid_at: None,
                 as_of: None,
+                according_to: None,
             },
             "no flags means now on both, decided downstream"
         );
@@ -687,6 +702,7 @@ mod tests {
                 attribute: "employer".into(),
                 valid_at: None,
                 as_of: None,
+                according_to: None,
             }
         );
         assert_eq!(parse_args(&["review"]).unwrap(), Command::ReviewList);
