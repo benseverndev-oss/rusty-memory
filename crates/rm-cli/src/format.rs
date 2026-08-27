@@ -460,10 +460,25 @@ Every vector in this store now comes from one model.",
         }
 
         // The counts are the point: a run's cost is legible before and after.
-        Outcome::Ingested(read) => format!(
-            "{} chunks, {} read, {} unchanged, {} facts",
-            read.chunks_seen, read.chunks_read, read.chunks_skipped, read.facts
-        ),
+        //
+        // Failures are named rather than folded into the read count. A chunk
+        // that could not be extracted was paid for and produced nothing, and
+        // it is not marked read -- so the line has to say so, or a run that
+        // quietly dropped a tenth of a corpus reads as a clean one.
+        Outcome::Ingested(read) => {
+            let base = format!(
+                "{} chunks, {} read, {} unchanged, {} facts",
+                read.chunks_seen, read.chunks_read, read.chunks_skipped, read.facts
+            );
+            if read.chunks_failed == 0 {
+                base
+            } else {
+                format!(
+                    "{base}, {} unreadable (not recorded as read, so the next run retries them)",
+                    read.chunks_failed
+                )
+            }
+        }
 
         // --dry-run: what a run would cost, having called nothing. No fact
         // count, because counting them would mean extracting them.
@@ -998,5 +1013,39 @@ mod tests {
                 )
             });
         }
+    }
+    /// A run that could not read some of what it paid for says so.
+    ///
+    /// The count is separate from `read` on purpose: an unreadable chunk cost
+    /// a completion, produced nothing, and is not marked read. Folding it into
+    /// either number would let a run that dropped a tenth of a corpus print
+    /// the same line as one that dropped none.
+    #[test]
+    fn an_ingest_run_reports_what_it_could_not_read() {
+        let clean = render(&Outcome::Ingested(rm_host::ingest::Read {
+            chunks_seen: 322,
+            chunks_read: 322,
+            chunks_skipped: 0,
+            chunks_failed: 0,
+            facts: 900,
+        }));
+        assert_eq!(clean, "322 chunks, 322 read, 0 unchanged, 900 facts");
+        assert!(
+            !clean.contains("unreadable"),
+            "a clean run mentioned failures it did not have"
+        );
+
+        let lossy = render(&Outcome::Ingested(rm_host::ingest::Read {
+            chunks_seen: 322,
+            chunks_read: 319,
+            chunks_skipped: 0,
+            chunks_failed: 3,
+            facts: 890,
+        }));
+        assert!(lossy.contains("3 unreadable"), "{lossy}");
+        assert!(
+            lossy.contains("retries"),
+            "the line does not say what happens next: {lossy}"
+        );
     }
 }

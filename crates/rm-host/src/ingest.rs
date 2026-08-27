@@ -111,6 +111,10 @@ pub struct Read {
     pub chunks_seen: usize,
     pub chunks_read: usize,
     pub chunks_skipped: usize,
+    /// Chunks whose extraction could not be used. Reported, never silent:
+    /// these were paid for and produced nothing, and they are not marked
+    /// read, so the next run tries them again.
+    pub chunks_failed: usize,
     pub facts: usize,
 }
 
@@ -125,7 +129,23 @@ pub struct Plan {
     pub planned: Vec<Planned>,
     pub seen: usize,
     pub skipped: usize,
+    /// One line per chunk whose extraction could not be used, naming the
+    /// chunk and why. A caller prints these; nothing here decides they are
+    /// unimportant.
+    pub failed: Vec<String>,
 }
+
+/// How many failures in a row mean the run is broken rather than unlucky.
+///
+/// A scattered bad response is ordinary across hundreds of calls -- the first
+/// corpus-scale run hit one at 322 chunks. A run of them is a dead key or a
+/// dead network, and continuing would spend one call per remaining chunk to
+/// collect the same error each time.
+///
+/// Five rather than one, because the thing being tolerated is exactly a model
+/// that occasionally answers badly, and rather than fifty because nothing is
+/// learned from the forty-fifth identical refusal.
+pub const CONSECUTIVE_FAILURE_LIMIT: usize = 5;
 
 /// Extract every chunk the store has not already read.
 ///
@@ -159,7 +179,9 @@ pub fn plan_tree(
         planned: Vec::new(),
         seen: 0,
         skipped: 0,
+        failed: Vec::new(),
     };
+    let mut consecutive = 0usize;
 
     for file in files {
         let text = std::fs::read_to_string(&file)
@@ -175,7 +197,7 @@ pub fn plan_tree(
                 out.skipped += 1;
                 continue;
             }
-            let plan = crate::command::plan_remember(
+            let planned = crate::command::plan_remember(
                 &chunk.text,
                 observed_at,
                 &reference,
@@ -186,11 +208,28 @@ pub fn plan_tree(
                 embedder,
                 dimension,
                 metric,
-            )?;
-            out.planned.push(Planned {
-                source_ref: reference,
-                plan,
-            });
+            );
+            match planned {
+                Ok(plan) => {
+                    consecutive = 0;
+                    out.planned.push(Planned {
+                        source_ref: reference,
+                        plan,
+                    });
+                }
+                Err(e) => {
+                    consecutive += 1;
+                    if consecutive >= CONSECUTIVE_FAILURE_LIMIT {
+                        // Not this chunk's problem any more. Give the caller
+                        // the underlying error rather than a count, because
+                        // the underlying error is the one that says why.
+                        return Err(e);
+                    }
+                    // Deliberately not marked read: the next run retries this
+                    // chunk and skips every one that worked.
+                    out.failed.push(format!("{reference}: {e}"));
+                }
+            }
         }
     }
     Ok(out)
@@ -254,6 +293,7 @@ pub fn commit_tree(engine: &mut Engine, plan: Plan) -> Result<Read, HostError> {
     let mut out = Read {
         chunks_seen: plan.seen,
         chunks_skipped: plan.skipped,
+        chunks_failed: plan.failed.len(),
         ..Read::default()
     };
     for Planned { plan, source_ref } in plan.planned {
@@ -578,24 +618,24 @@ after the fence
         assert!(format!("{err}").contains("scratch"), "{err}");
     }
 
-    /// A failure part-way through a plan loses every chunk read before it.
+    /// One unusable response does not throw away the rest of the run.
     ///
-    /// Not a bug -- `plan_tree` is all-or-nothing by construction, so that no
-    /// model call happens under the lock. But it is a cost that only shows up
-    /// at corpus scale: at 30 chunks a retry is free, and at 322 a blip on the
-    /// last one throws away every completion already paid for, because the
-    /// read set is only written by `commit_tree`.
+    /// Measured, not imagined: the first corpus-scale run was 322 chunks of
+    /// arrow's API reference, and it died sixteen minutes in on a single
+    /// response that was not the JSON the extractor asked for. Every
+    /// completion already paid for went with it. Across hundreds of calls a
+    /// malformed one is ordinary, so a run that cannot survive one cannot read
+    /// a corpus at all.
     ///
-    /// Recorded as a test rather than a note so the day someone makes planning
-    /// resumable, this fails and says what changed.
+    /// The failed chunk is deliberately *not* marked read, so the next run
+    /// retries exactly it and nothing else.
     #[test]
-    fn a_failure_part_way_through_planning_discards_the_whole_run() {
-        struct FailsOnThird(std::cell::Cell<usize>);
-        impl Completer for FailsOnThird {
-            fn complete(&self, _: &str) -> Result<String, CompleterError> {
-                self.0.set(self.0.get() + 1);
-                if self.0.get() >= 3 {
-                    return Err(CompleterError("the network went away".into()));
+    fn one_unusable_response_does_not_lose_the_run() {
+        struct BadOnGamma;
+        impl Completer for BadOnGamma {
+            fn complete(&self, prompt: &str) -> Result<String, CompleterError> {
+                if prompt.contains("gamma") {
+                    return Ok("{\"mentions\": [ truncated".to_string());
                 }
                 Ok(r#"{"mentions":[{"kind":"person","name":"A","text":"A"}],"facts":[{"subject":0,"attribute":"role","value":"noted","text":"A role"}],"relations":[],"closures":[]}"#.to_string())
             }
@@ -620,10 +660,70 @@ after the fence
             .unwrap();
         }
 
-        let e = doc_engine();
-        let c = FailsOnThird(std::cell::Cell::new(0));
+        let mut e = doc_engine();
         let emb = crate::testing::StubProvider::new(vec![]);
+        let plan = plan_tree(
+            e.read_sources(),
+            dir.path(),
+            100,
+            &BadOnGamma,
+            &emb,
+            3,
+            Metric::Cosine,
+        )
+        .expect("one bad response must not fail the whole plan");
 
+        assert_eq!(
+            plan.planned.len(),
+            3,
+            "good chunks were lost with the bad one"
+        );
+        assert_eq!(plan.failed.len(), 1, "the failure was not reported");
+        assert!(plan.failed[0].contains("c.md"), "{:?}", plan.failed);
+
+        let out = commit_tree(&mut e, plan).unwrap();
+        assert_eq!(out.chunks_read, 3);
+        assert_eq!(out.chunks_failed, 1);
+        assert_eq!(
+            e.read_sources().len(),
+            3,
+            "a chunk that failed was marked read, so a retry would skip it forever"
+        );
+    }
+
+    /// A run where everything fails stops instead of burning the corpus.
+    ///
+    /// Tolerating a bad response must not become tolerating a dead key: with
+    /// no floor, a wrong credential would spend one call per chunk to collect
+    /// one identical failure per chunk. Consecutive failures are the signal --
+    /// scattered ones are luck, a run of them is a broken setup.
+    #[test]
+    fn a_run_of_consecutive_failures_stops_the_plan() {
+        struct AlwaysBad(std::cell::Cell<usize>);
+        impl Completer for AlwaysBad {
+            fn complete(&self, _: &str) -> Result<String, CompleterError> {
+                self.0.set(self.0.get() + 1);
+                Err(CompleterError("unauthorized".into()))
+            }
+        }
+
+        let dir = crate::testing::TempDir::new();
+        for n in 0..20 {
+            std::fs::write(
+                dir.path().join(format!("f{n:02}.md")),
+                format!(
+                    "# f{n}
+
+body {n}
+"
+                ),
+            )
+            .unwrap();
+        }
+
+        let e = doc_engine();
+        let emb = crate::testing::StubProvider::new(vec![]);
+        let c = AlwaysBad(std::cell::Cell::new(0));
         let Err(err) = plan_tree(
             e.read_sources(),
             dir.path(),
@@ -633,18 +733,59 @@ after the fence
             3,
             Metric::Cosine,
         ) else {
-            panic!("a completer that fails should fail the plan")
+            panic!("twenty consecutive failures should stop the run")
         };
-        assert!(format!("{err}").contains("network"), "{err}");
+        assert!(format!("{err}").contains("unauthorized"), "{err}");
+        assert!(
+            c.0.get() <= CONSECUTIVE_FAILURE_LIMIT + 1,
+            "kept calling after {} consecutive failures: {} calls",
+            CONSECUTIVE_FAILURE_LIMIT,
+            c.0.get()
+        );
+    }
+
+    /// Planning writes nothing, so an abandoned run cannot half-record a read.
+    ///
+    /// This used to say that a failure part-way through discarded the run,
+    /// which stopped being true when planning learned to tolerate a single bad
+    /// response. What survives is the invariant underneath it: the read set is
+    /// written by `commit_tree` and by nothing before it, so a plan that is
+    /// dropped -- by an abort, a panic, a killed process -- leaves the store
+    /// exactly as it was, and the next run re-reads every chunk rather than
+    /// skipping one it never wrote.
+    ///
+    /// The cost is the other half of that trade and it is real: an abandoned
+    /// run keeps none of the completions it paid for.
+    #[test]
+    fn planning_writes_nothing_until_the_commit() {
+        let dir = tree();
+        let e = doc_engine();
+        let c = CountingCompleter::default();
+        let emb = crate::testing::StubProvider::new(vec![]);
+
+        let plan = plan_tree(
+            e.read_sources(),
+            dir.path(),
+            100,
+            &c,
+            &emb,
+            3,
+            Metric::Cosine,
+        )
+        .unwrap();
 
         assert!(
-            e.read_sources().is_empty(),
-            "a failed plan recorded a read, so a retry would skip a chunk it never wrote"
+            c.calls() > 0,
+            "planning called no model, so it proves nothing"
         );
-        assert_eq!(
-            c.0.get(),
-            3,
-            "planning kept calling after a failure -- it must stop"
+        assert!(!plan.planned.is_empty());
+        assert!(
+            e.read_sources().is_empty(),
+            "planning recorded a read, so a dropped plan would make the store lie"
+        );
+        assert!(
+            e.source_refs().is_empty(),
+            "planning wrote an assertion before any commit"
         );
     }
 

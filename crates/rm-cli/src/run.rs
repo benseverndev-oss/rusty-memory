@@ -191,6 +191,15 @@ pub fn run(
 
         let provider = config.provider()?;
         let plan = ingest::plan_tree(&seen, root, now, &provider, &provider, dimension, metric)?;
+
+        // Named on stderr, one line each, before anything is written. The
+        // summary line carries a count; a count alone does not tell you which
+        // chunk to go and look at, and these are chunks that were paid for.
+        // stderr rather than stdout so a run stays pipeable.
+        for line in &plan.failed {
+            eprintln!("could not read {line}");
+        }
+
         let (r, p2) = (config.ruleset()?, config.policy_for_engine()?);
         return store::with_write(&path, r, p2, dimension, metric, |engine| {
             ingest::commit_tree(engine, plan).map(Outcome::Ingested)
