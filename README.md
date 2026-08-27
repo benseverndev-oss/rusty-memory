@@ -8,14 +8,21 @@ employer  no value — asserted to have none
 pets      nothing known — this was never discussed
 ```
 
-Three answers, not two. Memory systems for agents settle conflicts in
-different ways — mem0's pipeline decides per fact whether to add, update or
-delete it; Graphiti invalidates edges with temporal metadata; Letta keeps
-free-text blocks an agent rewrites. What none of them **documents** is a way to
-record that something was asserted *not* to be, distinctly from never having
-come up. Ask one whether someone has an employer and it will tell you. Ask this
-one and it can say it does not know — a different answer from "they have none",
-and the difference is the point.
+Three answers, not two — and the third is *stated*, not inferred.
+
+Run the same two conversations past mem0: one where the speaker says they have
+no partner, one where partners never come up. Ask both whether this person has
+a partner. It keeps the difference — the first returns the stated negation at
+0.64, the second returns unrelated memories at 0.19. What it does not do is say
+**which**. The caller is handed content and a score, and has to decide for
+themselves what 0.19 means.
+
+That decision is the problem. Measured on LoCoMo, keeping 90% of answerable
+questions means refusing only 36.6% of unanswerable ones, and a cutoff tuned on
+one corpus marked a perfect answer as a miss on another. Scores do not travel.
+
+So this store answers instead of scoring: `Absent` where somebody said there is
+none, `Unknown` where nobody has said anything.
 
 Measured on a corpus where all three answers are labelled by hand: 8/8/8, no
 fabrications. See [`docs/absence-benchmark.md`](docs/absence-benchmark.md),
