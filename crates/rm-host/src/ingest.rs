@@ -243,8 +243,13 @@ pub fn commit_tree(engine: &mut Engine, plan: Plan) -> Result<Read, HostError> {
         chunks_skipped: plan.skipped,
         ..Read::default()
     };
-    for Planned { plan, .. } in plan.planned {
+    for Planned { plan, source_ref } in plan.planned {
         let outcome = crate::command::commit_remember(engine, plan)?;
+        // Recorded whatever it yielded. A chunk of prose that asserts nothing
+        // still cost a model call, and a ledger derived from what was written
+        // would forget it and pay again on every run -- measured at 21 chunks
+        // in 30 on this repository's own documentation.
+        engine.mark_read(source_ref);
         out.chunks_read += 1;
         if let Outcome::Remembered { ingested, .. } = outcome {
             out.facts += ingested.assertions.len();
@@ -414,7 +419,7 @@ mod tests {
         c: &CountingCompleter,
     ) -> Result<Read, HostError> {
         let emb = crate::testing::StubProvider::new(vec![]);
-        let plan = plan_tree(&e.source_refs(), dir, at, c, &emb, 3, Metric::Cosine)?;
+        let plan = plan_tree(e.read_sources(), dir, at, c, &emb, 3, Metric::Cosine)?;
         commit_tree(e, plan)
     }
 
@@ -557,8 +562,8 @@ mod tests {
     }
     /// A chunk that yields no facts leaves no trace, and is read again forever.
     ///
-    /// **This fails, and it is committed failing on purpose.** It is the
-    /// defect a real run found: 30 chunks of this repository's own
+    /// The defect a real run found, now fixed. It is kept because it is the
+    /// only test that reaches the zero-yield path: 30 chunks of this repository's own
     /// documentation produced 9 source_refs, because 21 of them extracted to
     /// nothing. The store cannot be its own ledger of what was *read* when it
     /// only records what was *written*.
@@ -567,9 +572,8 @@ mod tests {
     /// fact, so the zero-yield path did not exist. Ignored rather than
     /// deleted: the fix is a design decision -- see
     /// `docs/ingest-findings.md` -- and a defect nobody can see is one nobody
-    /// fixes.
+    /// fixes -- and one nobody can retest is one that comes back.
     #[test]
-    #[ignore = "known defect: a zero-yield chunk is re-read forever"]
     fn a_chunk_that_yields_nothing_is_still_remembered_as_read() {
         /// Extracts nothing, which is what most prose does.
         struct Silent;
@@ -584,7 +588,7 @@ mod tests {
         let emb = crate::testing::StubProvider::new(vec![]);
 
         let plan = plan_tree(
-            &e.source_refs(),
+            e.read_sources(),
             dir.path(),
             100,
             &Silent,
@@ -596,7 +600,7 @@ mod tests {
         commit_tree(&mut e, plan).unwrap();
 
         let plan = plan_tree(
-            &e.source_refs(),
+            e.read_sources(),
             dir.path(),
             200,
             &Silent,

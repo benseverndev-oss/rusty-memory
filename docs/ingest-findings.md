@@ -7,28 +7,31 @@ scratch store, with `gpt-4o-mini` and the offline embedder.
 Step 1 of `docs/superpowers/specs/2026-08-27-document-ingest-design.md`. Nothing
 was written to a live store.
 
-## The headline: idempotency does not hold
+## The headline: idempotency failed, and why
 
-The spec made this the ship-or-drop condition. It fails.
+The spec made this the ship-or-drop condition. The first build failed it:
 
 ```
 first run:   30 chunks, 30 read,  0 unchanged, 52 facts
 second run:  30 chunks, 23 read,  7 unchanged, 22 facts
 ```
 
-A second run should read nothing. It read 23 of 30.
+A second run should read nothing. It read 23 of 30, because the store held
+**9 distinct `source_ref`s from 30 chunks**: twenty-one chunks extracted to no
+facts, wrote no assertions, and left no trace of having been read.
 
-**Why:** the store holds **9 distinct `source_ref`s** from 30 chunks. Twenty-one
-chunks extracted to no facts, wrote no assertions, and so left no trace that
-they had ever been read. The store cannot be its own ledger of what was *read*
-when the only thing it records is what was *written*.
+**A store cannot be its own ledger of what was *read* when the only thing it
+records is what was *written*.** That was the design being wrong, not the code.
 
-That is a flaw in the design, not in the implementation. It was chosen over a
-sidecar ledger because a sidecar can desync from the store — which is still
-true, and is now a trade rather than a free win.
+The fix is a `read` set carried in the snapshot beside the entities and the
+index -- one file, one atomic write, so it cannot desync from the store the way
+a sidecar ledger could. It is `skip_serializing_if` empty, so a store that has
+never been ingested into writes no field and older snapshots still load.
 
-`a_chunk_that_yields_nothing_is_still_remembered_as_read` is committed
-**failing and ignored**, so the defect is visible rather than remembered.
+```
+first run:   30 chunks, 30 read,  0 unchanged, 70 facts
+second run:  30 chunks,  0 read, 30 unchanged,  0 facts
+```
 
 ### Why no test caught it
 
@@ -36,9 +39,15 @@ Every test used a stub that always returns a fact, so a chunk that yields
 nothing never existed. The zero-yield path was not tested badly; it was not
 reachable.
 
-This is the same shape as the other verification failures this week: an
-instrument that cannot observe the thing, reporting nothing and being read as
-evidence of absence.
+The same shape as the other verification failures this week: an instrument that
+cannot observe the thing, reporting nothing, and being read as evidence of
+absence.
+
+There is a second lesson underneath. When the fix was in and the test still
+failed, the cause was that `cargo fmt` had wrapped the test's own calls across
+lines, so a single-line replacement had silently matched nothing and the test
+was still asking the old question. The fix was right and the test was wrong,
+which is the hardest pair to tell apart from a fix that does not work.
 
 ## The second finding: prose does not yield facts
 
@@ -91,18 +100,14 @@ What the run does establish for that spec:
   `source_ref` carries no `@`, so it cannot be pointed at a real store by
   accident.
 
-## What has not been decided
+## What is still open
 
-How the ledger should work now. Three options, none free:
+**The twenty-fact reading is not done.** Seventy facts from nine chunks of one
+document is a sample of one document, not of extraction's failure modes. Doing
+it properly needs a corpus of *reference* documentation -- a register, a
+runbook, a schema -- which this repository does not contain and which the
+second finding above says is where ingest belongs anyway.
 
-1. **A sidecar ledger.** Handles zero-yield chunks. Can desync from the store,
-   which is the failure this design was avoiding.
-2. **A marker assertion per chunk.** Keeps one source of truth, and makes a
-   document an entity in all but name — which the spec forbids, for the reason
-   that "what does this file say" is a different product.
-3. **Accept the re-reads.** Cheapest to build and wrong on the spec's own
-   terms: a run that re-reads two thirds of a tree is not runnable on a
-   schedule.
-
-This is a design decision and it belongs to a person, which is why the defect is
-pinned rather than patched.
+**Nothing has been written to a live store**, and nothing should be until the
+declines work exists. The refusal in `commit_tree` enforces that rather than
+asking for it.

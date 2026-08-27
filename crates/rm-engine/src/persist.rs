@@ -61,6 +61,15 @@ struct Persisted {
     rejected: BTreeSet<Settled>,
     next_assertion: AssertionId,
     next_review: ReviewId,
+    /// Sources read from, as distinct from written by. See
+    /// `Engine::read`.
+    ///
+    /// `default` and `skip_serializing_if` so a store that has never
+    /// been ingested into writes no field and a snapshot from before
+    /// this existed still loads -- the same treatment `Version`'s
+    /// `supersession` and `according_to` already carry.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    read: BTreeSet<String>,
 }
 
 impl Engine {
@@ -87,6 +96,7 @@ impl Engine {
         let p = Persisted {
             store: self.store.snapshot(),
             index,
+            read: self.read.clone(),
             identity: self.identity.clone(),
             assertions: self.assertions.clone(),
             review: self.review.clone(),
@@ -290,6 +300,8 @@ impl Engine {
         let mut engine = Engine {
             store,
             index,
+            read: p.read,
+
             ruleset,
             policy,
             identity: p.identity,

@@ -274,6 +274,20 @@ pub struct Engine {
     /// lesson that persisted derived state lets a snapshot disagree with itself.
     pub(crate) blocks: BTreeMap<String, Vec<StableId>>,
     pub(crate) assertions: BTreeMap<AssertionId, AssertionRef>,
+    /// Sources this engine has been *read from*, as distinct from
+    /// written by.
+    ///
+    /// Document ingest needs both and they are not the same set: a
+    /// chunk of prose that asserts nothing writes no assertion, so a
+    /// ledger derived from provenance would forget it had ever been
+    /// read and pay for it again on every run. Measured on this
+    /// repository's own documentation, that was 21 chunks in 30.
+    ///
+    /// Kept here rather than in a file beside the store so it cannot
+    /// desync from it: one snapshot, one write, one truth. Empty for
+    /// every store that has never been ingested into, which is what
+    /// makes it additive.
+    pub(crate) read: BTreeSet<String>,
     /// Filed by resolution's `Review` band: pairs the resolver could not call,
     /// waiting on an answer from `pending_review`.
     pub(crate) review: BTreeMap<ReviewId, PendingReview>,
@@ -287,6 +301,22 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Record that a source has been read, whatever it yielded.
+    ///
+    /// Separate from remembering, because a source that yielded nothing
+    /// still cost a model call and must not cost another.
+    pub fn mark_read(&mut self, source_ref: impl Into<String>) {
+        self.read.insert(source_ref.into());
+    }
+
+    /// Every source this engine has been read from.
+    ///
+    /// Not the same as the set of `provenance.source_ref`s it holds --
+    /// see the field's own note. A caller deciding what to re-read wants
+    /// this one.
+    pub fn read_sources(&self) -> &BTreeSet<String> {
+        &self.read
+    }
     /// A new engine over an empty store.
     ///
     /// The index is supplied rather than constructed because its dimension and
@@ -296,6 +326,7 @@ impl Engine {
         Engine {
             store: MemoryStore::new(),
             index,
+            read: BTreeSet::new(),
             ruleset,
             policy,
             identity: BTreeMap::new(),

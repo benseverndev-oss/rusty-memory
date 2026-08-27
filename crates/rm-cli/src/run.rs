@@ -181,7 +181,7 @@ pub fn run(
     if let Command::Ingest { path: dir, dry_run } = &command {
         let (r, p2) = (config.ruleset()?, config.policy_for_engine()?);
         let seen = store::with_read(&path, r, p2, dimension, metric, |engine| {
-            Ok(engine.source_refs())
+            Ok(engine.read_sources().clone())
         })?;
         let root = std::path::Path::new(dir);
 
