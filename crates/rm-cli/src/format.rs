@@ -411,6 +411,46 @@ Every vector in this store now comes from one model.",
             )
         }
 
+        // Unreachable from the CLI today -- it always asks for `Stated`.
+        // Rendered anyway because `Outcome` is public and a host that
+        // does ask should not meet a panic.
+        Outcome::LocatedHits { hits } => {
+            if hits.is_empty() {
+                return "nothing near that".to_string();
+            }
+            hits.iter()
+                .map(|h| {
+                    let name = h.name.as_deref().unwrap_or("");
+                    format!(
+                        "{name} (entity {})  {}  {:.3}",
+                        h.entity, h.attribute, h.score
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        Outcome::TracedHits { hits, weak_below } => {
+            let _ = weak_below;
+            if hits.is_empty() {
+                return "nothing near that".to_string();
+            }
+            hits.iter()
+                .map(|h| {
+                    let name = h.recalled.name.as_deref().unwrap_or("");
+                    format!(
+                        "{name} (entity {})  {} = {}  ({} version{} in the slot)",
+                        h.recalled.entity,
+                        h.recalled.attribute,
+                        h.recalled.value.as_deref().unwrap_or("no value"),
+                        h.history.len(),
+                        if h.history.len() == 1 { "" } else { "s" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
         Outcome::Rejected => "kept apart, and not asked again".to_string(),
     }
 }

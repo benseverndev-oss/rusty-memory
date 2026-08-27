@@ -91,6 +91,37 @@ pub struct Query {
     pub boost_by: f32,
 }
 
+/// A hit at its cheapest: what was found, and whether it still stands.
+///
+/// A separate type rather than [`Recalled`] with its value-bearing fields
+/// blanked. `Recalled::value` is already `Option<String>` and `None` there
+/// means the assertion claimed the attribute had no value; reusing it to mean
+/// "not fetched at this depth" would make a tombstone indistinguishable from
+/// an omission. That is the `Absent`/`Unknown` confusion this store exists to
+/// prevent, and it has no business appearing in the store's own return type.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Located {
+    pub entity: StableId,
+    pub name: Option<String>,
+    pub assertion: AssertionId,
+    pub attribute: String,
+    pub standing: Standing,
+    pub score: f32,
+}
+
+/// A hit with what it rests on: who asserted it, and the versions it stands
+/// against.
+///
+/// `recalled` is the ordinary [`Recalled`], unchanged and not re-rendered. A
+/// deeper level is a superset of a shallower one, which is the property that
+/// separates this from summarising.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Traced {
+    pub recalled: Recalled,
+    /// Every version in this assertion's slot, oldest first.
+    pub history: Vec<rm_store::Version>,
+}
+
 /// One recalled assertion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Recalled {
@@ -352,6 +383,46 @@ impl Engine {
     /// short list with no way to tell it was truncated by the filter rather
     /// than by the data. `rm_index` was built specifically to avoid that
     /// failure, and reintroducing it one layer up would waste the work.
+    /// Recall, without the assertion text.
+    ///
+    /// For a caller that wants to know what exists before deciding what to
+    /// read. Derived from the same query path as [`Engine::recall`] and then
+    /// narrowed -- nothing is precomputed, so no level can drift from another.
+    pub fn recall_located(&self, q: &Query) -> Result<Vec<Located>, EngineError> {
+        Ok(self
+            .recall(q)?
+            .into_iter()
+            .map(|r| Located {
+                entity: r.entity,
+                name: r.name,
+                assertion: r.assertion,
+                attribute: r.attribute,
+                standing: r.standing,
+                score: r.score,
+            })
+            .collect())
+    }
+
+    /// Recall, with each hit's slot history.
+    ///
+    /// This does not explain why the vector matched; that is a cosine score
+    /// and no amount of history makes it an explanation. It answers the
+    /// question a caller can act on -- what the answer rests on -- in one
+    /// call instead of one per hit.
+    pub fn recall_traced(&self, q: &Query) -> Result<Vec<Traced>, EngineError> {
+        Ok(self
+            .recall(q)?
+            .into_iter()
+            .map(|r| {
+                let history = self.store_history(r.entity, &r.attribute).to_vec();
+                Traced {
+                    recalled: r,
+                    history,
+                }
+            })
+            .collect())
+    }
+
     pub fn recall(&self, q: &Query) -> Result<Vec<Recalled>, EngineError> {
         let keep = |id: rm_index::EntryId| self.in_scope(id, q);
         // The boost runs inside the scan for the same reason the filter does.
