@@ -104,6 +104,13 @@ pub enum Outcome {
         absent: bool,
         /// It landed on an entity that already existed.
         merged: bool,
+        /// Whose view it was recorded as, if anybody's.
+        ///
+        /// Reported because the flag's *absence* is the risk: two
+        /// commands differing by one argument produce records that
+        /// never meet, and a forgotten flag silently promotes an
+        /// opinion to a fact.
+        according_to: Option<StableId>,
         /// Every pair it scored inside the review band against. A vector
         /// rather than an option because one mention can be ambiguous against
         /// several entities at once, and reporting only the first would hide
@@ -851,6 +858,9 @@ pub struct NotePlan {
     valid_from: Timestamp,
     observed_at: Timestamp,
     session: String,
+    /// Whose view this is. `None` makes it the store's own fact,
+    /// which is what a caller who says nothing is asserting.
+    according_to: Option<StableId>,
     /// The scope and its embedding together, because a scope is a second
     /// attribute and therefore a second vector -- taken here so the store's
     /// lock is never held while an embedder is called.
@@ -887,6 +897,7 @@ pub fn plan_note(
     observed_at: Timestamp,
     session: &str,
     scope: Option<&str>,
+    according_to: Option<StableId>,
     embedder: &impl Embedder,
 ) -> Result<NotePlan, HostError> {
     if who.trim().is_empty() {
@@ -938,6 +949,7 @@ pub fn plan_note(
         observed_at,
         session: session.to_string(),
         scope,
+        according_to,
         embedding,
     })
 }
@@ -961,6 +973,7 @@ pub fn commit_note(engine: &mut Engine, plan: NotePlan) -> Result<Outcome, HostE
         observed_at,
         session,
         scope,
+        according_to,
         embedding,
     } = plan;
 
@@ -980,7 +993,7 @@ pub fn commit_note(engine: &mut Engine, plan: NotePlan) -> Result<Outcome, HostE
         valid: Interval::since(valid_from),
         provenance: Provenance::new(Source::UserAssertion, observed_at, session.clone()),
         supersession: Supersession::Corrects,
-        according_to: None,
+        according_to,
         embedding,
     };
 
@@ -1036,6 +1049,7 @@ pub fn commit_note(engine: &mut Engine, plan: NotePlan) -> Result<Outcome, HostE
         attribute,
         absent,
         merged,
+        according_to,
         reviews,
     })
 }
@@ -1966,6 +1980,7 @@ pub(crate) mod tests {
             100,
             "test",
             None,
+            None,
             &Hashed::new(3),
         )
         .unwrap();
@@ -2004,6 +2019,7 @@ pub(crate) mod tests {
             100,
             "test",
             None,
+            None,
             &Hashed::new(3),
         )
         .unwrap();
@@ -2020,6 +2036,7 @@ pub(crate) mod tests {
             None,
             200,
             "test",
+            None,
             None,
             &Hashed::new(3),
         )
@@ -2051,6 +2068,7 @@ pub(crate) mod tests {
             None,
             100,
             "test",
+            None,
             None,
             &Hashed::new(3),
         )
@@ -2089,6 +2107,7 @@ pub(crate) mod tests {
             100,
             "test",
             None,
+            None,
             &Hashed::new(3),
         )
         .unwrap();
@@ -2116,6 +2135,7 @@ pub(crate) mod tests {
             None,
             100,
             "test",
+            None,
             None,
             &Hashed::new(3),
         )
@@ -2150,6 +2170,7 @@ pub(crate) mod tests {
             100,
             "test",
             None,
+            None,
             &Hashed::new(3),
         )
         .unwrap_err();
@@ -2171,6 +2192,7 @@ pub(crate) mod tests {
             100,
             "test",
             Some("work/circ-tools"),
+            None,
             &Hashed::new(3),
         )
         .unwrap();

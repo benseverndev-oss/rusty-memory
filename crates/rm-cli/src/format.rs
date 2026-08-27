@@ -375,12 +375,20 @@ Every vector in this store now comes from one model.",
             attribute,
             absent,
             merged,
+            according_to,
             reviews,
         } => {
             let what = if *absent {
                 format!("{attribute} recorded as absent")
             } else {
                 format!("{attribute} recorded")
+            };
+            // Said out loud, because the flag's absence is the risk:
+            // a forgotten `--according-to` records an opinion as a
+            // fact, and the two never meet again.
+            let whose = match according_to {
+                None => String::new(),
+                Some(h) => format!(" as entity {h}'s view"),
             };
             let who = if *merged {
                 format!("on entity {entity}, which the store already knew")
@@ -392,7 +400,7 @@ Every vector in this store now comes from one model.",
             // own position is that the fact is kept either way -- what is
             // uncertain is only whose it is.
             if reviews.is_empty() {
-                return format!("{what} {who}");
+                return format!("{what}{whose} {who}");
             }
             let open: Vec<String> = reviews
                 .iter()
@@ -405,7 +413,7 @@ Every vector in this store now comes from one model.",
                 })
                 .collect();
             format!(
-                "{what} {who}\n\nopen question{}: the fact above is recorded either way -- what is open is only whose it is.\n{}",
+                "{what}{whose} {who}\n\nopen question{}: the fact above is recorded either way -- what is open is only whose it is.\n{}",
                 if reviews.len() == 1 { "" } else { "s" },
                 open.join("\n")
             )
@@ -947,6 +955,7 @@ mod tests {
             attribute: "team".into(),
             absent: false,
             merged: false,
+            according_to: None,
             reviews: vec![rm_engine::PendingReview {
                 id: 3,
                 a: 0,

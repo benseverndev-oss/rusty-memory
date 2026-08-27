@@ -433,6 +433,7 @@ pub fn render(outcome: &Outcome) -> Rendered {
             attribute,
             absent,
             merged,
+            according_to,
             reviews,
         } => Rendered {
             text: {
@@ -440,6 +441,12 @@ pub fn render(outcome: &Outcome) -> Rendered {
                     format!("{attribute} recorded as absent")
                 } else {
                     format!("{attribute} recorded")
+                };
+                // Named, because a forgotten `according_to` records an
+                // opinion as a fact and the two never meet again.
+                let whose = match according_to {
+                    None => String::new(),
+                    Some(h) => format!(" as entity {h}'s view"),
                 };
                 let who = if *merged {
                     format!("on entity {entity}, which the store already knew")
@@ -450,7 +457,7 @@ pub fn render(outcome: &Outcome) -> Rendered {
                 // identity is uncertain will go on writing as though it
                 // were settled.
                 if reviews.is_empty() {
-                    format!("{what} {who}.")
+                    format!("{what}{whose} {who}.")
                 } else {
                     let open: Vec<String> = reviews
                         .iter()
@@ -460,7 +467,7 @@ pub fn render(outcome: &Outcome) -> Rendered {
                         })
                         .collect();
                     format!(
-                        "{what} {who}. It could not be told apart from {} -- the fact is recorded either way, and whose it is stays open for a person to settle.",
+                        "{what}{whose} {who}. It could not be told apart from {} -- the fact is recorded either way, and whose it is stays open for a person to settle.",
                         open.join(", ")
                     )
                 }
@@ -470,6 +477,7 @@ pub fn render(outcome: &Outcome) -> Rendered {
                 "attribute": attribute,
                 "absent": absent,
                 "merged": merged,
+                "according_to": according_to.map(|h| h.to_string()),
                 "open_questions": reviews
                     .iter()
                     .map(|r| json!({
