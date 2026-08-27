@@ -578,6 +578,76 @@ after the fence
         assert!(format!("{err}").contains("scratch"), "{err}");
     }
 
+    /// A failure part-way through a plan loses every chunk read before it.
+    ///
+    /// Not a bug -- `plan_tree` is all-or-nothing by construction, so that no
+    /// model call happens under the lock. But it is a cost that only shows up
+    /// at corpus scale: at 30 chunks a retry is free, and at 322 a blip on the
+    /// last one throws away every completion already paid for, because the
+    /// read set is only written by `commit_tree`.
+    ///
+    /// Recorded as a test rather than a note so the day someone makes planning
+    /// resumable, this fails and says what changed.
+    #[test]
+    fn a_failure_part_way_through_planning_discards_the_whole_run() {
+        struct FailsOnThird(std::cell::Cell<usize>);
+        impl Completer for FailsOnThird {
+            fn complete(&self, _: &str) -> Result<String, CompleterError> {
+                self.0.set(self.0.get() + 1);
+                if self.0.get() >= 3 {
+                    return Err(CompleterError("the network went away".into()));
+                }
+                Ok(r#"{"mentions":[{"kind":"person","name":"A","text":"A"}],"facts":[{"subject":0,"attribute":"role","value":"noted","text":"A role"}],"relations":[],"closures":[]}"#.to_string())
+            }
+        }
+
+        let dir = crate::testing::TempDir::new();
+        for (n, body) in [
+            ("a", "alpha"),
+            ("b", "beta"),
+            ("c", "gamma"),
+            ("d", "delta"),
+        ] {
+            std::fs::write(
+                dir.path().join(format!("{n}.md")),
+                format!(
+                    "# {n}
+
+{body}
+"
+                ),
+            )
+            .unwrap();
+        }
+
+        let e = doc_engine();
+        let c = FailsOnThird(std::cell::Cell::new(0));
+        let emb = crate::testing::StubProvider::new(vec![]);
+
+        let Err(err) = plan_tree(
+            e.read_sources(),
+            dir.path(),
+            100,
+            &c,
+            &emb,
+            3,
+            Metric::Cosine,
+        ) else {
+            panic!("a completer that fails should fail the plan")
+        };
+        assert!(format!("{err}").contains("network"), "{err}");
+
+        assert!(
+            e.read_sources().is_empty(),
+            "a failed plan recorded a read, so a retry would skip a chunk it never wrote"
+        );
+        assert_eq!(
+            c.0.get(),
+            3,
+            "planning kept calling after a failure -- it must stop"
+        );
+    }
+
     /// Planning needs no store at all.
     ///
     /// The type is the guarantee that every model call happens above the lock:
