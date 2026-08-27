@@ -247,6 +247,23 @@ pub struct Version {
     /// existed round-trips byte for byte.
     #[serde(default, skip_serializing_if = "Supersession::is_unstated")]
     pub supersession: Supersession,
+
+    /// Whose view this is, when it is a view rather than a fact.
+    ///
+    /// An entity, not a label: a holder is somebody the store already knows,
+    /// so a holder can be asked about like anyone else and two spellings of
+    /// one person cannot become two holders.
+    ///
+    /// `None` is the store's own assertion, which is what every version
+    /// written before this field existed is. Survivorship partitions a slot
+    /// by this before resolving, so one holder correcting themselves is a
+    /// correction and two holders differing is not -- the latter used to be
+    /// settled by arrival order, reporting a change where nothing changed.
+    ///
+    /// Written only when it says something, so a snapshot from before the
+    /// field existed round-trips byte for byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub according_to: Option<StableId>,
 }
 
 impl Version {
@@ -385,6 +402,7 @@ impl MemoryStore {
         valid: Interval,
         provenance: Provenance,
         supersession: Supersession,
+        according_to: Option<StableId>,
     ) -> Result<(), StoreError> {
         let value_is_absent = value.is_none();
         let entity = self
@@ -410,6 +428,7 @@ impl MemoryStore {
                 } else {
                     supersession
                 },
+                according_to,
             });
         Ok(())
     }
@@ -478,6 +497,9 @@ impl MemoryStore {
                 Interval::since(earliest),
                 latest.clone(),
                 Supersession::Corrects,
+                // A materialised resolution is the store's own conclusion,
+                // not anybody's view.
+                None,
             ),
             Outcome::Timeline(facts) => {
                 // A contested span has no representation here: `Version.value`
@@ -507,6 +529,7 @@ impl MemoryStore {
                         fact.valid,
                         latest.clone(),
                         Supersession::Corrects,
+                        None,
                     )?;
                 }
                 Ok(())
@@ -1201,6 +1224,7 @@ mod tests {
             Interval::since(JAN),
             user_said(MAR),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
         s.assert(
@@ -1210,6 +1234,7 @@ mod tests {
             Interval::since(JUL),
             user_said(SEP),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
 
@@ -1237,6 +1262,7 @@ mod tests {
             Interval::since(JAN),
             user_said(SEP),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
         // True since January, but we did not hear it until September.
@@ -1258,6 +1284,7 @@ mod tests {
             Interval::since(JUL),
             user_said(JUL),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
         // "I'm unemployed" is an answer; it must not read as "never discussed".
@@ -1283,6 +1310,7 @@ mod tests {
             Interval::since(JAN),
             user_said(JAN),
             Supersession::Joins,
+            None,
         )
         .unwrap();
         s.assert(
@@ -1292,6 +1320,7 @@ mod tests {
             Interval::since(JUL),
             user_said(JUL),
             Supersession::Joins,
+            None,
         )
         .unwrap();
 
@@ -1322,6 +1351,7 @@ mod tests {
                 Interval::since(t),
                 user_said(t),
                 claim,
+                None,
             )
             .unwrap();
         }
@@ -1350,6 +1380,7 @@ mod tests {
             Interval::since(JAN),
             user_said(JAN),
             Supersession::Corrects,
+            None,
         )
         .unwrap();
 
@@ -1384,6 +1415,7 @@ mod tests {
             Interval::since(JAN),
             user_said(JAN),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
 
@@ -1406,6 +1438,7 @@ mod tests {
             Interval::since(JAN),
             user_said(MAR),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
         s.assert(
@@ -1415,6 +1448,7 @@ mod tests {
             Interval::since(JUL),
             user_said(SEP),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
         assert_eq!(s.as_of(id, "employer", AUG, MAR), Known::Absent);
@@ -1544,6 +1578,7 @@ mod tests {
                 Interval::since(JAN),
                 user_said(MAR),
                 Supersession::Unstated,
+                None,
             )
             .unwrap_err();
         assert_eq!(err, StoreError::UnknownEntity(99));
@@ -1570,6 +1605,7 @@ mod tests {
                 Interval::since(JAN),
                 user_said(JAN),
                 Supersession::Unstated,
+                None,
             )
             .unwrap();
         store
@@ -1580,6 +1616,7 @@ mod tests {
                 Interval::since(JUL),
                 user_said(JUL),
                 Supersession::Unstated,
+                None,
             )
             .unwrap();
 
@@ -2143,6 +2180,7 @@ mod tests {
                 Interval::since(JAN),
                 user_said(JAN),
                 Supersession::Unstated,
+                None,
             )
             .unwrap();
         store
@@ -2579,6 +2617,7 @@ mod tests {
             Interval::since(JAN),
             user_said(MAR),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
         s.assert(
@@ -2588,6 +2627,7 @@ mod tests {
             Interval::since(JUL),
             user_said(SEP),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
 
@@ -2610,6 +2650,7 @@ mod tests {
             Interval::since(JAN),
             user_said(MAR),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
         s.assert(
@@ -2619,6 +2660,7 @@ mod tests {
             Interval::since(JAN),
             user_said(MAR),
             Supersession::Unstated,
+            None,
         )
         .unwrap();
         // Attributes inserted out of order still serialise identically, so
@@ -2710,6 +2752,61 @@ mod tests {
         assert!(
             s.history(id, "employer").is_empty(),
             "a refused resolution left a half-written timeline behind"
+        );
+    }
+}
+
+#[cfg(test)]
+mod holders {
+    use super::*;
+
+    /// A snapshot written before holders existed round-trips byte for byte.
+    ///
+    /// The same promise `supersession` makes, for the same reason: a store's
+    /// whole value is that it stays reconstructible, and a field that rewrites
+    /// every existing snapshot on upgrade costs more than it is worth.
+    ///
+    /// The literal below was captured by serialising a holder-less `Version`
+    /// before the field existed, not hand-written from the struct definition.
+    #[test]
+    fn a_holder_less_version_serialises_exactly_as_it_did_before() {
+        let v = Version {
+            value: Some("Circulation".into()),
+            valid: Interval::since(100),
+            provenance: Provenance::new(rm_core::Source::UserAssertion, 100, "s"),
+            supersession: Supersession::Unstated,
+            according_to: None,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(
+            !json.contains("according_to"),
+            "a holder-less version wrote the field: {json}"
+        );
+        assert_eq!(
+            json,
+            r#"{"value":"Circulation","valid":{"from":100,"to":null},"provenance":{"source":"UserAssertion","observed_at":100,"source_ref":"s"}}"#,
+            "the byte-for-byte shape moved"
+        );
+
+        let back: Version = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.according_to, None);
+    }
+
+    /// A held version writes the field, so the two are distinguishable on disk.
+    #[test]
+    fn a_held_version_says_whose_view_it_is() {
+        let v = Version {
+            value: Some("R&A".into()),
+            valid: Interval::since(100),
+            provenance: Provenance::new(rm_core::Source::UserAssertion, 100, "s"),
+            supersession: Supersession::Unstated,
+            according_to: Some(300),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains(r#""according_to":300"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<Version>(&json).unwrap().according_to,
+            Some(300)
         );
     }
 }

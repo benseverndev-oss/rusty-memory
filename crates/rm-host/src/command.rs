@@ -980,6 +980,7 @@ pub fn commit_note(engine: &mut Engine, plan: NotePlan) -> Result<Outcome, HostE
         valid: Interval::since(valid_from),
         provenance: Provenance::new(Source::UserAssertion, observed_at, session.clone()),
         supersession: Supersession::Corrects,
+        according_to: None,
         embedding,
     };
 
@@ -1023,6 +1024,7 @@ pub fn commit_note(engine: &mut Engine, plan: NotePlan) -> Result<Outcome, HostE
                     valid: Interval::since(valid_from),
                     provenance: Provenance::new(Source::UserAssertion, observed_at, session),
                     supersession: Supersession::Corrects,
+                    according_to: None,
                     embedding: scope_embedding,
                 },
             )
@@ -1770,6 +1772,7 @@ fn write_field(
                 // a sentence. Somebody decided it and said so.
                 provenance: Provenance::new(Source::UserAssertion, observed_at, session),
                 supersession: Supersession::Corrects,
+                according_to: None,
                 embedding: embedding.clone(),
             },
         )
@@ -3232,6 +3235,7 @@ pub(crate) mod tests {
             valid: Interval::since(100),
             provenance: Provenance::new(Source::ToolOutput, 100, "t"),
             supersession: Supersession::Unstated,
+            according_to: None,
             embedding: stub.embed("Ben works at Globex").unwrap(),
         })
         .unwrap();

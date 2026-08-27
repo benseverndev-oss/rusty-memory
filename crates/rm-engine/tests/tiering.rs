@@ -38,6 +38,7 @@ fn told(e: &mut Engine, value: &str, at: i64, session: &str) {
         valid: Interval::since(at),
         provenance: Provenance::new(Source::UserAssertion, at, session),
         supersession: Supersession::Corrects,
+        according_to: None,
         embedding: vec![1.0, 0.0, 0.0],
     })
     .unwrap();
@@ -185,6 +186,7 @@ fn seeded_with(n: usize) -> Engine {
             valid: Interval::since(NOW),
             provenance: Provenance::new(Source::UserAssertion, NOW, "cost"),
             supersession: Supersession::Corrects,
+            according_to: None,
             embedding: vec![1.0, i as f32 / 100.0, 0.0],
         })
         .unwrap();

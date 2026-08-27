@@ -45,6 +45,7 @@ fn person(name: &str, at: i64) -> Observation {
         valid: Interval::since(at),
         provenance: Provenance::new(Source::UserAssertion, at, "s"),
         supersession: Supersession::Unstated,
+        according_to: None,
         embedding: vec![1.0, 0.0, 0.0],
     }
 }
@@ -67,6 +68,7 @@ fn seen(name: &str, attribute: &str, value: &str, at: i64, v: [f32; 3]) -> Obser
         valid: Interval::since(at),
         provenance: Provenance::new(Source::UserAssertion, at, "session-1"),
         supersession: Supersession::Unstated,
+        according_to: None,
         embedding: v.to_vec(),
     }
 }

@@ -245,6 +245,8 @@ impl Engine {
                 // it -- a place that turns out to be an organisation is a
                 // correction, not a second nature.
                 supersession: Supersession::Corrects,
+                // Extraction names nobody as holding a fact, so it is the store's own.
+                according_to: None,
                 embedding,
             })?;
             record(&mut out, remembered);
@@ -294,6 +296,8 @@ impl Engine {
                     valid: Interval::since(fact.valid_from),
                     provenance: prov.clone(),
                     supersession: fact.supersession,
+                    // Extraction names nobody as holding a fact, so it is the store's own.
+                    according_to: None,
                     embedding,
                 },
             )?;

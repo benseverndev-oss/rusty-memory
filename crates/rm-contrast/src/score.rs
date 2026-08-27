@@ -94,6 +94,7 @@ fn load(w: &Workload) -> (Engine, Vec<StableId>) {
             valid: interval(write.valid_from),
             provenance: provenance(write.observed_at),
             supersession: supersession(),
+            according_to: None,
             embedding: vec![1.0, 0.0, 0.0],
         };
         let (id, _) = engine
