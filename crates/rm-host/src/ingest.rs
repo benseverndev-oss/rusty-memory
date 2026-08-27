@@ -208,6 +208,7 @@ pub fn plan_tree(
                 embedder,
                 dimension,
                 metric,
+                crate::command::Witness::Document,
             );
             match planned {
                 Ok(plan) => {
@@ -741,6 +742,77 @@ body {n}
             "kept calling after {} consecutive failures: {} calls",
             CONSECUTIVE_FAILURE_LIMIT,
             c.0.get()
+        );
+    }
+
+    /// A document leaves an unmentioned attribute `Unknown`, never `Absent`.
+    ///
+    /// End to end, through the same path a real run takes. `absent` and
+    /// `unknown` are different answers and the difference is the reason this
+    /// project exists -- one says somebody asserted there is none, the other
+    /// says nobody has been asked. A document that passes over something has
+    /// asserted nothing, so extraction reading one must not be able to produce
+    /// the first.
+    ///
+    /// Measured before this existed: 9 of 79 facts from arrow's API reference
+    /// came back as absences, and `rmem about 15 definition` answered "no value
+    /// -- asserted to have none" about `Field`.
+    #[test]
+    fn a_document_cannot_assert_that_something_has_none() {
+        struct SaysThereIsNone;
+        impl Completer for SaysThereIsNone {
+            fn complete(&self, _: &str) -> Result<String, CompleterError> {
+                Ok(
+                    r#"{"mentions":[{"kind":"thing","name":"Field","text":"Field"}],
+                       "facts":[
+                         {"subject":0,"attribute":"definition","value":null,
+                          "text":"Field has no definition","days_ago":null},
+                         {"subject":0,"attribute":"purpose","value":"describes a column",
+                          "text":"Field describes a column","days_ago":null}],
+                       "relations":[],"closures":[]}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        let dir = crate::testing::TempDir::new();
+        std::fs::write(
+            dir.path().join("f.md"),
+            "# Field
+
+A named column.
+",
+        )
+        .unwrap();
+
+        let mut e = doc_engine();
+        let emb = crate::testing::StubProvider::new(vec![]);
+        let plan = plan_tree(
+            e.read_sources(),
+            dir.path(),
+            100,
+            &SaysThereIsNone,
+            &emb,
+            3,
+            Metric::Cosine,
+        )
+        .unwrap();
+        commit_tree(&mut e, plan).unwrap();
+
+        let entity = *e
+            .entity_ids()
+            .first()
+            .expect("the document named something");
+
+        assert_eq!(
+            e.about(entity, "purpose", 200, 200).unwrap(),
+            rm_engine::Believed::Value("describes a column".to_string()),
+            "the fact that had a value was lost with the one that did not"
+        );
+        assert_eq!(
+            e.about(entity, "definition", 200, 200).unwrap(),
+            rm_engine::Believed::Unknown,
+            "a document asserted an absence -- the store now claims nobody gave              this a definition, which nobody said"
         );
     }
 

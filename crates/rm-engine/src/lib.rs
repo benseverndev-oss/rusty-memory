@@ -67,8 +67,8 @@ pub use review::{PendingReview, ReviewId, Settled};
 // goes past what `Extraction` alone would require.
 pub use rm_core::{Interval, Provenance, Source, Supersession, Timestamp};
 pub use rm_extract::{
-    extract, prompt, Closure, Completer, CompleterError, ExtractError, Extraction, Fact, Mention,
-    Relation, Turn,
+    extract, prompt, without_absences, Closure, Completer, CompleterError, ExtractError,
+    Extraction, Fact, Mention, Relation, Turn,
 };
 pub use rm_graph::{Direction, Neighborhood, Reached, Walk};
 pub use rm_index::{IndexError, Metric, VectorIndex};
