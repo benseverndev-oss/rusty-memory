@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 pub use ingest::{prepare, Closed, Embedder, EmbedderError, Ingested, Prepared};
 pub use policy::Policy;
-pub use read::{Believed, Query, Recalled, Standing};
+pub use read::{Believed, Located, Query, Recalled, Standing, Traced};
 pub use review::{PendingReview, ReviewId, Settled};
 
 // Everything a caller needs to construct an `Observation`, build the index and
