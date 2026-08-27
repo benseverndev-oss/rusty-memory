@@ -16,7 +16,13 @@ use crate::Turn;
 /// "nothing" -- it answers with the example. Measured on arrow's API reference:
 /// 16 of 213 facts in the store were Alex Chen working at Globex, from six
 /// chunks whose entire text was a line like "Null type".
-pub(crate) const EXAMPLE_NAMES: [&str; 2] = ["Alex Chen", "Globex"];
+///
+/// Every string the example offers, not just the names. `"Alex"` is the
+/// example's `text` rather than its `name`, and listing only the `name` let one
+/// fact survive a 322-chunk run: the model answered with `"name": "Alex"`.
+/// `the_guard_covers_every_name_the_example_offers` now derives the list from
+/// the example itself rather than trusting this to be complete.
+pub(crate) const EXAMPLE_NAMES: [&str; 3] = ["Alex Chen", "Alex", "Globex"];
 
 /// A turn that names the worked example, for the two tests that feed the
 /// example back through `extract`.
@@ -549,15 +555,46 @@ mod tests {
             "the prompt has to say what a closure is for, not just name the field"
         );
     }
-    /// The guard's names are the ones the prompt actually shows.
+    /// Every name the example shows is one the guard knows about.
     ///
-    /// `extract` drops mentions matching `EXAMPLE_NAMES` when the turn does not
-    /// contain them. If someone rewrites the example and not the constant, the
-    /// guard silently starts protecting against names nothing emits, which is
-    /// indistinguishable from working.
+    /// This started as the weaker check that each guarded name appears in the
+    /// prompt, which cannot fail the way the guard actually failed: the example
+    /// carries `"name": "Alex Chen"` and `"text": "Alex"`, only the first was
+    /// listed, and a model answered with the second. One leaked fact survived a
+    /// 322-chunk run because of it.
+    ///
+    /// So the direction that matters is this one -- every string the example
+    /// offers a model to copy must be covered, not merely every string already
+    /// covered must be in the example.
     #[test]
-    fn the_example_names_are_the_ones_the_prompt_shows() {
+    fn the_guard_covers_every_name_the_example_offers() {
         let p = prompt(&turn("anything at all", None));
+        let example: serde_json::Value =
+            serde_json::from_str(example_json(&p)).expect("the example should be JSON");
+
+        let mut offered: Vec<String> = Vec::new();
+        for m in example["mentions"].as_array().into_iter().flatten() {
+            for key in ["name", "text"] {
+                if let Some(v) = m[key].as_str() {
+                    offered.push(v.to_string());
+                }
+            }
+        }
+        for f in example["facts"].as_array().into_iter().flatten() {
+            if let Some(v) = f["value"].as_str() {
+                offered.push(v.to_string());
+            }
+        }
+        assert!(!offered.is_empty(), "the example offered nothing to check");
+
+        for name in offered {
+            assert!(
+                EXAMPLE_NAMES.iter().any(|e| e.eq_ignore_ascii_case(&name)),
+                "the example offers {name:?} and the guard does not know it -- a model                  that copies the example will put it in the store"
+            );
+        }
+
+        // And the weaker direction too, so a stale entry is still caught.
         for name in EXAMPLE_NAMES {
             assert!(
                 p.contains(name),

@@ -425,7 +425,10 @@ pub(crate) fn unfenced(response: &str) -> &str {
     body.trim().strip_suffix("```").unwrap_or(body).trim()
 }
 
-/// Is this the prompt's worked example rather than something the turn said?
+/// Is this string the prompt's worked example rather than something the turn said?
+///
+/// Applied to a mention's name and to a fact's value, because the example
+/// offers both and a model copies whichever it reaches for.
 ///
 /// True only when the name is one the prompt shows *and* the turn does not
 /// contain it. A model given a chunk with nothing extractable in it tends to
@@ -524,6 +527,18 @@ pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, Ex
                     continue;
                 }
             };
+        // The value, as well as the mention's name. The example offers both,
+        // and a model reaching for one is as likely to reach for the other:
+        // one fact survived a 322-chunk run as `employer = "Globex"` hung on a
+        // mention this guard had let through under a different spelling.
+        if let Some(v) = f.value.as_deref() {
+            if echoes_the_example(v, &turn.text) {
+                out.dropped.push(drop(format!(
+                    "its value {v:?} is from the prompt's own example and the turn does not contain it"
+                )));
+                continue;
+            }
+        }
         out.facts.push(Fact {
             subject,
             attribute: f.attribute,
@@ -1165,5 +1180,46 @@ mod tests {
             "a fact about a dropped mention survived: {:?}",
             out.facts
         );
+    }
+    /// An example value hung on a real mention is dropped too.
+    ///
+    /// This is the one that got through. The guard covered a mention's name, so
+    /// a 322-chunk run over arrow came back with one leaked fact instead of
+    /// sixteen: a mention the guard let through, carrying `employer = "Globex"`
+    /// from the example. A name-only guard turns a loud failure into a quiet
+    /// one, which is worse than the failure.
+    ///
+    /// The mention here is legitimate and stays. Only the value is the example.
+    #[test]
+    fn an_example_value_on_a_real_mention_is_dropped() {
+        let doc = Turn {
+            text: "BatchCoalescer concatenates small batches into larger ones".to_string(),
+            speaker: None,
+            observed_at: NOW,
+            session: "session-1".to_string(),
+        };
+        let out = extract(
+            &doc,
+            &Canned(
+                r#"{"mentions":[
+                     {"kind":"thing","name":"BatchCoalescer","text":"BatchCoalescer"}],
+                   "facts":[
+                     {"subject":0,"attribute":"employer","value":"Globex",
+                      "text":"BatchCoalescer works at Globex","days_ago":null}],
+                   "relations":[],"closures":[]}"#,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(out.mentions.len(), 1, "a real mention was thrown away");
+        assert_eq!(out.mentions[0].name, "BatchCoalescer");
+        assert!(
+            out.facts.is_empty(),
+            "the example's value was recorded as a fact: {:?}",
+            out.facts
+        );
+        assert_eq!(out.dropped.len(), 1, "{:?}", out.dropped);
+        assert_eq!(out.dropped[0].what, "fact");
+        assert!(out.dropped[0].why.contains("Globex"), "{:?}", out.dropped);
     }
 }
