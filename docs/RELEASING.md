@@ -35,15 +35,48 @@ happens last and only once.
 4. **The full gate.** `cargo test --workspace`, `cargo clippy --workspace
    --all-targets -- -D warnings`, `cargo fmt --all --check`.
 
-5. **Dry run.** `cargo publish --dry-run --workspace` packages and verifies each
-   crate without uploading. On this laptop it OOMs at default parallelism —
-   `rustc-LLVM ERROR: out of memory` — so pass `-j 1`, or run it in CI. That is
-   a limit of the machine, not of the package.
+5. **Dry run.** The release workflow does this for you; run it locally only if
+   you want the answer before tagging. `cargo publish --dry-run --workspace`
+   packages and verifies each crate without uploading, and OOMs on this laptop
+   at default parallelism — `rustc-LLVM ERROR: out of memory` — so pass `-j 1`.
+   That is a limit of the machine, not of the package, and it is most of why
+   releasing moved to CI.
 
 ## Publishing
 
+Tag it. `.github/workflows/release.yml` does the rest.
+
 ```sh
-cargo login          # once per machine, token from crates.io/settings/tokens
+git tag v0.3.0 && git push origin v0.3.0
+```
+
+The workflow re-runs the gate, refuses if the tag disagrees with
+`Cargo.toml`, dry-runs the whole workspace, mints a short-lived crates.io
+token, runs `scripts/publish.sh`, and then installs the published crate into a
+throwaway project to prove it. It runs under the `crates-io` environment, so
+required reviewers on that environment in repository settings become an
+approval gate on the one step that cannot be undone.
+
+CI rather than a laptop for three reasons, only one of which is convention:
+the dry run exhausts memory on the author's machine and completes on a runner;
+a release built from an unspecified working tree is not reproducible; and
+**trusted publishing means no long-lived crates.io credential exists anywhere**
+— not on a laptop, not in repository secrets. crates.io exchanges the
+workflow's OIDC identity for a token scoped to that run, and the action revokes
+it when the job ends.
+
+That last part needs one-time setup per crate, on crates.io, under
+*Settings → Trusted Publishing*: repository `benseverndev-oss/rusty-memory`,
+workflow `release.yml`, environment `crates-io`. Fourteen crates, and until a
+crate has it the workflow will fail on that crate rather than silently skip it.
+
+### Doing it by hand
+
+Still supported, and the workflow calls the same script rather than a second
+copy of the ordering:
+
+```sh
+cargo login          # token from crates.io/settings/tokens
 bash scripts/publish.sh
 ```
 
