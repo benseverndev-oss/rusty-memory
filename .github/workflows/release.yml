@@ -1,0 +1,131 @@
+name: Release
+
+# Publishing is irreversible: a version can be yanked but never replaced, and a
+# name is never freed. Everything before the upload step exists to make the
+# upload boring.
+#
+# Triggered by a tag rather than a merge, so cutting a release is a deliberate
+# act and the thing published is a named, immutable ref. `workflow_dispatch` is
+# for resuming a partial run -- select the same tag; `scripts/publish.sh` skips
+# whatever already reached the index at this version.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Least privilege by default; the publish job adds only what it needs.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    # An approval gate for the one step that cannot be undone. Configure
+    # required reviewers on this environment in repository settings -- until
+    # that is done GitHub creates it unprotected and this runs straight
+    # through, which is worth knowing rather than assuming.
+    environment: crates-io
+
+    permissions:
+      contents: read
+      # Trusted publishing: crates.io exchanges this workflow's OIDC identity
+      # for a short-lived token. No long-lived credential exists on a laptop or
+      # in repository secrets, and the action revokes what it minted when the
+      # job ends.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Nothing here pushes, and a checkout that leaves a usable token in
+          # the runner's git config is a credential later steps did not ask for.
+          persist-credentials: false
+
+      # Same shape as ci.yml: rust-toolchain.toml names the version, and a
+      # green run does not prove the pin bound unless the pin is compared.
+      - name: Toolchain
+        run: |
+          rustup show
+          want=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          got=$(rustc --version | cut -d' ' -f2)
+          if [ "$got" != "$want" ]; then
+            echo "::error::rust-toolchain.toml pins $want but rustc here is $got -- the pin did not bind"
+            exit 1
+          fi
+          echo "rustc $got, as pinned"
+
+      # The tag says what is being released; Cargo.toml decides what actually
+      # uploads. If they disagree the tag is a lie about an immutable artefact,
+      # so stop before anything is built.
+      - name: The tag is the version being published
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          tag="${REF_NAME#v}"
+          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $REF_NAME says $tag, Cargo.toml says $version"
+            exit 1
+          fi
+          echo "releasing $version"
+
+      # No build cache here, deliberately. A cache is shared across workflows
+      # and writable from ones that run on pull requests, so a poisoned entry
+      # would reach the artefact this job uploads to crates.io permanently.
+      # `zizmor` flags it as cache-poisoning, and the saving on a job that runs
+      # once per release is not worth the exposure.
+      #
+      # Re-run rather than trusting the branch build: a tag can point at any
+      # commit, including one that never sat on main.
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --all-features
+
+      # Packages and verifies all fourteen crates without uploading. This is
+      # the step that cannot run on the author's laptop -- it exhausts memory
+      # there at default parallelism -- which is most of why releasing belongs
+      # here.
+      - name: Dry run
+        run: cargo publish --dry-run --workspace
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # The same script a person would run locally, rather than the same
+      # ordering written out twice. It knows the dependency order, waits for
+      # each crate to reach the index at this version, and is idempotent on a
+      # re-run.
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: bash scripts/publish.sh
+
+      # The only check that proves it, and it has to happen from outside the
+      # workspace: inside it, path dependencies resolve whether or not anything
+      # was published.
+      - name: Install it the way an adopter would
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          cd "$(mktemp -d)"
+          cargo new adopt && cd adopt
+          # The index is eventually consistent and `cargo add` reads it, so a
+          # failure in the first seconds after publishing means "not yet",
+          # not "not there".
+          for attempt in 1 2 3 4 5 6; do
+            if cargo add "rusty-memory@$version"; then
+              break
+            fi
+            echo "index has not caught up (attempt $attempt); waiting"
+            sleep 20
+          done
+          cargo build
+          echo "rusty-memory $version installs and builds from crates.io"

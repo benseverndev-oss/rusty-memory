@@ -34,13 +34,12 @@ settled at write time, and two entities that score too close to call are filed
 as a question rather than merged. Entity resolution and survivorship — solved
 problems in master data management — applied to agent memory.
 
-Status: early, and published — `rusty-memory = "0.1"`.
+Status: early, and published — `rusty-memory = "0.3"`.
 
-**This README describes `main`, which is ahead of what is on crates.io.**
-0.2.0 is prepared and not published, so holder-scoped assertions, recall
-depths and `rmem ingest` are in the repository and not in the crate. The
-[CHANGELOG](CHANGELOG.md) says which is which. Depending on `= "0.2"` fails to
-resolve, and this line said to until 2026-08-27.
+0.2.0 was prepared and never published, so crates.io goes 0.1.0 to 0.3.0 and
+anyone upgrading from 0.1.0 needs both sections of the
+[CHANGELOG](CHANGELOG.md). This line said `= "0.2"` until 2026-08-27, which did
+not resolve against anything.
 
 See [`docs/positioning.md`](docs/positioning.md) for what this is and what it
 is not, and [`docs/architecture-sketch.md`](docs/architecture-sketch.md) for

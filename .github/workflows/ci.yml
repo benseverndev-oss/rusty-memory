@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only by default. This job builds and tests and writes nothing back, so
+# the token it is handed should not be able to.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -13,7 +18,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Nothing here pushes, and the default leaves a usable token in the
+          # runner's git config for every later step to inherit.
+          persist-credentials: false
       # No toolchain action: rust-toolchain.toml names the version, and an
       # action that installs one would only be a second place to change it.
       # `rustup show` is what makes the install happen here, with the version
@@ -34,7 +43,7 @@ jobs:
             exit 1
           fi
           echo "rustc $got, as pinned"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
