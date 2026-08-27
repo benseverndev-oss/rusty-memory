@@ -11,6 +11,12 @@
 //! everything into an empty store, which is a silent no-op that looks like
 //! success.
 
+use rm_engine::{Embedder, Engine, Timestamp};
+use rm_extract::Completer;
+
+use crate::command::Outcome;
+use crate::HostError;
+
 /// FNV-1a, 64-bit.
 ///
 /// Hand-written rather than a dependency: this is a dozen lines of arithmetic
@@ -86,6 +92,68 @@ pub fn source_ref(path: &str, chunk: &Chunk) -> String {
     format!("{path}#{}@{}", chunk.heading, chunk.hash)
 }
 
+/// What one document produced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Read {
+    pub chunks_seen: usize,
+    pub chunks_read: usize,
+    pub chunks_skipped: usize,
+    pub facts: usize,
+}
+
+/// Read one document into the store.
+///
+/// Each chunk becomes a turn with **no speaker**. A document has no first
+/// person, and `rm_extract`'s prompt says so explicitly rather than leaving a
+/// blank for the model to fill.
+///
+/// Nothing is ever deleted. A chunk that has vanished since the last read is
+/// simply not seen, and what it once asserted goes on standing until something
+/// contradicts it. A removed sentence is not somebody saying "there is none" --
+/// writing a tombstone for it would manufacture absences at the rate documents
+/// get edited, in a store whose whole claim is that it does not.
+pub fn read_document(
+    engine: &mut Engine,
+    path: &str,
+    markdown: &str,
+    observed_at: Timestamp,
+    completer: &impl Completer,
+    embedder: &impl Embedder,
+) -> Result<Read, HostError> {
+    // Asked once per document rather than once per chunk: this is a walk over
+    // the store, and the answer cannot change while we are reading.
+    let seen = engine.source_refs();
+    let all = chunks(markdown);
+    let mut out = Read {
+        chunks_seen: all.len(),
+        ..Read::default()
+    };
+
+    for chunk in &all {
+        let reference = source_ref(path, chunk);
+        // The hash is in the reference, so an unchanged chunk is one the store
+        // has already seen under exactly this name.
+        if seen.contains(&reference) {
+            out.chunks_skipped += 1;
+            continue;
+        }
+        let outcome = crate::command::remember(
+            engine,
+            &chunk.text,
+            observed_at,
+            &reference,
+            None,
+            completer,
+            embedder,
+        )?;
+        out.chunks_read += 1;
+        if let Outcome::Remembered { ingested, .. } = outcome {
+            out.facts += ingested.assertions.len();
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +224,130 @@ mod tests {
         let out = chunks("# A\n\na\n\n## B\n\nb\n\n### C\n\nc\n\n## D\n\nd\n\n# E\n\ne\n");
         let headings: Vec<&str> = out.iter().map(|c| c.heading.as_str()).collect();
         assert_eq!(headings, ["A", "A > B", "A > B > C", "A > D", "E"]);
+    }
+    // ---- reading a document ---------------------------------------------
+
+    use rm_engine::{
+        BlockingKey, Comparator, FieldRule, Metric, Policy, Ruleset, Strategy, VectorIndex,
+    };
+    use rm_extract::CompleterError;
+
+    /// A stub that counts, so "no model was called" fails legibly rather than
+    /// as a stub running out of canned answers.
+    #[derive(Default)]
+    struct CountingCompleter {
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl CountingCompleter {
+        fn calls(&self) -> usize {
+            self.calls.get()
+        }
+    }
+
+    impl Completer for CountingCompleter {
+        fn complete(&self, prompt: &str) -> Result<String, CompleterError> {
+            self.calls.set(self.calls.get() + 1);
+            // One mention and one fact, named after whatever the chunk said, so
+            // two chunks do not collapse onto one entity.
+            let who = prompt
+                .lines()
+                .find(|l| l.contains("alpha") || l.contains("beta") || l.contains("Okta"))
+                .unwrap_or("someone")
+                .trim()
+                .chars()
+                .take(20)
+                .collect::<String>();
+            Ok(format!(
+                r#"{{"mentions":[{{"kind":"person","name":"{who}","text":"{who}"}}],"facts":[{{"subject":0,"attribute":"role","value":"noted","text":"{who} role"}}],"relations":[],"closures":[]}}"#
+            ))
+        }
+    }
+
+    fn doc_engine() -> Engine {
+        Engine::new(
+            VectorIndex::new(3, Metric::Cosine),
+            Ruleset::new(
+                vec![FieldRule::new("name", Comparator::JaroWinkler, 0.9, 0.01)],
+                vec![BlockingKey::Prefix("name".to_string(), 3)],
+                4.0,
+                6.0,
+            )
+            .unwrap(),
+            Policy::new(Strategy::MostRecent),
+        )
+    }
+
+    /// A second read of an unchanged document calls no model.
+    ///
+    /// The spec makes this the measurement that decides whether ingest ships:
+    /// if it does not hold, ingest is a one-shot import rather than something
+    /// runnable on a schedule.
+    #[test]
+    fn re_reading_an_unchanged_document_calls_no_model() {
+        let doc = "# Roles\n\nRosalind owns the Okta setup.\n";
+        let mut e = doc_engine();
+        let c = CountingCompleter::default();
+        let emb = crate::testing::StubProvider::new(vec![]);
+
+        let first = read_document(&mut e, "docs/team.md", doc, 100, &c, &emb).unwrap();
+        assert_eq!(first.chunks_read, 1);
+        let after_first = c.calls();
+        assert!(after_first > 0, "the first read called no model at all");
+
+        let second = read_document(&mut e, "docs/team.md", doc, 200, &c, &emb).unwrap();
+        assert_eq!(second.chunks_read, 0);
+        assert_eq!(second.chunks_skipped, 1);
+        assert_eq!(
+            c.calls(),
+            after_first,
+            "an unchanged chunk was sent to the model again"
+        );
+    }
+
+    /// An edited section is read again; its unedited neighbours are not.
+    #[test]
+    fn editing_one_section_re_reads_only_that_section() {
+        let before = "# A\n\nalpha\n\n# B\n\nbeta\n";
+        let after = "# A\n\nalpha\n\n# B\n\nbeta edited\n";
+        let mut e = doc_engine();
+        let c = CountingCompleter::default();
+        let emb = crate::testing::StubProvider::new(vec![]);
+
+        read_document(&mut e, "docs/x.md", before, 100, &c, &emb).unwrap();
+        let baseline = c.calls();
+
+        let out = read_document(&mut e, "docs/x.md", after, 200, &c, &emb).unwrap();
+        assert_eq!(out.chunks_read, 1, "both sections were re-read");
+        assert_eq!(out.chunks_skipped, 1);
+        assert_eq!(c.calls(), baseline + 1);
+    }
+
+    /// A section deleted from a document writes nothing.
+    ///
+    /// A removed sentence is not an assertion of absence: nobody said there is
+    /// none, the document simply stopped saying it. Writing a tombstone here
+    /// would manufacture absences at the rate documents get edited.
+    #[test]
+    fn deleting_a_section_asserts_nothing() {
+        let before = "# A\n\nalpha\n\n# B\n\nbeta\n";
+        let after = "# A\n\nalpha\n";
+        let mut e = doc_engine();
+        let c = CountingCompleter::default();
+        let emb = crate::testing::StubProvider::new(vec![]);
+
+        read_document(&mut e, "docs/x.md", before, 100, &c, &emb).unwrap();
+        let sources_before = e.source_refs().len();
+        let calls_before = c.calls();
+
+        let out = read_document(&mut e, "docs/x.md", after, 200, &c, &emb).unwrap();
+        assert_eq!(out.chunks_seen, 1, "the deleted section was still seen");
+        assert_eq!(out.chunks_read, 0);
+        assert_eq!(
+            e.source_refs().len(),
+            sources_before,
+            "removing a section wrote something -- it must write nothing"
+        );
+        assert_eq!(c.calls(), calls_before, "a deletion called the model");
     }
 }
