@@ -22,6 +22,7 @@
 pub mod attribution;
 pub mod command;
 pub mod config;
+pub mod ingest;
 pub mod scope;
 pub mod store;
 pub mod testing;
