@@ -67,8 +67,21 @@ pub fn chunks(markdown: &str) -> Vec<Chunk> {
         });
     }
 
+    // Whether we are inside a ``` or ~~~ block. Code is not structure: Rust
+    // starts a line with `#[derive(...)]` and rustdoc hides doctest setup
+    // behind `# `, so without this a reference corpus splits on its own code
+    // and every fragment after the split carries the wrong subject.
+    let mut fenced = false;
+
     for line in markdown.lines() {
-        if line.starts_with('#') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+            body.push_str(line);
+            body.push('\n');
+            continue;
+        }
+        if line.starts_with('#') && !fenced {
             let depth = line.chars().take_while(|c| *c == '#').count();
             let title = line.trim_start_matches('#').trim().to_string();
             flush(&heading, &mut body, &mut out);
@@ -281,6 +294,38 @@ fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `#` inside a code fence is code, not a heading.
+    ///
+    /// Rust puts an attribute at the start of a line (`#[derive(Debug)]`) and
+    /// rustdoc hides doctest setup lines behind `# `, so a reference corpus is
+    /// full of lines that look like headings and are not. Splitting on one
+    /// detaches the rest of an item's documentation from the item it is about,
+    /// which is worse than a bad heading: the text arrives at the model with
+    /// the wrong subject.
+    ///
+    /// Measured before this test existed: 206 such lines in this repository's
+    /// own `docs/`, and 6% of documented items in `arrow-schema`.
+    #[test]
+    fn a_hash_inside_a_code_fence_is_not_a_heading() {
+        let out = chunks(
+            "# Title
+
+```rust
+#[derive(Debug)]
+struct S;
+```
+
+after the fence
+",
+        );
+        let headings: Vec<&str> = out.iter().map(|c| c.heading.as_str()).collect();
+        assert_eq!(headings, ["Title"], "a code line was read as a heading");
+        assert!(
+            out[0].text.contains("after the fence"),
+            "the fence split the chunk, so the tail lost its subject"
+        );
+    }
 
     /// Headings are the author's own segmentation, so they are the split.
     #[test]
