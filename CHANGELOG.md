@@ -1,9 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+**If you are on 0.1.0, this is your next version.** 0.2.0 was prepared and
+never published, so everything in its section below ships here for the first
+time — read both. Fourteen crates; `rusty-memory` is the one to depend on.
 
 **Breaking, in `rusty-memory-host` only.** `plan_remember` takes a `Witness` as
-a final argument. `Witness::Speaker` is what every 0.2.0 call meant.
+a final argument. `Witness::Speaker` is what every earlier call meant.
 
 ### A document cannot assert that something has none
 
@@ -76,6 +80,11 @@ fragment attached to the wrong subject.
   rather than an unlucky one.
 
 ## 0.2.0
+
+**Never published.** Prepared, version-bumped, and not uploaded — crates.io
+went 0.1.0 to 0.3.0. The section is kept rather than folded into 0.3.0 because
+its three breaking changes are real and someone upgrading from 0.1.0 has to
+make them; only the release it arrived in is different.
 
 **Breaking.** Three public signatures changed, so anything built against 0.1.0
 needs an edit. Each is one argument or one field:
