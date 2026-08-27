@@ -459,6 +459,19 @@ Every vector in this store now comes from one model.",
                 .join("\n")
         }
 
+        // The counts are the point: a run's cost is legible before and after.
+        Outcome::Ingested(read) => format!(
+            "{} chunks, {} read, {} unchanged, {} facts",
+            read.chunks_seen, read.chunks_read, read.chunks_skipped, read.facts
+        ),
+
+        // --dry-run: what a run would cost, having called nothing. No fact
+        // count, because counting them would mean extracting them.
+        Outcome::Surveyed(read) => format!(
+            "{} chunks, {} would be read, {} unchanged -- nothing was called",
+            read.chunks_seen, read.chunks_read, read.chunks_skipped
+        ),
+
         Outcome::Rejected => "kept apart, and not asked again".to_string(),
     }
 }

@@ -150,6 +150,10 @@ pub enum Outcome {
         weak_below: f32,
     },
 
+    /// What a document ingest wrote.
+    Ingested(crate::ingest::Read),
+    /// What a document ingest *would* write, having called nothing.
+    Surveyed(crate::ingest::Read),
     /// A recall at [`Depth::Located`]: locators, no assertion text.
     LocatedHits {
         hits: Vec<rm_engine::Located>,

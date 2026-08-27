@@ -183,6 +183,36 @@ pub fn plan_tree(
     Ok(out)
 }
 
+/// Count what a run would read, without calling anything.
+///
+/// What `--dry-run` reports. The point is to know a run's cost before paying
+/// it: a tree whose chunks are almost all unchanged costs almost nothing, and
+/// one being read for the first time costs a completion per chunk.
+pub fn survey(
+    seen: &std::collections::BTreeSet<String>,
+    root: &std::path::Path,
+) -> Result<Read, HostError> {
+    let mut files = Vec::new();
+    collect(root, &mut files)?;
+    files.sort();
+
+    let mut out = Read::default();
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .map_err(|e| HostError::Refused(format!("could not read {}: {e}", file.display())))?;
+        let shown = file.to_string_lossy().replace('\\', "/");
+        for chunk in chunks(&text) {
+            out.chunks_seen += 1;
+            if seen.contains(&source_ref(&shown, &chunk)) {
+                out.chunks_skipped += 1;
+            } else {
+                out.chunks_read += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Write what [`plan_tree`] extracted.
 ///
 /// # Refusing a store that is not a scratch one
@@ -524,5 +554,61 @@ mod tests {
         assert_eq!(plan.planned.len(), 2);
         assert_eq!(plan.skipped, 0);
         assert!(c.calls() > 0, "planning called no model");
+    }
+    /// A chunk that yields no facts leaves no trace, and is read again forever.
+    ///
+    /// **This fails, and it is committed failing on purpose.** It is the
+    /// defect a real run found: 30 chunks of this repository's own
+    /// documentation produced 9 source_refs, because 21 of them extracted to
+    /// nothing. The store cannot be its own ledger of what was *read* when it
+    /// only records what was *written*.
+    ///
+    /// Every other test here missed it because their stub always returns a
+    /// fact, so the zero-yield path did not exist. Ignored rather than
+    /// deleted: the fix is a design decision -- see
+    /// `docs/ingest-findings.md` -- and a defect nobody can see is one nobody
+    /// fixes.
+    #[test]
+    #[ignore = "known defect: a zero-yield chunk is re-read forever"]
+    fn a_chunk_that_yields_nothing_is_still_remembered_as_read() {
+        /// Extracts nothing, which is what most prose does.
+        struct Silent;
+        impl Completer for Silent {
+            fn complete(&self, _: &str) -> Result<String, CompleterError> {
+                Ok(r#"{"mentions":[],"facts":[],"relations":[],"closures":[]}"#.to_string())
+            }
+        }
+
+        let dir = tree();
+        let mut e = doc_engine();
+        let emb = crate::testing::StubProvider::new(vec![]);
+
+        let plan = plan_tree(
+            &e.source_refs(),
+            dir.path(),
+            100,
+            &Silent,
+            &emb,
+            3,
+            Metric::Cosine,
+        )
+        .unwrap();
+        commit_tree(&mut e, plan).unwrap();
+
+        let plan = plan_tree(
+            &e.source_refs(),
+            dir.path(),
+            200,
+            &Silent,
+            &emb,
+            3,
+            Metric::Cosine,
+        )
+        .unwrap();
+        let again = commit_tree(&mut e, plan).unwrap();
+        assert_eq!(
+            again.chunks_read, 0,
+            "a chunk that asserted nothing was sent to the model a second time"
+        );
     }
 }
