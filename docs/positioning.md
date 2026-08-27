@@ -34,16 +34,23 @@ a different answer from `Absent`, and the difference is the product.
 
 A memory has boundaries: things come in, are stored, are identified, are
 related, are asked about, and are shared. The principle above is a claim about
-**all six**, and it currently holds at three of them.
+**all six**, and it currently holds at four of them.
 
 | boundary | crate | does it refuse to fabricate? |
 |---|---|---|
 | storage — competing values over time | `rm-survivor` | **yes.** Both kept, resolved at read time |
 | identity — is this the same thing? | `rm-resolve` | **yes.** The review band files a question |
 | query — what does it hold? | `rm-engine` | **yes.** Three states, not two |
+| sharing — whose view is this? | `rm-engine` | **yes.** A holder's assertions are their own slot, and disagreement is kept rather than settled by arrival |
 | input — what did that text assert? | `rm-extract` | **not yet.** Extraction asserts; it does not decline |
 | relations — how do these connect? | `rm-graph` | **not yet.** No edge has ever been written |
 | retrieval — is this near enough? | `rm-index` | **partly.** `weak_below` labels rather than filters, and is off by default because no cutoff transferred between corpora |
+
+Sharing was the most recent to close: an assertion can now name whose
+view it is, and two people differing is kept rather than settled by
+arrival order. Retrieval also moved — a caller can ask for an answer
+without the text that established it, which is the same refusal applied
+to what a hit costs rather than to what it claims.
 
 This is the growth story, and it is why the dormant crates are not a backlog.
 `rm-extract` and `rm-graph` are the same idea not yet extended to the two
