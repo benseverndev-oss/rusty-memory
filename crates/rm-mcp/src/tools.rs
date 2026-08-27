@@ -49,7 +49,7 @@ pub const SCOPE_ENV: &str = "RMEM_SCOPE";
 /// # Why a session should be able to ask for fewer
 ///
 /// The tool table is sent on every turn of every session that has this server
-/// configured, whether or not it is used. Measured: nine tools are about 2,560
+/// configured, whether or not it is used. Measured: nine tools are about 2,640
 /// tokens, which is more than a thirty-decision log costs to read in full -- so
 /// a project that only ever consults decisions pays a log's worth of context
 /// per turn to advertise six tools it will never call.
@@ -123,6 +123,10 @@ fn all_definitions() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "according_to": {
+                        "type": "integer",
+                        "description": "The entity whose view this is, if it is a view rather than a fact. Omit it and the assertion is the store's own -- a fact nobody is named as holding. Two people differing are both kept; neither overwrites the other, and neither reaches a read that did not ask for a holder."
+                    },
                     "who": {
                         "type": "string",
                         "description": "Who the fact is about -- what the store scores against everyone it already knows."
@@ -410,6 +414,9 @@ pub enum Call {
         valid_from: Option<Timestamp>,
         scope: Option<String>,
         session: String,
+        /// Whose view this is, as an entity id. `None` records the
+        /// store's own fact, which is what saying nothing asserts.
+        according_to: Option<StableId>,
     },
     Decide {
         title: String,
@@ -607,6 +614,8 @@ impl Call {
                         .transpose()?,
                     scope: optional_string(arguments, "scope")?,
                     session: Call::attributed(arguments, client)?,
+                    according_to: optional_integer(arguments, "according_to")?
+                        .map(|n| n as StableId),
                 })
             }
             "decide" => Ok(Call::Decide {
@@ -1342,16 +1351,16 @@ mod tests {
     fn the_tool_table_is_the_size_the_documentation_says() {
         let chars = serde_json::to_string(&all_definitions()).unwrap().len();
         assert!(
-            (9_700..10_700).contains(&chars),
+            (10_000..11_000).contains(&chars),
             "the table is {chars} chars; update the README's row and the comment on `definitions` together"
         );
         let tokens = chars as f64 / CHARS_PER_TOKEN;
-        assert!((tokens - 2_560.0).abs() < 150.0, "~{tokens:.0} tokens");
+        assert!((tokens - 2_640.0).abs() < 150.0, "~{tokens:.0} tokens");
     }
     /// Measured 2026-08-26, before the prose edit that follows.
     const EXPECTED_BYTES: &[(&str, usize)] = &[
         ("remember", 788),
-        ("note", 1834),
+        ("note", 2158),
         ("recall", 1594),
         ("about", 889),
         ("reviews", 380),

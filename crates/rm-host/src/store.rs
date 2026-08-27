@@ -368,6 +368,7 @@ mod tests {
             valid: rm_engine::Interval::since(at),
             provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, at, "test"),
             supersession: rm_engine::Supersession::Unstated,
+            according_to: None,
             embedding: vec![1.0, 0.0, 0.0],
         }
     }
@@ -545,6 +546,7 @@ mod tests {
                 valid: rm_engine::Interval::since(1),
                 provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, 1, "test"),
                 supersession: rm_engine::Supersession::Unstated,
+                according_to: None,
                 embedding: vec![1.0, 0.0, 0.0],
             })
             .unwrap();
@@ -721,6 +723,7 @@ mod tests {
                 valid: rm_engine::Interval::since(1),
                 provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, 1, "test"),
                 supersession: rm_engine::Supersession::Unstated,
+                according_to: None,
                 embedding: vec![1.0, 0.0, 0.0],
             })
             .unwrap();
@@ -740,6 +743,7 @@ mod tests {
                 valid: rm_engine::Interval::since(2),
                 provenance: rm_engine::Provenance::new(rm_engine::Source::UserAssertion, 2, "test"),
                 supersession: rm_engine::Supersession::Unstated,
+                according_to: None,
                 embedding: vec![0.0, 1.0, 0.0],
             })
             .unwrap();

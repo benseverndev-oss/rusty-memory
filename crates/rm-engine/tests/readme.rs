@@ -41,6 +41,7 @@ fn told(employer: &str, at: i64, session: &str, embedding: [f32; 3]) -> Observat
         // last. Saying so is what lets the recall below report a correction
         // rather than the mere fact that something arrived afterwards.
         supersession: Supersession::Corrects,
+        according_to: None,
         embedding: embedding.to_vec(),
     }
 }

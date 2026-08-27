@@ -289,6 +289,49 @@ impl Engine {
     ///
     /// [`Strategy::MostRecent`]: rm_survivor::Strategy::MostRecent
     /// [`Strategy::ValidInterval`]: rm_survivor::Strategy::ValidInterval
+    /// What one person believes an attribute holds.
+    ///
+    /// A holder is an entity, so it can be asked about like anyone else.
+    /// A holder who has said nothing reads [`Believed::Unknown`] rather
+    /// than falling back to the store's own assertion -- falling back
+    /// would put words in somebody's mouth.
+    pub fn about_according_to(
+        &self,
+        entity: StableId,
+        attribute: &str,
+        according_to: StableId,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+    ) -> Result<Believed, EngineError> {
+        self.about_under_held_by(
+            &self.policy,
+            entity,
+            attribute,
+            valid_t,
+            tx_t,
+            Some(according_to),
+        )
+    }
+
+    /// Everyone who holds a view on an attribute, lowest id first.
+    ///
+    /// Deliberately a call rather than a fourth [`Believed`] variant. A
+    /// `Contested` answer would change what every existing read can
+    /// return, and the compatibility promise is worth more than the
+    /// convenience. Empty when nobody has offered one, which is not the
+    /// same as nobody disagreeing.
+    pub fn holders_of(&self, entity: StableId, attribute: &str) -> Vec<StableId> {
+        let mut holders: Vec<StableId> = self
+            .store
+            .history(entity, attribute)
+            .iter()
+            .filter_map(|v| v.according_to)
+            .collect();
+        holders.sort_unstable();
+        holders.dedup();
+        holders
+    }
+
     pub fn about_under(
         &self,
         policy: &Policy,
@@ -297,12 +340,37 @@ impl Engine {
         valid_t: Timestamp,
         tx_t: Timestamp,
     ) -> Result<Believed, EngineError> {
+        self.about_under_held_by(policy, entity, attribute, valid_t, tx_t, None)
+    }
+
+    /// What one person's view of an attribute is, under a policy.
+    ///
+    /// `according_to` partitions the slot before survivorship runs, and `None`
+    /// matches only `None`. That is the whole feature and the whole
+    /// compatibility promise at once: one holder correcting themselves is a
+    /// correction, two holders differing is not, and an assertion written
+    /// before holders existed answers exactly as it always did.
+    fn about_under_held_by(
+        &self,
+        policy: &Policy,
+        entity: StableId,
+        attribute: &str,
+        valid_t: Timestamp,
+        tx_t: Timestamp,
+        according_to: Option<StableId>,
+    ) -> Result<Believed, EngineError> {
         // Only what we had by tx_t. Later knowledge does not leak backwards.
+        //
+        // ...and only what this holder said. `None` matches only `None`: a
+        // holder-less read returning views would make every existing entity
+        // start answering differently the moment somebody recorded an opinion
+        // about it, and a holder's read returning facts would attribute the
+        // store's own assertions to a person who never made them.
         let versions: Vec<_> = self
             .store
             .history(entity, attribute)
             .iter()
-            .filter(|v| v.ingested_at() <= tx_t)
+            .filter(|v| v.ingested_at() <= tx_t && v.according_to == according_to)
             .collect();
         if versions.is_empty() {
             // Covers three cases that are all the same answer: an unknown

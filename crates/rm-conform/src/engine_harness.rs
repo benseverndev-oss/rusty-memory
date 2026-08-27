@@ -44,6 +44,7 @@ pub fn build(history: &[Assertion], attribute: &str, strategy: Strategy) -> (Eng
             valid: a.valid,
             provenance: a.provenance.clone(),
             supersession: a.supersession,
+            according_to: None,
             embedding: vec![1.0, 0.0, 0.0],
         };
         let (id, _) = engine.remember_as(entity, obs).expect("pinned write");

@@ -29,7 +29,7 @@
 //! `args` iterator and none of them from any file. Anything that begins
 //! reading a file in here needs this paragraph revisited.
 
-use rm_engine::Timestamp;
+use rm_engine::{StableId, Timestamp};
 use rm_host::scope::UNIVERSAL;
 
 use crate::CliError;
@@ -99,6 +99,9 @@ pub enum Command {
         fields: Vec<(String, String)>,
         valid_from: Option<Timestamp>,
         scope: Option<String>,
+        /// Whose view this is, as an entity id. `None` records the
+        /// store's own fact, which is what saying nothing asserts.
+        according_to: Option<StableId>,
     },
     Remember {
         text: String,
@@ -415,6 +418,17 @@ pub fn parse(args: impl Iterator<Item = String>) -> Result<Command, CliError> {
                     .map(|d| rm_host::time::parse_day(&d).map_err(CliError::Usage))
                     .transpose()?,
                 scope: flag(&args, "--scope")?,
+                // An id, never a name. Resolving a holder's name here
+                // would put a resolution failure -- and possibly a
+                // review -- in the middle of a write.
+                according_to: match flag(&args, "--according-to")? {
+                    None => None,
+                    Some(v) => Some(v.parse::<StableId>().map_err(|_| {
+                        CliError::Usage(format!(
+                            "--according-to takes an entity id, not {v:?} -- resolve the name first\n\n{USAGE}"
+                        ))
+                    })?),
+                },
             })
         }
 
@@ -1050,6 +1064,7 @@ mod tests {
                 fields: vec![],
                 valid_from: None,
                 scope: None,
+                according_to: None,
             }
         );
     }
@@ -1069,6 +1084,7 @@ mod tests {
                 fields: vec![],
                 valid_from: None,
                 scope: None,
+                according_to: None,
             }
         );
         let err = parse_args(&["note", "Jon", "reports", "none", "--absent"]).unwrap_err();
@@ -1110,5 +1126,51 @@ mod tests {
     fn a_field_without_a_value_is_refused() {
         let err = parse_args(&["note", "Jon", "role", "x", "--field", "email"]).unwrap_err();
         assert!(format!("{err}").contains("--field"), "{err}");
+    }
+    /// `--according-to` takes an entity id, not a name.
+    ///
+    /// Resolving a holder's name would put a resolution failure -- and
+    /// possibly a review -- in the middle of a write. The host resolves
+    /// first; this parses an id or refuses.
+    #[test]
+    fn according_to_takes_an_id_and_refuses_a_name() {
+        let Command::Note { according_to, .. } = parse_args(&[
+            "note",
+            "Jon",
+            "team",
+            "Circulation",
+            "--according-to",
+            "300",
+        ])
+        .unwrap() else {
+            panic!("expected Note")
+        };
+        assert_eq!(according_to, Some(300));
+
+        let err = parse_args(&[
+            "note",
+            "Jon",
+            "team",
+            "Circulation",
+            "--according-to",
+            "Divya",
+        ])
+        .unwrap_err();
+        assert!(format!("{err}").contains("entity id"), "{err}");
+    }
+
+    /// Saying nothing records the store's own fact.
+    ///
+    /// The default is the risk: two commands differing by one argument
+    /// produce records that never meet, so what the absence asserts is
+    /// pinned rather than assumed.
+    #[test]
+    fn a_note_without_the_flag_is_the_stores_own_fact() {
+        let Command::Note { according_to, .. } =
+            parse_args(&["note", "Jon", "team", "Circulation"]).unwrap()
+        else {
+            panic!("expected Note")
+        };
+        assert_eq!(according_to, None);
     }
 }

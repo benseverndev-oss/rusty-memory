@@ -265,6 +265,7 @@ pub fn run(
                 fields,
                 valid_from,
                 scope,
+                according_to,
             } => {
                 // An embedder, never a provider. A fact someone already
                 // knows has a known shape, so this costs one embedding and
@@ -281,6 +282,7 @@ pub fn run(
                     now,
                     &attribution::cli(),
                     scope.as_deref(),
+                    *according_to,
                     &embedder,
                 )?))
             }

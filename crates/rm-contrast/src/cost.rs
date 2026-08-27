@@ -338,6 +338,7 @@ mod tests {
             valid: Interval::since(at),
             provenance: Provenance::new(Source::UserAssertion, at, format!("cost-{at}")),
             supersession: Supersession::Corrects,
+            according_to: None,
             embedding: vec![1.0, 0.0, 0.0],
         }
     }

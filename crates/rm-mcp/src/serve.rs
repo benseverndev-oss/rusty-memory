@@ -509,6 +509,7 @@ where
                 valid_from,
                 scope,
                 session,
+                according_to,
             } => {
                 // An embedder alone, like `decide`. A fact someone already
                 // knows has a known shape, so nothing has to be guessed out of
@@ -524,6 +525,7 @@ where
                     now,
                     session,
                     scope.as_deref(),
+                    *according_to,
                     &embedder,
                 )?))
             }

@@ -178,6 +178,7 @@ fn seeded(corpus: &Corpus) -> (Engine, Vec<(usize, usize)>) {
                 valid: Interval::since(NOW),
                 provenance: Provenance::new(Source::UserAssertion, NOW, "absence-corpus"),
                 supersession: Supersession::Corrects,
+                according_to: None,
                 embedding,
             };
             let id = match engine.remember(observation).unwrap() {

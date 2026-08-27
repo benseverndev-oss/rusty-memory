@@ -622,6 +622,9 @@ impl Engine {
                         v.valid,
                         v.provenance,
                         v.supersession,
+                        // A merge moves versions; it does not reattribute
+                        // them. Whoever held a view still holds it.
+                        v.according_to,
                     )
                     .map_err(on_write)?;
             }
@@ -837,6 +840,7 @@ impl Engine {
             obs.valid,
             obs.provenance.clone(),
             obs.supersession,
+            obs.according_to,
         )?;
         let version = self.store.history(entity, &obs.attribute).len() - 1;
 
@@ -975,6 +979,10 @@ impl Engine {
                 // suggest the question was open. "Stop telling me this" is the
                 // least open question in the crate.
                 Supersession::Corrects,
+                // `forget` silences the attribute for everyone. A tombstone
+                // held by one person would only silence their view, which is
+                // not what being asked to stop is.
+                None,
             )
             .map_err(on_write)?;
         self.drop_vectors(entity, attribute);
@@ -1213,6 +1221,16 @@ pub struct Observation {
     pub supersession: Supersession,
     /// Caller-supplied. `rm_extract` is the only crate permitted to reach the
     /// network, so nothing here computes an embedding.
+    /// Whose view this is, when it is a view rather than a fact.
+    ///
+    /// An entity, not a label, so a holder can be asked about like anyone
+    /// else and two spellings of one person cannot become two holders.
+    ///
+    /// `None` is the store's own assertion, and is what every observation
+    /// written before this field existed is. Survivorship partitions a slot
+    /// by this, so one holder correcting themselves is a correction and two
+    /// holders differing is not.
+    pub according_to: Option<StableId>,
     pub embedding: Vec<f32>,
 }
 
@@ -1280,6 +1298,7 @@ mod tests {
             // so the tests exercise the same path an unconsidered caller takes.
             // `correcting` marks the ones that are about a fact changing.
             supersession: Supersession::Unstated,
+            according_to: None,
             embedding: vec![1.0, 0.0, 0.0],
         }
     }
@@ -1335,6 +1354,7 @@ mod tests {
                 valid: Interval::since(valid_from),
                 provenance: Provenance::new(Source::UserAssertion, heard, "s"),
                 supersession: Supersession::Unstated,
+                according_to: None,
                 embedding: vec![1.0, 0.0, 0.0],
             })
             .unwrap()
@@ -4017,6 +4037,7 @@ mod tests {
             valid: Interval::since(at),
             provenance: Provenance::new(Source::ToolOutput, at, "session-1"),
             supersession: Supersession::Unstated,
+            according_to: None,
             embedding: vec![1.0, 0.0, 0.0],
         };
 
