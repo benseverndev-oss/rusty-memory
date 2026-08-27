@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+**Breaking, in `rusty-memory-host` only.** `plan_remember` takes a `Witness` as
+a final argument. `Witness::Speaker` is what every 0.2.0 call meant.
+
+### A document cannot assert that something has none
+
+`value: None` on a fact is not a missing fact — it is the claim that the
+attribute *has* no value, and it is why this store answers `absent` where
+another answers nothing at all. A person can make that claim: "he has no direct
+reports" is a real thing to say. A document cannot. It says what it says, and
+passing over something is not a claim about it.
+
+Nine of 79 facts read from Apache Arrow's API reference arrived as absences —
+`Field` has no definition, `Opaque` has no type — and the store went on to
+report exactly that, while correctly saying it knew nothing about `Field`'s
+colour. The difference between those two answers is the reason this project
+exists.
+
+`rm_extract::without_absences` removes them and records each in `dropped`, which
+the CLI already prints, so it is a reported loss and not a silent one. It runs
+before `prepare`, so a removed fact is never embedded or costed. Dialogue is
+untouched: `rmem remember` still records an absence a speaker states, and a test
+asserts the guard is *not* applied there.
+
 ### Reading documents
 
 `rmem ingest <dir>` reads every `.md` under a directory, splitting each on its

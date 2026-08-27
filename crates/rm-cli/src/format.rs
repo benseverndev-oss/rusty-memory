@@ -470,14 +470,29 @@ Every vector in this store now comes from one model.",
                 "{} chunks, {} read, {} unchanged, {} facts",
                 read.chunks_seen, read.chunks_read, read.chunks_skipped, read.facts
             );
-            if read.chunks_failed == 0 {
+            let mut out = if read.chunks_failed == 0 {
                 base
             } else {
                 format!(
                     "{base}, {} unreadable (not recorded as read, so the next run retries them)",
                     read.chunks_failed
                 )
+            };
+            // Named, not counted. These are readings the extractor offered and
+            // the store would not take -- an absence a document cannot assert,
+            // a name copied from the prompt's own example -- and which one it
+            // was is the whole of what a reader wants to know.
+            if !read.not_kept.is_empty() {
+                out.push_str("
+not kept:
+");
+                for line in &read.not_kept {
+                    out.push_str(&format!("  {line}
+"));
+                }
+                out = out.trim_end().to_string();
             }
+            out
         }
 
         // --dry-run: what a run would cost, having called nothing. No fact
@@ -1027,6 +1042,7 @@ mod tests {
             chunks_read: 322,
             chunks_skipped: 0,
             chunks_failed: 0,
+            not_kept: Vec::new(),
             facts: 900,
         }));
         assert_eq!(clean, "322 chunks, 322 read, 0 unchanged, 900 facts");
@@ -1040,6 +1056,7 @@ mod tests {
             chunks_read: 319,
             chunks_skipped: 0,
             chunks_failed: 3,
+            not_kept: Vec::new(),
             facts: 890,
         }));
         assert!(lossy.contains("3 unreadable"), "{lossy}");

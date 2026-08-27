@@ -226,13 +226,32 @@ for dialogue, where a person really can say someone has none. It is wrong for a
 document, which is not a witness and cannot assert an absence by failing to
 mention something.
 
+**This is fixed**; see "What this changes" below. The numbers above are from the
+run that found it.
+
 ## What this changes
 
-**Extraction from a document should not be able to assert an absence.** That is
-narrower and more urgent than the declines spec describes, it is testable
-without a model, and it protects the one distinction the library is built on.
-Recorded here rather than done, because it is a decision about what a document
-*is* rather than a defect to patch.
+**Extraction from a document can no longer assert an absence.** Fixed after
+this was written. `rm_extract::without_absences` removes facts with a null
+value, and `plan_remember` takes a `Witness` saying whether the source is a
+speaker or a document — dialogue is untouched, because a person really can say
+someone has none, and a test asserts the guard is *not* applied there.
+
+Re-run over the same 322 sections:
+
+```
+$ rmem about 2 definition
+nothing known — this was never discussed
+```
+
+Zero tombstones in the store, from nine. Guaranteed by construction rather than
+by luck: every null-valued fact from a document is removed, and each removal is
+reported by section and reason rather than counted.
+
+That last part was itself wrong when first written. `commit_tree` kept only the
+assertion count and discarded the reasons, so the fix was silent on exactly the
+run — hundreds of sections — where a reader cannot go and look. `Read` now
+carries them out.
 
 **The declines spec now has evidence, and the evidence changes its argument.**
 It was written around saving completions on ambiguous readings. The measured

@@ -446,6 +446,69 @@ fn echoes_the_example(name: &str, turn: &str) -> bool {
         && !turn.to_lowercase().contains(&name.to_lowercase())
 }
 
+/// Remove the facts that assert an absence, for a source that cannot assert one.
+///
+/// `value: None` is not a missing fact here -- it is the claim that the
+/// attribute has no value, and it is why the store can answer `absent` where
+/// another would answer nothing. That is right for dialogue: a person really
+/// can say someone has no siblings, and "nobody has said" and "someone said
+/// there are none" are different answers worth keeping apart.
+///
+/// A document is not a witness. It says what it says, and passing over
+/// something is not a claim about it -- so an extractor reading one must not be
+/// able to turn silence into an assertion.
+///
+/// # Why this exists
+///
+/// Measured against Apache Arrow's API reference: 9 of 79 facts came back this
+/// way. `Field` has no definition. `Opaque` has no type. The store then told a
+/// reader, correctly by its own rules, that arrow's `Field` is *asserted* to
+/// have no definition -- while still saying it knew nothing about its colour.
+/// The difference between those two answers is the reason this project exists,
+/// and extraction was manufacturing false positives on the side of it that
+/// cannot be recovered from: an `absent` is a claim somebody made, and nobody
+/// made this one.
+///
+/// Removals are recorded in [`Extraction::dropped`] like every other, so this
+/// is a reported loss rather than a silent one.
+///
+/// # The index in a `Dropped` from here
+///
+/// A position among the facts that survived [`extract`], not among the facts
+/// the model wrote. Nothing downstream indexes into `facts` -- relations and
+/// closures point at mentions -- so removing one shifts no reference.
+pub fn without_absences(extraction: &mut Extraction) {
+    let mut kept = Vec::with_capacity(extraction.facts.len());
+    for (i, fact) in std::mem::take(&mut extraction.facts)
+        .into_iter()
+        .enumerate()
+    {
+        if fact.value.is_none() {
+            extraction.dropped.push(Dropped {
+                what: "fact",
+                index: i,
+                why: format!(
+                    "it asserts an absence -- that {:?} has no {} -- and this source cannot assert one. A document that does not mention something has not claimed there is none",
+                    subject_name(extraction, fact.subject),
+                    fact.attribute
+                ),
+            });
+            continue;
+        }
+        kept.push(fact);
+    }
+    extraction.facts = kept;
+}
+
+/// What to call a fact's subject in a message, falling back to its index.
+fn subject_name(extraction: &Extraction, subject: usize) -> String {
+    extraction
+        .mentions
+        .get(subject)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| format!("mention {subject}"))
+}
+
 pub fn extract(turn: &Turn, completer: &impl Completer) -> Result<Extraction, ExtractError> {
     let response = completer.complete(&prompt(turn))?;
 
@@ -1221,5 +1284,120 @@ mod tests {
         assert_eq!(out.dropped.len(), 1, "{:?}", out.dropped);
         assert_eq!(out.dropped[0].what, "fact");
         assert!(out.dropped[0].why.contains("Globex"), "{:?}", out.dropped);
+    }
+    /// A document cannot assert that something has none.
+    ///
+    /// `value: None` is not a missing fact in this crate -- it is the claim
+    /// that the attribute has no value, and the store answers `absent` rather
+    /// than `unknown` because of it. That is right for dialogue, where a person
+    /// really can say someone has no siblings. A document is not a witness: it
+    /// says what it says, and passing over something is not a claim about it.
+    ///
+    /// Measured on arrow's API reference, where 9 of 79 facts read this way --
+    /// `Field` has no definition, `Opaque` has no type. The store then told a
+    /// reader that `Field` is *asserted* to have no definition, which is the
+    /// one distinction this project exists to keep.
+    #[test]
+    fn a_source_that_cannot_assert_an_absence_has_its_absences_removed() {
+        let mut e = Extraction {
+            mentions: vec![Mention {
+                kind: "thing".into(),
+                name: "Field".into(),
+                text: "Field".into(),
+            }],
+            facts: vec![
+                Fact {
+                    subject: 0,
+                    attribute: "definition".into(),
+                    value: None,
+                    text: "Field has no definition".into(),
+                    valid_from: NOW,
+                    supersession: Supersession::Unstated,
+                },
+                Fact {
+                    subject: 0,
+                    attribute: "purpose".into(),
+                    value: Some("describes a column".into()),
+                    text: "Field describes a column".into(),
+                    valid_from: NOW,
+                    supersession: Supersession::Unstated,
+                },
+            ],
+            relations: Vec::new(),
+            closures: Vec::new(),
+            dropped: Vec::new(),
+        };
+
+        without_absences(&mut e);
+
+        assert_eq!(
+            e.facts.len(),
+            1,
+            "a fact with a value was removed: {:?}",
+            e.facts
+        );
+        assert_eq!(e.facts[0].attribute, "purpose");
+        assert_eq!(e.dropped.len(), 1, "the absence went unreported");
+        assert_eq!(e.dropped[0].what, "fact");
+        assert!(e.dropped[0].why.contains("absence"), "{:?}", e.dropped[0]);
+    }
+
+    /// It leaves an extraction with nothing to remove exactly as it was.
+    #[test]
+    fn without_absences_leaves_a_clean_extraction_alone() {
+        let mut e = Extraction {
+            mentions: vec![Mention {
+                kind: "thing".into(),
+                name: "Field".into(),
+                text: "Field".into(),
+            }],
+            facts: vec![Fact {
+                subject: 0,
+                attribute: "purpose".into(),
+                value: Some("describes a column".into()),
+                text: "Field describes a column".into(),
+                valid_from: NOW,
+                supersession: Supersession::Unstated,
+            }],
+            relations: Vec::new(),
+            closures: Vec::new(),
+            dropped: Vec::new(),
+        };
+        let before = e.clone();
+        without_absences(&mut e);
+        assert_eq!(e, before, "a clean extraction was changed");
+    }
+
+    /// A person can still say that someone has none.
+    ///
+    /// The counterpart to `a_source_that_cannot_assert_an_absence_...`, and the
+    /// one that keeps the fix honest. Removing absences is only correct because
+    /// it is scoped to documents; if it ever ran on dialogue it would delete
+    /// the write side of the three-way answer, and `note --absent` would be the
+    /// only way left to record something a person had just said out loud.
+    ///
+    /// So this asserts the *absence of the guard* on a speaker's turn: extract
+    /// keeps the null, nothing is dropped, and it is `without_absences` and not
+    /// `extract` that does the removing.
+    #[test]
+    fn a_speaker_may_still_assert_an_absence() {
+        let out = extract(
+            &turn(),
+            &Canned(
+                r#"{"mentions":[{"kind":"person","name":"Ben Severn","text":"Ben"}],
+                    "facts":[{"subject":0,"attribute":"reports","value":null,
+                              "text":"Ben has no direct reports","days_ago":null}],
+                    "relations":[],"closures":[]}"#,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(out.facts.len(), 1, "extract removed a speaker's absence");
+        assert!(
+            out.facts[0].value.is_none(),
+            "the absence lost its meaning: {:?}",
+            out.facts[0]
+        );
+        assert!(out.dropped.is_empty(), "{:?}", out.dropped);
     }
 }

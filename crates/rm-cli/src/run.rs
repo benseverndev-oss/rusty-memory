@@ -262,6 +262,7 @@ pub fn run(
                     &provider,
                     dimension,
                     metric,
+                    command::Witness::Speaker,
                 )?))
             }
             Command::Decide {

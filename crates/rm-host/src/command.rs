@@ -486,6 +486,7 @@ pub fn remember(
         embedder,
         dimension,
         metric,
+        Witness::Speaker,
     )?;
     commit_remember(engine, plan)
 }
@@ -513,6 +514,30 @@ impl RememberPlan {
     }
 }
 
+/// What kind of source a turn came from, and so what it is allowed to assert.
+///
+/// The distinction is about absence and nothing else. `value: None` on a fact
+/// is the claim that an attribute *has* no value, which is why the store can
+/// answer `absent` where another would answer nothing at all.
+///
+/// A person can make that claim: "he has no siblings" is a real thing to say.
+/// A document cannot. It says what it says, and passing over something is not a
+/// claim about it -- so reading one must not be able to turn silence into an
+/// assertion. Measured on arrow's API reference, 9 of 79 facts arrived as
+/// absences, and the store went on to report that arrow's `Field` was
+/// *asserted* to have no definition.
+///
+/// A final argument with an old-behaviour default, the same shape `Depth` took
+/// in 0.2.0, so a caller that meant `Speaker` says so rather than inheriting it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Witness {
+    /// A person said this, and may assert an absence.
+    #[default]
+    Speaker,
+    /// A document said this, and may not.
+    Document,
+}
+
 /// The half of [`remember`] that talks to models. No store, no lock.
 ///
 /// `dimension` and `metric` describe the index the vectors are destined for.
@@ -528,6 +553,7 @@ pub fn plan_remember(
     embedder: &impl Embedder,
     dimension: usize,
     metric: Metric,
+    witness: Witness,
 ) -> Result<RememberPlan, HostError> {
     let turn = Turn {
         text: text.to_string(),
@@ -536,8 +562,12 @@ pub fn plan_remember(
         session: session.to_string(),
     };
 
-    let extraction =
+    let mut extraction =
         rm_engine::extract(&turn, completer).map_err(|e| HostError::Refused(e.to_string()))?;
+    // Before `prepare`, so a removed fact is never embedded or costed.
+    if witness == Witness::Document {
+        rm_engine::without_absences(&mut extraction);
+    }
     let prepared = rm_engine::prepare(&extraction, embedder, dimension, metric)
         .map_err(|e| HostError::Refused(e.to_string()))?;
 
@@ -2323,6 +2353,7 @@ pub(crate) mod tests {
             &probe,
             3,
             Metric::Cosine,
+            Witness::Speaker,
         )
         .unwrap();
         // Not vacuous: the probe has to have actually run. A plan that called

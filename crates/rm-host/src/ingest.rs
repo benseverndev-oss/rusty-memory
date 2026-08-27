@@ -106,7 +106,7 @@ pub fn source_ref(path: &str, chunk: &Chunk) -> String {
 }
 
 /// What a run produced.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Read {
     pub chunks_seen: usize,
     pub chunks_read: usize,
@@ -116,6 +116,15 @@ pub struct Read {
     /// read, so the next run tries them again.
     pub chunks_failed: usize,
     pub facts: usize,
+    /// Everything an extraction offered that was not kept, one line each,
+    /// naming the section it came from.
+    ///
+    /// Not a count. An absence a document could not assert and a name copied
+    /// from the prompt's own example are both refusals, and which one happened
+    /// is the whole of what a reader wants to know. For a single `remember` the
+    /// CLI has always printed these; a run over hundreds of sections discarded
+    /// them at the last step, which is the run where you cannot go and look.
+    pub not_kept: Vec<String>,
 }
 
 /// A chunk that has to be read, with its extraction already done.
@@ -208,6 +217,7 @@ pub fn plan_tree(
                 embedder,
                 dimension,
                 metric,
+                crate::command::Witness::Document,
             );
             match planned {
                 Ok(plan) => {
@@ -298,15 +308,25 @@ pub fn commit_tree(engine: &mut Engine, plan: Plan) -> Result<Read, HostError> {
     };
     for Planned { plan, source_ref } in plan.planned {
         let outcome = crate::command::commit_remember(engine, plan)?;
+        out.chunks_read += 1;
+        if let Outcome::Remembered {
+            ingested, dropped, ..
+        } = outcome
+        {
+            out.facts += ingested.assertions.len();
+            // Carried out of the run with the section that produced them. The
+            // reason is the point; a total would say something was refused and
+            // never which reading it was.
+            out.not_kept
+                .extend(dropped.iter().map(|d| format!("{source_ref}: {d}")));
+        }
         // Recorded whatever it yielded. A chunk of prose that asserts nothing
         // still cost a model call, and a ledger derived from what was written
         // would forget it and pay again on every run -- measured at 21 chunks
         // in 30 on this repository's own documentation.
+        //
+        // Last, because it consumes the reference the lines above name.
         engine.mark_read(source_ref);
-        out.chunks_read += 1;
-        if let Outcome::Remembered { ingested, .. } = outcome {
-            out.facts += ingested.assertions.len();
-        }
     }
     Ok(out)
 }
@@ -741,6 +761,146 @@ body {n}
             "kept calling after {} consecutive failures: {} calls",
             CONSECUTIVE_FAILURE_LIMIT,
             c.0.get()
+        );
+    }
+
+    /// A document leaves an unmentioned attribute `Unknown`, never `Absent`.
+    ///
+    /// End to end, through the same path a real run takes. `absent` and
+    /// `unknown` are different answers and the difference is the reason this
+    /// project exists -- one says somebody asserted there is none, the other
+    /// says nobody has been asked. A document that passes over something has
+    /// asserted nothing, so extraction reading one must not be able to produce
+    /// the first.
+    ///
+    /// Measured before this existed: 9 of 79 facts from arrow's API reference
+    /// came back as absences, and `rmem about 15 definition` answered "no value
+    /// -- asserted to have none" about `Field`.
+    #[test]
+    fn a_document_cannot_assert_that_something_has_none() {
+        struct SaysThereIsNone;
+        impl Completer for SaysThereIsNone {
+            fn complete(&self, _: &str) -> Result<String, CompleterError> {
+                Ok(
+                    r#"{"mentions":[{"kind":"thing","name":"Field","text":"Field"}],
+                       "facts":[
+                         {"subject":0,"attribute":"definition","value":null,
+                          "text":"Field has no definition","days_ago":null},
+                         {"subject":0,"attribute":"purpose","value":"describes a column",
+                          "text":"Field describes a column","days_ago":null}],
+                       "relations":[],"closures":[]}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        let dir = crate::testing::TempDir::new();
+        std::fs::write(
+            dir.path().join("f.md"),
+            "# Field
+
+A named column.
+",
+        )
+        .unwrap();
+
+        let mut e = doc_engine();
+        let emb = crate::testing::StubProvider::new(vec![]);
+        let plan = plan_tree(
+            e.read_sources(),
+            dir.path(),
+            100,
+            &SaysThereIsNone,
+            &emb,
+            3,
+            Metric::Cosine,
+        )
+        .unwrap();
+        commit_tree(&mut e, plan).unwrap();
+
+        let entity = *e
+            .entity_ids()
+            .first()
+            .expect("the document named something");
+
+        assert_eq!(
+            e.about(entity, "purpose", 200, 200).unwrap(),
+            rm_engine::Believed::Value("describes a column".to_string()),
+            "the fact that had a value was lost with the one that did not"
+        );
+        assert_eq!(
+            e.about(entity, "definition", 200, 200).unwrap(),
+            rm_engine::Believed::Unknown,
+            "a document asserted an absence -- the store now claims nobody gave              this a definition, which nobody said"
+        );
+    }
+
+    /// What a run refused is carried out of it, not counted and forgotten.
+    ///
+    /// `commit_tree` used to destructure the outcome with `..` and keep only
+    /// the assertion count, so every reason an extraction was trimmed -- an
+    /// absence a document could not assert, a name copied from the prompt's own
+    /// example -- was discarded at the last step. The CLI prints these for a
+    /// single `remember` and printed nothing for a run over 322 sections, which
+    /// is the run where you cannot go and look for yourself.
+    #[test]
+    fn what_a_run_refused_comes_back_with_it() {
+        struct SaysThereIsNone;
+        impl Completer for SaysThereIsNone {
+            fn complete(&self, _: &str) -> Result<String, CompleterError> {
+                Ok(
+                    r#"{"mentions":[{"kind":"thing","name":"Field","text":"Field"}],
+                       "facts":[
+                         {"subject":0,"attribute":"definition","value":null,
+                          "text":"Field has no definition","days_ago":null},
+                         {"subject":0,"attribute":"purpose","value":"describes a column",
+                          "text":"Field describes a column","days_ago":null}],
+                       "relations":[],"closures":[]}"#
+                        .to_string(),
+                )
+            }
+        }
+
+        let dir = crate::testing::TempDir::new();
+        std::fs::write(
+            dir.path().join("f.md"),
+            "# Field
+
+A named column.
+",
+        )
+        .unwrap();
+
+        let mut e = doc_engine();
+        let emb = crate::testing::StubProvider::new(vec![]);
+        let plan = plan_tree(
+            e.read_sources(),
+            dir.path(),
+            100,
+            &SaysThereIsNone,
+            &emb,
+            3,
+            Metric::Cosine,
+        )
+        .unwrap();
+        let out = commit_tree(&mut e, plan).unwrap();
+
+        assert_eq!(out.facts, 2, "the kept fact and the entity's kind");
+        assert_eq!(
+            out.not_kept.len(),
+            1,
+            "the refusal was counted and forgotten: {:?}",
+            out.not_kept
+        );
+        assert!(
+            out.not_kept[0].contains("absence"),
+            "the reason did not survive: {:?}",
+            out.not_kept
+        );
+        assert!(
+            out.not_kept[0].contains("f.md"),
+            "nothing says which section it was: {:?}",
+            out.not_kept
         );
     }
 

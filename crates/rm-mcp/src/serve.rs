@@ -498,6 +498,7 @@ where
                     &provider,
                     dimension,
                     metric,
+                    command::Witness::Speaker,
                 )?))
             }
             Call::Note {
